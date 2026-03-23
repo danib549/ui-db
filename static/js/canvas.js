@@ -6,14 +6,13 @@
 
 import { EventBus } from './events.js';
 import { getViewport } from './state.js';
+import { GRID_COLORS } from './constants.js';
 
 // ---- Module state (not application state) ----
 let canvasEl = null;
 let ctx = null;
 
 // ---- Background grid constants ----
-const BG_COLOR = '#F9FAFB';
-const DOT_COLOR = '#E5E7EB';
 const DOT_RADIUS = 1;
 const GRID_SPACING = 20;
 
@@ -119,7 +118,7 @@ export function drawBackground() {
 
   // Fill entire canvas with background color in screen space
   resetTransform(ctx);
-  ctx.fillStyle = BG_COLOR;
+  ctx.fillStyle = GRID_COLORS.bg;
   ctx.fillRect(0, 0, canvasEl.width, canvasEl.height);
 
   // Adaptive spacing: increase grid step at low zoom to avoid drawing tens of thousands of dots
@@ -134,7 +133,7 @@ export function drawBackground() {
 
   // Draw dots in world space using fillRect (faster than arc for small dots)
   applyViewportTransform(ctx, viewport);
-  ctx.fillStyle = DOT_COLOR;
+  ctx.fillStyle = GRID_COLORS.dot;
   const dotSize = DOT_RADIUS * 2;
 
   for (let x = startX; x <= endX; x += effectiveSpacing) {

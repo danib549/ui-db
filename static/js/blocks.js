@@ -13,32 +13,35 @@ import {
 
 // ---- Shadow/border styles per visual state ----
 
-const VISUAL_STYLES = {
-  'default': {
-    shadowBlur: 3, shadowOffsetY: 1, shadowColor: 'rgba(0,0,0,0.1)',
-    borderColor: BLOCK_COLORS.border, borderWidth: 1, headerFill: BLOCK_COLORS.header, opacity: 1.0,
-  },
-  'hover': {
-    shadowBlur: 6, shadowOffsetY: 4, shadowColor: 'rgba(0,0,0,0.1)',
-    borderColor: BLOCK_COLORS.borderHover, borderWidth: 1, headerFill: BLOCK_COLORS.header, opacity: 1.0,
-  },
-  'selected': {
-    shadowBlur: 6, shadowOffsetY: 4, shadowColor: 'rgba(59,130,246,0.15)',
-    borderColor: BLOCK_COLORS.borderSelected, borderWidth: 2, headerFill: BLOCK_COLORS.headerSelected, opacity: 1.0,
-  },
-  'selected-hover': {
-    shadowBlur: 6, shadowOffsetY: 4, shadowColor: 'rgba(59,130,246,0.15)',
-    borderColor: BLOCK_COLORS.borderSelected, borderWidth: 2, headerFill: BLOCK_COLORS.headerSelected, opacity: 1.0,
-  },
-  'dragging': {
-    shadowBlur: 24, shadowOffsetY: 12, shadowColor: 'rgba(0,0,0,0.15)',
-    borderColor: BLOCK_COLORS.borderSelected, borderWidth: 2, headerFill: BLOCK_COLORS.headerSelected, opacity: 0.92,
-  },
-  'dimmed': {
-    shadowBlur: 0, shadowOffsetY: 0, shadowColor: 'transparent',
-    borderColor: BLOCK_COLORS.border, borderWidth: 1, headerFill: BLOCK_COLORS.header, opacity: 0.25,
-  },
-};
+function getVisualStyle(state) {
+  const styles = {
+    'default': {
+      shadowBlur: 3, shadowOffsetY: 1, shadowColor: 'rgba(0,0,0,0.1)',
+      borderColor: BLOCK_COLORS.border, borderWidth: 1, headerFill: BLOCK_COLORS.header, opacity: 1.0,
+    },
+    'hover': {
+      shadowBlur: 6, shadowOffsetY: 4, shadowColor: 'rgba(0,0,0,0.1)',
+      borderColor: BLOCK_COLORS.borderHover, borderWidth: 1, headerFill: BLOCK_COLORS.header, opacity: 1.0,
+    },
+    'selected': {
+      shadowBlur: 6, shadowOffsetY: 4, shadowColor: 'rgba(59,130,246,0.15)',
+      borderColor: BLOCK_COLORS.borderSelected, borderWidth: 2, headerFill: BLOCK_COLORS.headerSelected, opacity: 1.0,
+    },
+    'selected-hover': {
+      shadowBlur: 6, shadowOffsetY: 4, shadowColor: 'rgba(59,130,246,0.15)',
+      borderColor: BLOCK_COLORS.borderSelected, borderWidth: 2, headerFill: BLOCK_COLORS.headerSelected, opacity: 1.0,
+    },
+    'dragging': {
+      shadowBlur: 24, shadowOffsetY: 12, shadowColor: 'rgba(0,0,0,0.15)',
+      borderColor: BLOCK_COLORS.borderSelected, borderWidth: 2, headerFill: BLOCK_COLORS.headerSelected, opacity: 0.92,
+    },
+    'dimmed': {
+      shadowBlur: 0, shadowOffsetY: 0, shadowColor: 'transparent',
+      borderColor: BLOCK_COLORS.border, borderWidth: 1, headerFill: BLOCK_COLORS.header, opacity: 0.25,
+    },
+  };
+  return styles[state] || styles['default'];
+}
 
 // ---- Visual state resolution ----
 
@@ -247,7 +250,7 @@ function drawColumnRows(ctx, table, x, y, w, hoveredColumn) {
 
     // Row divider
     if (i > 0) {
-      ctx.strokeStyle = '#F3F4F6';
+      ctx.strokeStyle = BLOCK_COLORS.divider;
       ctx.lineWidth = 1;
       ctx.beginPath();
       ctx.moveTo(x + PADDING_H, rowY);
@@ -336,7 +339,7 @@ export function redrawAll() {
 
     const visualState = getBlockVisualState(table.name, state, traceTableSet);
     if (visualState === 'hidden') continue;
-    const vs = VISUAL_STYLES[visualState] || VISUAL_STYLES['default'];
+    const vs = getVisualStyle(visualState);
 
     ctx.globalAlpha = vs.opacity;
 

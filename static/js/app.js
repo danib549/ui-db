@@ -15,6 +15,7 @@ import { initTrace } from './trace.js';
 import { initFilters } from './filters.js';
 import { initExport } from './export.js';
 import { initTableViewer } from './table-viewer.js';
+import { initTheme } from './theme.js';
 
 // ---- Interaction state (not application state) ----
 
@@ -454,6 +455,7 @@ function wireEventSubscriptions() {
   EventBus.on('blockExpanded', scheduleRender);
   EventBus.on('connectionAdded', scheduleRender);
   EventBus.on('connectionRemoved', scheduleRender);
+  EventBus.on('themeChanged', scheduleRender);
   EventBus.on('panToTable', handlePanToTable);
 
   // Trace animation: only redraws connection layer (not full render) for performance
@@ -477,6 +479,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const canvasEl = document.getElementById('diagram-canvas');
   if (!canvasEl) return;
 
+  initTheme();
   initCanvas(canvasEl);
   initUpload();
   initSearch();
