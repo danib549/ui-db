@@ -1,6 +1,0 @@
-id,name,team_id,lead_employee_id,status
-1,API Rewrite,1,1,active
-2,Dashboard v2,2,3,active
-3,Q2 Campaign,4,6,completed
-4,Cloud Migration,5,7,active
-5,Chatbot,7,9,planning

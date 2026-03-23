@@ -151,6 +151,32 @@ def trace():
     return jsonify(results)
 
 
+@app.route("/api/table-data")
+def table_data():
+    """Return row data for a table as a JSON grid.
+
+    Query params: table. Returns columns metadata and up to 500 rows.
+    """
+    table = request.args.get("table", "")
+    if not table:
+        return jsonify({"error": "table is required"}), 400
+
+    table_info = loaded_tables.get(table)
+    df = loaded_dataframes.get(table)
+    if table_info is None or df is None:
+        return jsonify({"error": "table not found"}), 404
+
+    columns = table_info.get("columns", [])
+    col_names = [c["name"] for c in columns]
+    rows = df[col_names].head(500).fillna("").astype(str).values.tolist()
+
+    return jsonify({
+        "table": table,
+        "columns": columns,
+        "rows": rows,
+    })
+
+
 @app.route("/api/column-values")
 def column_values():
     """Return unique values for a specific table column.

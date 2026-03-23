@@ -1,9 +1,0 @@
-id,title,project_id,assigned_employee_id,status,priority
-1,Design API schema,1,1,done,high
-2,Implement auth,1,2,in_progress,high
-3,Write tests,1,2,todo,medium
-4,Build components,2,3,in_progress,high
-5,Landing page,3,6,done,medium
-6,Setup CI/CD,4,7,in_progress,high
-7,Train model,5,9,in_progress,high
-8,Eval pipeline,5,10,todo,medium
