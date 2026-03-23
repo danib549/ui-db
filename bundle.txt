@@ -243,6 +243,137 @@ Review all changed code for quality. Fix issues.
 When ALL 10 steps are verified and working, output:
 <promise>PLAN COMPLETE</promise>
 ===== END: PROMPT.md =====
+===== FILE: README.md =====
+# DB Diagram Visualizer
+
+A local, browser-based tool for visualizing database table relationships from CSV files — similar to [dbdiagram.io](https://dbdiagram.io), but fully offline.
+
+![Python](https://img.shields.io/badge/Python-3.10+-blue) ![Flask](https://img.shields.io/badge/Flask-Backend-green) ![Vanilla JS](https://img.shields.io/badge/Vanilla_JS-Frontend-yellow)
+
+## What It Does
+
+1. **Upload CSV files** — each file represents a database table
+2. **Auto-detect keys** — primary keys, foreign keys, and unique constraints identified from column names and data patterns
+3. **Infer relationships** — FK-to-PK matching across tables with cardinality detection (1:1, 1:N, M:N)
+4. **Render interactive diagram** — table blocks on an HTML5 Canvas with bezier curve connection lines and crow's foot notation
+5. **Search & trace** — find values across all tables and trace data flow along FK chains
+6. **Filter & export** — filter by key type, relationship type, or table; export as PNG or JSON
+
+## Quick Start
+
+```bash
+# Install dependencies
+pip install flask pandas
+
+# Run the server
+python app.py
+
+# Open in browser
+# http://localhost:5000
+```
+
+Upload CSV files via the sidebar or drag-and-drop onto the canvas.
+
+## Features
+
+### Canvas Interactions
+- **Drag** table blocks by their header
+- **Pan** by dragging empty canvas space (or middle-mouse anywhere)
+- **Zoom** with Ctrl+Scroll (cursor-centered, 25%-200%)
+- **Select** with click, Shift+click, or Ctrl+A
+- **Collapse** tables with double-click on header
+- **Delete** selected tables with Delete key
+
+### Auto-Layout
+Four layout algorithms available from the toolbar:
+- **Left-to-Right** — dependency flow (roots left, children right)
+- **Top-to-Bottom** — vertical dependency flow
+- **Force-Directed** — physics simulation minimizing line crossings
+- **Grid** — alphabetical grid arrangement
+
+### Search & Trace
+- Type in the search bar to find values across all loaded tables
+- Click the trace button (arrows icon) on any search result to follow FK relationships
+- Traced connections highlight as animated red dashed lines
+
+### Filters
+- Filter by key type (PK, FK, UQ)
+- Filter by relationship type (one-to-one, one-to-many, many-to-many)
+- Filter by table name
+- Toggle between dim and hide modes
+
+### Export
+- **PNG** — rasterized diagram at 2x resolution
+- **JSON** — full state snapshot (tables, positions, connections)
+
+## Project Structure
+
+```
+db-diagram-visualizer/
+├── app.py                    # Flask routes (thin layer)
+├── csv_handler.py            # CSV parsing, type detection
+├── key_detector.py           # PK/FK/UQ detection
+├── relationship_analyzer.py  # Cross-table relationship inference
+├── search.py                 # Cross-table value search
+├── trace.py                  # BFS value tracing across FKs
+├── requirements.txt          # flask, pandas
+├── templates/
+│   └── index.html            # Main page
+├── static/
+│   ├── css/
+│   │   └── styles.css        # All styles (BEM, CSS custom properties)
+│   └── js/
+│       ├── app.js            # Main orchestrator, render pipeline, interactions
+│       ├── state.js          # Central state store, mutations emit events
+│       ├── events.js         # Pub/sub event bus
+│       ├── constants.js      # Shared dimensions, colors, helpers
+│       ├── utils.js          # Shared utilities (escapeHtml)
+│       ├── canvas.js         # Canvas engine, viewport, grid background
+│       ├── blocks.js         # Table block rendering
+│       ├── connections.js    # Connection lines, bezier curves, cardinality
+│       ├── csv-import.js     # File upload and drag-and-drop
+│       ├── layout.js         # Layout algorithms with animation
+│       ├── search.js         # Search UI
+│       ├── trace.js          # Value tracing UI
+│       ├── filters.js        # Filter panel
+│       └── export.js         # PNG/JSON export
+└── test_data/                # Sample CSVs for testing
+    ├── users.csv
+    ├── orders.csv
+    └── products.csv
+```
+
+## Architecture
+
+- **Backend**: Python/Flask — handles CSV parsing, key detection, relationship analysis, search, and trace. Returns JSON only.
+- **Frontend**: Vanilla JS with HTML5 Canvas — all rendering and interaction client-side. No frameworks.
+- **State**: Central store (`state.js`) with event-driven mutations. Every state change triggers a render via `scheduleRender()` (rAF-batched).
+- **The Iron Rule**: Connection lines are fully recalculated on every state change. Never cached.
+- **Local only**: No CDNs, no external APIs, no tracking. Everything runs on localhost.
+
+## Key Detection Rules
+
+| Pattern | Detected As |
+|---------|-------------|
+| Column named `id` with all unique non-null values | Primary Key (PK) |
+| Column named `uuid` or `guid` | Primary Key (PK) |
+| Column ending in `_id`, `_ref`, `_key` | Foreign Key (FK) |
+| All values unique and non-null (not FK) | Unique (UQ) |
+
+## API Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/` | Serve the main page |
+| POST | `/api/upload-csv` | Upload CSV files, returns tables + relationships |
+| POST | `/api/detect-relationships` | Re-detect relationships for loaded tables |
+| POST | `/api/search` | Search values across tables |
+| POST | `/api/trace` | Trace a value across FK chains |
+
+## License
+
+MIT
+===== END: README.md =====
 ===== FILE: app.py =====
 """Flask application — thin route layer for the DB Diagram Visualizer."""
 
@@ -5158,6 +5289,8 @@ Skill name: Interactive Filtering and Connection Highlighting
 /* ============================================
    Dark Mode Theme Overrides
    Applied when body has the "dark" class.
+   In dark mode, chrome and canvas are both dark
+   (light mode already has dark chrome with light canvas).
    ============================================ */
 
 body.dark {
@@ -5177,7 +5310,7 @@ body.dark {
   --rel-many-many: #FB923C;
   --rel-self: #C4B5FD;
 
-  /* UI */
+  /* UI (canvas-area elements like table-viewer modal) */
   --text-primary: #E5E7EB;
   --text-secondary: #9CA3AF;
   --border-color: #374151;
@@ -5189,6 +5322,15 @@ body.dark {
   --accent: #60A5FA;
   --accent-dark: #93C5FD;
 
+  /* Chrome (sidebar/toolbar) — deeper dark in full dark mode */
+  --chrome-bg: #141520;
+  --chrome-text: #E5E7EB;
+  --chrome-text-secondary: #9CA3AF;
+  --chrome-border: #252630;
+  --chrome-hover: #1e1f2b;
+  --chrome-selected: rgba(59, 130, 246, 0.2);
+  --chrome-input-bg: #1a1b23;
+
   /* Shadows */
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
   --shadow-md: 0 4px 6px rgba(0, 0, 0, 0.4);
@@ -5196,28 +5338,11 @@ body.dark {
   color-scheme: dark;
 }
 
-/* Scrollbar in dark mode */
-body.dark .sidebar::-webkit-scrollbar-thumb,
-body.dark .sidebar__table-list::-webkit-scrollbar-thumb {
-  background: #4B5563;
-}
-
-body.dark .sidebar::-webkit-scrollbar-thumb:hover,
-body.dark .sidebar__table-list::-webkit-scrollbar-thumb:hover {
-  background: #6B7280;
-}
-
-/* Search input focus glow */
-body.dark .search-bar__input:focus {
-  box-shadow: 0 0 0 3px rgba(96, 165, 250, 0.2);
-}
-
 /* Table viewer td border */
 body.dark .table-viewer__td {
   border-bottom-color: #2d2e3a;
 }
 
-/* Row divider inside table blocks (hardcoded in blocks.js, but viewer uses CSS) */
 body.dark .table-viewer__th {
   border-bottom-color: #374151;
 }
@@ -5241,7 +5366,7 @@ body.dark .table-viewer__backdrop {
 
 /* Dark mode toggle button active state */
 body.dark #btn-theme {
-  background: var(--bg-hover);
+  background: var(--chrome-hover);
   border-color: var(--accent);
   color: var(--accent);
 }
@@ -5272,12 +5397,21 @@ body.dark #btn-theme {
   --text-secondary: #6B7280;
   --border-color: #E5E7EB;
   --bg-white: #FFFFFF;
-  --bg-sidebar: #FFFFFF;
+  --bg-sidebar: #1e1f2b;
   --bg-header: #F9FAFB;
   --bg-selected: #EFF6FF;
   --bg-hover: #F3F4F6;
   --accent: #3B82F6;
   --accent-dark: #2563EB;
+
+  /* Sidebar / Toolbar chrome (dark panels on light canvas) */
+  --chrome-bg: #1e1f2b;
+  --chrome-text: #E5E7EB;
+  --chrome-text-secondary: #9CA3AF;
+  --chrome-border: #2d2e3a;
+  --chrome-hover: #2d2e3a;
+  --chrome-selected: rgba(59, 130, 246, 0.2);
+  --chrome-input-bg: #272836;
 
   /* Sizing */
   --sidebar-width: 280px;
@@ -5352,27 +5486,28 @@ ul {
   width: var(--sidebar-width);
   min-width: var(--sidebar-width);
   height: 100vh;
-  background: var(--bg-sidebar);
-  border-right: 1px solid var(--border-color);
+  background: var(--chrome-bg);
+  border-right: 1px solid var(--chrome-border);
   display: flex;
   flex-direction: column;
   overflow-y: auto;
+  color: var(--chrome-text);
 }
 
 .sidebar__header {
   padding: 16px 20px;
-  border-bottom: 1px solid var(--border-color);
+  border-bottom: 1px solid var(--chrome-border);
 }
 
 .sidebar__title {
   font-size: 16px;
   font-weight: 700;
-  color: var(--text-primary);
+  color: var(--chrome-text);
 }
 
 .sidebar__section {
   padding: 16px 20px;
-  border-bottom: 1px solid var(--border-color);
+  border-bottom: 1px solid var(--chrome-border);
 }
 
 .sidebar__section-title {
@@ -5380,7 +5515,7 @@ ul {
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.05em;
-  color: var(--text-secondary);
+  color: var(--chrome-text-secondary);
   margin-bottom: 12px;
 }
 
@@ -5392,7 +5527,7 @@ ul {
 }
 
 .sidebar__section-title--toggle:hover {
-  color: var(--text-primary);
+  color: var(--chrome-text);
 }
 
 .sidebar__section-arrow {
@@ -5431,7 +5566,7 @@ ul {
 
 /* Upload Zone */
 .sidebar__upload {
-  border: 2px dashed var(--border-color);
+  border: 2px dashed var(--chrome-border);
   border-radius: var(--radius-lg);
   padding: 24px 16px;
   text-align: center;
@@ -5442,19 +5577,19 @@ ul {
 .sidebar__upload:hover,
 .sidebar__upload--active {
   border-color: var(--accent);
-  background: var(--bg-selected);
+  background: var(--chrome-selected);
 }
 
 .sidebar__upload-icon {
   font-size: 24px;
   font-weight: 300;
-  color: var(--text-secondary);
+  color: var(--chrome-text-secondary);
   margin-bottom: 4px;
 }
 
 .sidebar__upload-text {
   font-size: 12px;
-  color: var(--text-secondary);
+  color: var(--chrome-text-secondary);
 }
 
 .sidebar__upload-input {
@@ -5478,11 +5613,11 @@ ul {
 }
 
 .sidebar__table-item:hover {
-  background: var(--bg-hover);
+  background: var(--chrome-hover);
 }
 
 .sidebar__table-item--selected {
-  background: var(--bg-selected);
+  background: var(--chrome-selected);
   color: var(--accent);
   font-weight: 500;
 }
@@ -5509,19 +5644,19 @@ ul {
   padding: 4px 10px;
   border-radius: 12px;
   font-size: 12px;
-  background: var(--bg-hover);
-  color: var(--text-primary);
+  background: var(--chrome-hover);
+  color: var(--chrome-text);
   cursor: pointer;
   transition: background-color 0.1s;
 }
 
 .filter-panel__chip:hover {
-  background: var(--border-color);
+  background: var(--chrome-border);
 }
 
 .filter-panel__chip--active {
   background: var(--accent);
-  color: var(--bg-white);
+  color: #fff;
 }
 
 /* Search Bar */
@@ -5532,22 +5667,22 @@ ul {
 .search-bar__input {
   width: 100%;
   padding: 8px 12px;
-  border: 1px solid var(--border-color);
+  border: 1px solid var(--chrome-border);
   border-radius: var(--radius-md);
   font-size: 13px;
-  color: var(--text-primary);
-  background: var(--bg-white);
+  color: var(--chrome-text);
+  background: var(--chrome-input-bg);
   outline: none;
   transition: border-color 0.15s, box-shadow 0.15s;
 }
 
 .search-bar__input::placeholder {
-  color: var(--text-secondary);
+  color: var(--chrome-text-secondary);
 }
 
 .search-bar__input:focus {
   border-color: var(--accent);
-  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
 }
 
 /* ============================================
@@ -5570,8 +5705,8 @@ ul {
   align-items: center;
   justify-content: space-between;
   padding: 0 16px;
-  border-bottom: 1px solid var(--border-color);
-  background: var(--bg-white);
+  border-bottom: 1px solid var(--chrome-border);
+  background: var(--chrome-bg);
   gap: 12px;
 }
 
@@ -5588,20 +5723,20 @@ ul {
   padding: 6px 12px;
   font-size: 13px;
   font-weight: 500;
-  color: var(--text-primary);
-  background: var(--bg-white);
-  border: 1px solid var(--border-color);
+  color: var(--chrome-text);
+  background: var(--chrome-input-bg);
+  border: 1px solid var(--chrome-border);
   border-radius: var(--radius-md);
   transition: background-color 0.1s, border-color 0.1s;
 }
 
 .toolbar__btn:hover {
-  background: var(--bg-hover);
-  border-color: var(--text-secondary);
+  background: var(--chrome-hover);
+  border-color: var(--chrome-text-secondary);
 }
 
 .toolbar__btn--active {
-  background: var(--bg-selected);
+  background: var(--chrome-selected);
   border-color: var(--accent);
   color: var(--accent);
 }
@@ -5616,7 +5751,7 @@ ul {
 .toolbar__zoom-label {
   font-size: 12px;
   font-weight: 500;
-  color: var(--text-secondary);
+  color: var(--chrome-text-secondary);
   min-width: 40px;
   text-align: center;
   user-select: none;
@@ -5733,13 +5868,13 @@ ul {
 
 .sidebar::-webkit-scrollbar-thumb,
 .sidebar__table-list::-webkit-scrollbar-thumb {
-  background: var(--border-color);
+  background: var(--chrome-border);
   border-radius: 3px;
 }
 
 .sidebar::-webkit-scrollbar-thumb:hover,
 .sidebar__table-list::-webkit-scrollbar-thumb:hover {
-  background: var(--text-secondary);
+  background: var(--chrome-text-secondary);
 }
 
 /* ============================================
@@ -5759,7 +5894,7 @@ ul {
   font-size: 11px;
   font-weight: 600;
   text-transform: uppercase;
-  color: var(--text-secondary);
+  color: var(--chrome-text-secondary);
   padding: 4px 0;
 }
 
@@ -5773,16 +5908,16 @@ ul {
 }
 
 .search-results__item:hover {
-  background: var(--bg-hover);
+  background: var(--chrome-hover);
 }
 
 .search-results__column {
-  color: var(--text-primary);
+  color: var(--chrome-text);
   font-weight: 500;
 }
 
 .search-results__value {
-  color: var(--text-secondary);
+  color: var(--chrome-text-secondary);
   max-width: 100px;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -5794,10 +5929,10 @@ ul {
   width: 22px;
   height: 22px;
   padding: 0;
-  border: 1px solid var(--border-color);
+  border: 1px solid var(--chrome-border);
   border-radius: var(--radius-sm);
-  background: var(--bg-white);
-  color: var(--text-secondary);
+  background: var(--chrome-input-bg);
+  color: var(--chrome-text-secondary);
   font-size: 12px;
   cursor: pointer;
   display: inline-flex;
@@ -5812,7 +5947,7 @@ ul {
 }
 
 .search-results__trace-btn:hover {
-  background: var(--bg-selected);
+  background: var(--chrome-selected);
   color: var(--accent);
   border-color: var(--accent);
 }
@@ -5834,18 +5969,18 @@ ul {
 
 .trace-node {
   padding: 4px 8px;
-  background: var(--bg-hover);
+  background: var(--chrome-hover);
   border-radius: var(--radius-sm);
   cursor: pointer;
 }
 
 .trace-node:hover {
-  background: var(--bg-selected);
+  background: var(--chrome-selected);
 }
 
 .trace-node__depth {
   font-size: 10px;
-  color: var(--text-secondary);
+  color: var(--chrome-text-secondary);
   margin-right: 4px;
 }
 
@@ -5854,7 +5989,7 @@ ul {
 }
 
 .trace-arrow {
-  color: var(--text-secondary);
+  color: var(--chrome-text-secondary);
   font-size: 14px;
 }
 
@@ -5875,7 +6010,7 @@ ul {
   font-size: 11px;
   font-weight: 600;
   text-transform: uppercase;
-  color: var(--text-secondary);
+  color: var(--chrome-text-secondary);
   margin-bottom: 6px;
 }
 
@@ -5895,7 +6030,7 @@ ul {
 .filter-panel__controls {
   margin-top: 8px;
   padding-top: 8px;
-  border-top: 1px solid var(--border-color);
+  border-top: 1px solid var(--chrome-border);
 }
 
 .filter-panel__clear {
@@ -5916,8 +6051,8 @@ ul {
   top: 100%;
   right: 0;
   margin-top: 4px;
-  background: var(--bg-white);
-  border: 1px solid var(--border-color);
+  background: var(--chrome-bg);
+  border: 1px solid var(--chrome-border);
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-md);
   z-index: 100;
@@ -5930,14 +6065,14 @@ ul {
   padding: 8px 12px;
   font-size: 13px;
   text-align: left;
-  color: var(--text-primary);
+  color: var(--chrome-text);
   background: none;
   border: none;
   cursor: pointer;
 }
 
 .toolbar__dropdown-item:hover {
-  background: var(--bg-hover);
+  background: var(--chrome-hover);
 }
 
 .toolbar__dropdown-item:first-child {
@@ -5961,10 +6096,10 @@ ul {
   width: 24px;
   height: 24px;
   padding: 0;
-  border: 1px solid var(--border-color);
+  border: 1px solid var(--chrome-border);
   border-radius: var(--radius-sm);
-  background: var(--bg-white);
-  color: var(--text-secondary);
+  background: var(--chrome-input-bg);
+  color: var(--chrome-text-secondary);
   font-size: 14px;
   cursor: pointer;
   display: inline-flex;
@@ -5979,7 +6114,7 @@ ul {
 }
 
 .sidebar__table-view-btn:hover {
-  background: var(--bg-selected);
+  background: var(--chrome-selected);
   color: var(--accent);
   border-color: var(--accent);
 }
@@ -6146,6 +6281,7 @@ import { initTrace } from './trace.js';
 import { initFilters } from './filters.js';
 import { initExport } from './export.js';
 import { initTableViewer } from './table-viewer.js';
+import { initTheme } from './theme.js';
 
 // ---- Interaction state (not application state) ----
 
@@ -6585,6 +6721,7 @@ function wireEventSubscriptions() {
   EventBus.on('blockExpanded', scheduleRender);
   EventBus.on('connectionAdded', scheduleRender);
   EventBus.on('connectionRemoved', scheduleRender);
+  EventBus.on('themeChanged', scheduleRender);
   EventBus.on('panToTable', handlePanToTable);
 
   // Trace animation: only redraws connection layer (not full render) for performance
@@ -6608,6 +6745,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const canvasEl = document.getElementById('diagram-canvas');
   if (!canvasEl) return;
 
+  initTheme();
   initCanvas(canvasEl);
   initUpload();
   initSearch();
@@ -6651,32 +6789,35 @@ import {
 
 // ---- Shadow/border styles per visual state ----
 
-const VISUAL_STYLES = {
-  'default': {
-    shadowBlur: 3, shadowOffsetY: 1, shadowColor: 'rgba(0,0,0,0.1)',
-    borderColor: BLOCK_COLORS.border, borderWidth: 1, headerFill: BLOCK_COLORS.header, opacity: 1.0,
-  },
-  'hover': {
-    shadowBlur: 6, shadowOffsetY: 4, shadowColor: 'rgba(0,0,0,0.1)',
-    borderColor: BLOCK_COLORS.borderHover, borderWidth: 1, headerFill: BLOCK_COLORS.header, opacity: 1.0,
-  },
-  'selected': {
-    shadowBlur: 6, shadowOffsetY: 4, shadowColor: 'rgba(59,130,246,0.15)',
-    borderColor: BLOCK_COLORS.borderSelected, borderWidth: 2, headerFill: BLOCK_COLORS.headerSelected, opacity: 1.0,
-  },
-  'selected-hover': {
-    shadowBlur: 6, shadowOffsetY: 4, shadowColor: 'rgba(59,130,246,0.15)',
-    borderColor: BLOCK_COLORS.borderSelected, borderWidth: 2, headerFill: BLOCK_COLORS.headerSelected, opacity: 1.0,
-  },
-  'dragging': {
-    shadowBlur: 24, shadowOffsetY: 12, shadowColor: 'rgba(0,0,0,0.15)',
-    borderColor: BLOCK_COLORS.borderSelected, borderWidth: 2, headerFill: BLOCK_COLORS.headerSelected, opacity: 0.92,
-  },
-  'dimmed': {
-    shadowBlur: 0, shadowOffsetY: 0, shadowColor: 'transparent',
-    borderColor: BLOCK_COLORS.border, borderWidth: 1, headerFill: BLOCK_COLORS.header, opacity: 0.25,
-  },
-};
+function getVisualStyle(state) {
+  const styles = {
+    'default': {
+      shadowBlur: 3, shadowOffsetY: 1, shadowColor: 'rgba(0,0,0,0.1)',
+      borderColor: BLOCK_COLORS.border, borderWidth: 1, headerFill: BLOCK_COLORS.header, opacity: 1.0,
+    },
+    'hover': {
+      shadowBlur: 6, shadowOffsetY: 4, shadowColor: 'rgba(0,0,0,0.1)',
+      borderColor: BLOCK_COLORS.borderHover, borderWidth: 1, headerFill: BLOCK_COLORS.header, opacity: 1.0,
+    },
+    'selected': {
+      shadowBlur: 6, shadowOffsetY: 4, shadowColor: 'rgba(59,130,246,0.15)',
+      borderColor: BLOCK_COLORS.borderSelected, borderWidth: 2, headerFill: BLOCK_COLORS.headerSelected, opacity: 1.0,
+    },
+    'selected-hover': {
+      shadowBlur: 6, shadowOffsetY: 4, shadowColor: 'rgba(59,130,246,0.15)',
+      borderColor: BLOCK_COLORS.borderSelected, borderWidth: 2, headerFill: BLOCK_COLORS.headerSelected, opacity: 1.0,
+    },
+    'dragging': {
+      shadowBlur: 24, shadowOffsetY: 12, shadowColor: 'rgba(0,0,0,0.15)',
+      borderColor: BLOCK_COLORS.borderSelected, borderWidth: 2, headerFill: BLOCK_COLORS.headerSelected, opacity: 0.92,
+    },
+    'dimmed': {
+      shadowBlur: 0, shadowOffsetY: 0, shadowColor: 'transparent',
+      borderColor: BLOCK_COLORS.border, borderWidth: 1, headerFill: BLOCK_COLORS.header, opacity: 0.25,
+    },
+  };
+  return styles[state] || styles['default'];
+}
 
 // ---- Visual state resolution ----
 
@@ -6885,7 +7026,7 @@ function drawColumnRows(ctx, table, x, y, w, hoveredColumn) {
 
     // Row divider
     if (i > 0) {
-      ctx.strokeStyle = '#F3F4F6';
+      ctx.strokeStyle = BLOCK_COLORS.divider;
       ctx.lineWidth = 1;
       ctx.beginPath();
       ctx.moveTo(x + PADDING_H, rowY);
@@ -6974,7 +7115,7 @@ export function redrawAll() {
 
     const visualState = getBlockVisualState(table.name, state, traceTableSet);
     if (visualState === 'hidden') continue;
-    const vs = VISUAL_STYLES[visualState] || VISUAL_STYLES['default'];
+    const vs = getVisualStyle(visualState);
 
     ctx.globalAlpha = vs.opacity;
 
@@ -7038,14 +7179,13 @@ export function getBlockAtPoint(canvasX, canvasY) {
 
 import { EventBus } from './events.js';
 import { getViewport } from './state.js';
+import { GRID_COLORS } from './constants.js';
 
 // ---- Module state (not application state) ----
 let canvasEl = null;
 let ctx = null;
 
 // ---- Background grid constants ----
-const BG_COLOR = '#F9FAFB';
-const DOT_COLOR = '#E5E7EB';
 const DOT_RADIUS = 1;
 const GRID_SPACING = 20;
 
@@ -7151,7 +7291,7 @@ export function drawBackground() {
 
   // Fill entire canvas with background color in screen space
   resetTransform(ctx);
-  ctx.fillStyle = BG_COLOR;
+  ctx.fillStyle = GRID_COLORS.bg;
   ctx.fillRect(0, 0, canvasEl.width, canvasEl.height);
 
   // Adaptive spacing: increase grid step at low zoom to avoid drawing tens of thousands of dots
@@ -7166,7 +7306,7 @@ export function drawBackground() {
 
   // Draw dots in world space using fillRect (faster than arc for small dots)
   applyViewportTransform(ctx, viewport);
-  ctx.fillStyle = DOT_COLOR;
+  ctx.fillStyle = GRID_COLORS.dot;
   const dotSize = DOT_RADIUS * 2;
 
   for (let x = startX; x <= endX; x += effectiveSpacing) {
@@ -7652,7 +7792,7 @@ export const CONNECTION_COLORS = {
   'many-to-many': '#F97316',
   'self':         '#A78BFA',
 };
-export const DIMMED_COLOR = '#D1D5DB';
+export let DIMMED_COLOR = '#D1D5DB';
 
 // ---- Block visual colors ----
 export const BLOCK_COLORS = {
@@ -7668,6 +7808,47 @@ export const BLOCK_COLORS = {
   textSecondary: '#6B7280',
   columnName: '#374151',
 };
+
+// ---- Light / Dark theme palettes for canvas ----
+
+const LIGHT_THEME = {
+  KEY_COLORS: { PK: '#F59E0B', FK: '#3B82F6', UQ: '#8B5CF6', IDX: '#14B8A6' },
+  CONNECTION_COLORS: { 'one-to-one': '#3B82F6', 'one-to-many': '#22C55E', 'many-to-many': '#F97316', 'self': '#A78BFA' },
+  DIMMED_COLOR: '#D1D5DB',
+  BLOCK_COLORS: {
+    background: '#FFFFFF', header: '#F9FAFB', headerSelected: '#EFF6FF',
+    rowHover: '#F3F4F6', divider: '#E5E7EB', border: '#D1D5DB',
+    borderHover: '#3B82F6', borderSelected: '#2563EB',
+    textPrimary: '#111827', textSecondary: '#6B7280', columnName: '#374151',
+  },
+  GRID: { bg: '#F9FAFB', dot: '#E5E7EB' },
+};
+
+const DARK_THEME = {
+  KEY_COLORS: { PK: '#FBBF24', FK: '#60A5FA', UQ: '#A78BFA', IDX: '#2DD4BF' },
+  CONNECTION_COLORS: { 'one-to-one': '#60A5FA', 'one-to-many': '#34D399', 'many-to-many': '#FB923C', 'self': '#C4B5FD' },
+  DIMMED_COLOR: '#4B5563',
+  BLOCK_COLORS: {
+    background: '#1F2028', header: '#252630', headerSelected: 'rgba(59,130,246,0.2)',
+    rowHover: '#2d2e3a', divider: '#374151', border: '#374151',
+    borderHover: '#60A5FA', borderSelected: '#3B82F6',
+    textPrimary: '#E5E7EB', textSecondary: '#9CA3AF', columnName: '#D1D5DB',
+  },
+  GRID: { bg: '#1a1b23', dot: '#2d2e3a' },
+};
+
+/** Canvas grid colors (read by canvas.js) */
+export const GRID_COLORS = { bg: '#F9FAFB', dot: '#E5E7EB' };
+
+/** Apply a theme palette to the mutable color objects. */
+export function applyTheme(isDark) {
+  const theme = isDark ? DARK_THEME : LIGHT_THEME;
+  Object.assign(KEY_COLORS, theme.KEY_COLORS);
+  Object.assign(CONNECTION_COLORS, theme.CONNECTION_COLORS);
+  Object.assign(BLOCK_COLORS, theme.BLOCK_COLORS);
+  Object.assign(GRID_COLORS, theme.GRID);
+  DIMMED_COLOR = theme.DIMMED_COLOR;
+}
 
 // ---- Connection drawing constants ----
 export const TICK_LENGTH = 8;
@@ -9002,6 +9183,49 @@ function closeViewer() {
   }
 }
 ===== END: static\js\table-viewer.js =====
+===== FILE: static\js\theme.js =====
+/**
+ * theme.js — Dark/light theme toggle.
+ * Manages body.dark class, swaps canvas color constants,
+ * persists preference to localStorage, and emits themeChanged.
+ */
+
+import { EventBus } from './events.js';
+import { applyTheme } from './constants.js';
+
+const STORAGE_KEY = 'db-diagram-theme';
+
+let isDark = false;
+
+export function initTheme() {
+  const saved = localStorage.getItem(STORAGE_KEY);
+  isDark = saved === 'dark';
+  apply();
+  wireToggle();
+}
+
+export function toggleTheme() {
+  isDark = !isDark;
+  apply();
+}
+
+export function getIsDark() {
+  return isDark;
+}
+
+function apply() {
+  document.body.classList.toggle('dark', isDark);
+  applyTheme(isDark);
+  localStorage.setItem(STORAGE_KEY, isDark ? 'dark' : 'light');
+  EventBus.emit('themeChanged', isDark);
+}
+
+function wireToggle() {
+  const btn = document.getElementById('btn-theme');
+  if (!btn) return;
+  btn.addEventListener('click', toggleTheme);
+}
+===== END: static\js\theme.js =====
 ===== FILE: static\js\trace.js =====
 /**
  * trace.js — Value tracing across FK relationships.
@@ -9091,6 +9315,7 @@ export function escapeHtml(str) {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>DB Diagram Visualizer</title>
   <link rel="stylesheet" href="/static/css/styles.css">
+  <link rel="stylesheet" href="/static/css/dark-mode.css">
 </head>
 <body>
   <div class="app">
@@ -9167,6 +9392,7 @@ export function escapeHtml(str) {
           <div class="toolbar__dropdown">
             <button class="toolbar__btn" id="btn-export">Export</button>
           </div>
+          <button class="toolbar__btn toolbar__btn--icon" id="btn-theme" title="Toggle dark mode">&#9790;</button>
         </div>
       </div>
 
