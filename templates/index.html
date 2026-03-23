@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DB Diagram Visualizer</title>
+  <link rel="stylesheet" href="/static/css/styles.css">
+</head>
+<body>
+  <div class="app">
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="sidebar__header">
+        <h1 class="sidebar__title">DB Diagram</h1>
+      </div>
+
+      <!-- Upload Section -->
+      <div class="sidebar__section sidebar__section--upload">
+        <h2 class="sidebar__section-title sidebar__section-title--toggle">
+          <span class="sidebar__section-arrow"></span>Import CSV
+        </h2>
+        <div class="sidebar__upload" id="upload-zone">
+          <div class="sidebar__upload-icon">+</div>
+          <p class="sidebar__upload-text">Drop CSV files here or click to browse</p>
+          <input type="file" id="file-input" class="sidebar__upload-input" accept=".csv" multiple hidden>
+        </div>
+      </div>
+
+      <!-- Table List -->
+      <div class="sidebar__section sidebar__section--tables">
+        <h2 class="sidebar__section-title sidebar__section-title--toggle">
+          <span class="sidebar__section-arrow"></span>Tables
+        </h2>
+        <ul class="sidebar__table-list" id="table-list">
+          <!-- Table items populated by JS -->
+        </ul>
+      </div>
+
+      <!-- Filter Panel Placeholder -->
+      <div class="sidebar__section sidebar__section--filters">
+        <h2 class="sidebar__section-title sidebar__section-title--toggle">
+          <span class="sidebar__section-arrow"></span>Filters
+        </h2>
+        <div class="filter-panel" id="filter-panel">
+          <!-- Filter controls populated by JS -->
+        </div>
+      </div>
+
+      <!-- Search Section -->
+      <div class="sidebar__section sidebar__section--search">
+        <h2 class="sidebar__section-title sidebar__section-title--toggle">
+          <span class="sidebar__section-arrow"></span>Search
+        </h2>
+        <div class="search-bar" id="search-bar">
+          <input type="text" class="search-bar__input" id="search-input" placeholder="Search columns or values...">
+        </div>
+        <div class="search-results" id="search-results" hidden></div>
+        <div class="trace-panel" id="trace-panel"></div>
+      </div>
+    </aside>
+
+    <!-- Main Area -->
+    <main class="main">
+      <!-- Toolbar -->
+      <div class="toolbar">
+        <div class="toolbar__group toolbar__group--left">
+          <div class="toolbar__dropdown">
+            <button class="toolbar__btn" id="btn-layout">Layout</button>
+          </div>
+          <button class="toolbar__btn" id="btn-fit">Fit</button>
+        </div>
+
+        <div class="toolbar__group toolbar__group--center">
+          <button class="toolbar__btn toolbar__btn--icon" id="btn-zoom-out">&minus;</button>
+          <span class="toolbar__zoom-label" id="zoom-label">100%</span>
+          <button class="toolbar__btn toolbar__btn--icon" id="btn-zoom-in">+</button>
+        </div>
+
+        <div class="toolbar__group toolbar__group--right">
+          <button class="toolbar__btn" id="btn-filter-toggle">Filters</button>
+          <div class="toolbar__dropdown">
+            <button class="toolbar__btn" id="btn-export">Export</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Canvas Container -->
+      <div class="canvas-container" id="canvas-container">
+        <canvas id="diagram-canvas"></canvas>
+        <!-- Drop overlay for drag-and-drop onto canvas -->
+        <div class="canvas-container__drop-overlay" id="canvas-drop-overlay">
+          <p>Drop CSV files to import</p>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <!-- Toast Notification (visibility via .toast--visible class for CSS transitions) -->
+  <div class="toast" id="toast">
+    <span class="toast__message" id="toast-message"></span>
+  </div>
+
+  <!-- Zoom Indicator (visibility via .zoom-indicator--visible class for CSS transitions) -->
+  <div class="zoom-indicator" id="zoom-indicator">
+    <span id="zoom-indicator-value">100%</span>
+  </div>
+
+  <script type="module" src="/static/js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,7 @@
+id,name,office_id,budget
+1,Engineering,1,500000
+2,Sales,1,300000
+3,Marketing,2,250000
+4,Engineering,3,400000
+5,Support,4,200000
+6,Research,5,600000

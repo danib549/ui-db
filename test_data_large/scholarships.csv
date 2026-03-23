@@ -1,0 +1,7 @@
+id,name,department_id,amount,min_gpa
+1,Physics Excellence,1,5000,3.5
+2,Engineering Merit,4,8000,3.7
+3,CS Innovation,10,10000,3.3
+4,Arts Award,7,3000,3.5
+5,Dean's Scholarship,null,15000,3.8
+6,International Grant,null,7000,3.0

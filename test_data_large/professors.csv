@@ -1,0 +1,17 @@
+id,name,email,department_id,country_id,tenure,hire_date
+1,Dr. Alice Chen,achen@uni.edu,1,1,true,2010-09-01
+2,Dr. Bob Singh,bsingh@uni.edu,2,5,true,2012-01-15
+3,Dr. Carol Wu,cwu@uni.edu,3,1,true,2008-06-01
+4,Dr. Dave Schmidt,dschmidt@uni.edu,4,4,true,2009-03-10
+5,Dr. Eve Tanaka,etanaka@uni.edu,5,6,true,2011-08-20
+6,Dr. Frank Costa,fcosta@uni.edu,6,7,false,2018-01-05
+7,Dr. Grace Miller,gmiller@uni.edu,7,1,true,2007-09-01
+8,Dr. Hank Okafor,hokafor@uni.edu,8,3,true,2013-04-15
+9,Dr. Iris Novak,inovak@uni.edu,9,4,false,2019-09-01
+10,Dr. Jake Patel,jpatel@uni.edu,10,5,true,2010-01-10
+11,Dr. Kara Lee,klee@uni.edu,11,1,false,2020-06-01
+12,Dr. Leo Rossi,lrossi@uni.edu,12,1,false,2021-01-15
+13,Dr. Mia Brown,mbrown@uni.edu,13,3,true,2011-09-01
+14,Dr. Noah Kim,nkim@uni.edu,14,1,false,2022-03-01
+15,Dr. Olivia Park,opark@uni.edu,1,1,false,2023-01-10
+16,Dr. Pete Garcia,pgarcia@uni.edu,10,7,false,2022-09-01

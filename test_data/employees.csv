@@ -1,0 +1,7 @@
+employee_id,name,manager_id,department,hire_date
+1,Alice Chen,,Engineering,2023-01-10
+2,Bob Park,1,Engineering,2023-06-15
+3,Carol White,1,Engineering,2024-01-20
+4,Dave Brown,,Sales,2023-03-01
+5,Eve Davis,4,Sales,2024-02-14
+6,Frank Miller,4,Sales,2024-07-01

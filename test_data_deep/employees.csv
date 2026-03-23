@@ -1,0 +1,11 @@
+id,name,team_id,manager_id,hire_date
+1,Alice Chen,1,,2022-01-10
+2,Bob Park,1,1,2022-06-15
+3,Carol White,2,1,2023-01-20
+4,Dave Brown,3,,2022-03-01
+5,Eve Davis,3,4,2023-02-14
+6,Frank Miller,4,,2023-07-01
+7,Grace Lee,5,1,2023-09-10
+8,Hank Wu,6,,2024-01-05
+9,Iris Patel,7,,2024-03-20
+10,Jake Olsen,7,9,2024-06-01

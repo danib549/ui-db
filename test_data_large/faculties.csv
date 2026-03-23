@@ -1,0 +1,6 @@
+id,name,campus_id,dean_professor_id
+1,Science,1,1
+2,Engineering,1,4
+3,Arts & Humanities,1,7
+4,Computer Science,2,10
+5,Business,3,13

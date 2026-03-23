@@ -1,0 +1,5 @@
+id,name,country_id,city,address
+1,Main Campus,1,Boston,100 University Ave
+2,West Campus,1,San Jose,200 Tech Blvd
+3,London Campus,3,London,50 Academic Rd
+4,Online Campus,1,,Virtual

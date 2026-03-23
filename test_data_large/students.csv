@@ -1,0 +1,16 @@
+id,name,email,country_id,department_id,advisor_professor_id,enrollment_year,gpa
+1,Sam Adams,sadams@uni.edu,1,1,1,2022,3.7
+2,Tina Bell,tbell@uni.edu,2,1,1,2023,3.5
+3,Uma Carter,ucarter@uni.edu,1,4,4,2022,3.9
+4,Victor Diaz,vdiaz@uni.edu,7,10,10,2023,3.2
+5,Wendy Evans,wevans@uni.edu,3,7,7,2021,3.8
+6,Xander Fox,xfox@uni.edu,1,10,10,2022,3.4
+7,Yuki Goto,ygoto@uni.edu,6,5,5,2023,3.6
+8,Zara Hassan,zhassan@uni.edu,5,11,11,2023,3.1
+9,Aaron Ito,aito@uni.edu,6,3,3,2022,3.9
+10,Beth James,bjames@uni.edu,1,13,13,2021,3.3
+11,Chris King,cking@uni.edu,8,12,12,2023,3.7
+12,Dana Lopez,dlopez@uni.edu,7,2,2,2022,3.5
+13,Eli Moore,emoore@uni.edu,1,8,8,2023,3.0
+14,Fay Nash,fnash@uni.edu,2,14,14,2024,3.8
+15,Glen Owen,gowen@uni.edu,1,6,6,2024,3.6
