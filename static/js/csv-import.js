@@ -208,8 +208,18 @@ function updateSidebarTableList() {
     countSpan.className = 'sidebar__table-count';
     countSpan.textContent = `${table.columns.length} cols`;
 
+    const viewBtn = document.createElement('button');
+    viewBtn.className = 'sidebar__table-view-btn';
+    viewBtn.title = 'View table data';
+    viewBtn.textContent = '\u2637'; // trigram / grid-like symbol
+    viewBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      EventBus.emit('openTableViewer', table.name);
+    });
+
     li.appendChild(nameSpan);
     li.appendChild(countSpan);
+    li.appendChild(viewBtn);
 
     li.addEventListener('click', () => {
       EventBus.emit('panToTable', table.name);

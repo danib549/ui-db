@@ -14,6 +14,7 @@ import { initSearch } from './search.js';
 import { initTrace } from './trace.js';
 import { initFilters } from './filters.js';
 import { initExport } from './export.js';
+import { initTableViewer } from './table-viewer.js';
 
 // ---- Interaction state (not application state) ----
 
@@ -482,6 +483,7 @@ document.addEventListener('DOMContentLoaded', () => {
   initTrace();
   initFilters();
   initExport();
+  initTableViewer();
   wireEventSubscriptions();
   wireCanvasEvents();
   wireToolbar();
