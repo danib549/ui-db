@@ -204,7 +204,7 @@ function isHighlighted(connection, interactionState) {
 /**
  * BFS from a selected column to find connections to highlight (locked hover mode).
  * Returns a Set of connection keys ("srcTable.srcCol->tgtTable.tgtCol").
- * Direct connections from the selected column are always included.
+ * Shows all connections from the selected column's TABLE (matching hover behavior).
  * For many-to-many connections, extends the path beyond the closest tables
  * by following ALL connections from M:M-reached tables (full chain).
  */
@@ -216,10 +216,10 @@ function buildSelectedColumnPathSet(selectedColumn, connections) {
   visitedTables.add(selectedColumn.table);
   const m2mQueue = [];
 
-  // First pass: find direct connections from the selected column
+  // Find all connections from the selected column's table
   for (const conn of connections) {
-    const isSource = conn.source.table === selectedColumn.table && conn.source.column === selectedColumn.column;
-    const isTarget = conn.target.table === selectedColumn.table && conn.target.column === selectedColumn.column;
+    const isSource = conn.source.table === selectedColumn.table;
+    const isTarget = conn.target.table === selectedColumn.table;
     if (!isSource && !isTarget) continue;
 
     pathSet.add(connKey(conn));
@@ -320,9 +320,9 @@ function resolveConnectionStyle(connection, interactionState, traceEdgeSet, sele
     return { color: DIMMED_COLOR, width: 1, dash: [4, 4], opacity: 0.15 };
   }
 
-  // Selected column: highlight full path, dim everything else (takes priority over hover)
-  if (selectedPathSet) {
-    if (selectedPathSet.has(connKey(connection))) {
+  // Locked hover mode: highlight connections from selected column's table, dim others
+  if (interactionState.selectedColumn) {
+    if (selectedPathSet && selectedPathSet.has(connKey(connection))) {
       return { color: baseColor, width: 2.5, dash: [], opacity: 1.0 };
     }
     return { color: DIMMED_COLOR, width: 1, dash: [4, 4], opacity: 0.15 };

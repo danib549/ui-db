@@ -66,10 +66,10 @@ function getBlockVisualState(tableName, state, traceTableSet, selectedPathTableS
 
   const hasActiveHover = hoveredTable || hoveredColumn || hoveredConnection;
 
-  // Selected column mode (locked hover): show source table as 'hover', path tables as default, dim rest
-  if (selectedPathTableSet) {
-    if (selectedColumn && tableName === selectedColumn.table) return 'hover';
-    if (selectedPathTableSet.has(tableName)) return 'default';
+  // Locked hover mode: always activate when a column is selected
+  if (selectedColumn) {
+    if (tableName === selectedColumn.table) return 'hover';
+    if (selectedPathTableSet && selectedPathTableSet.has(tableName)) return 'default';
     return 'dimmed';
   }
 
@@ -89,7 +89,7 @@ function getBlockVisualState(tableName, state, traceTableSet, selectedPathTableS
 
 /**
  * BFS from a selected column to find reachable tables (locked hover mode).
- * Direct connections from the selected column are always included.
+ * Shows all tables connected to the selected column's TABLE (matching hover behavior).
  * For many-to-many connections, extends the path beyond the closest tables
  * by following ALL connections from M:M-reached tables.
  */
@@ -100,10 +100,10 @@ function buildSelectedPathTableSet(selectedColumn, connections) {
   visited.add(selectedColumn.table);
   const m2mQueue = [];
 
-  // First pass: find direct connections from the selected column
+  // Find all tables connected to the selected column's table
   for (const conn of connections) {
-    const isSource = conn.source.table === selectedColumn.table && conn.source.column === selectedColumn.column;
-    const isTarget = conn.target.table === selectedColumn.table && conn.target.column === selectedColumn.column;
+    const isSource = conn.source.table === selectedColumn.table;
+    const isTarget = conn.target.table === selectedColumn.table;
     if (!isSource && !isTarget) continue;
 
     const neighbor = isSource ? conn.target.table : conn.source.table;
