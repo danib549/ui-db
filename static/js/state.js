@@ -18,6 +18,7 @@ const initialState = () => ({
   hoveredTable: null,
   hoveredColumn: null,
   hoveredConnection: null,
+  selectedColumn: null,
   activeFilters: [],
   searchQuery: null,
   searchMode: 'contains',
@@ -205,6 +206,15 @@ export const setSelectedTables = (tables) => {
   state.selectedTables = [...tables];
   emitChange('stateChanged', { key: 'selectedTables' }, 'selectedTables');
 };
+
+export const setSelectedColumn = (col) => {
+  if (state.selectedColumn === col) return;
+  if (col && state.selectedColumn && col.table === state.selectedColumn.table && col.column === state.selectedColumn.column) return;
+  state.selectedColumn = col;
+  emitChange('stateChanged', { key: 'selectedColumn' }, 'selectedColumn');
+};
+
+export const getSelectedColumn = () => state.selectedColumn;
 
 // --------------- Full State ---------------
 

@@ -118,6 +118,8 @@ function handleMouseDown(e) {
 
   if (hit && hit.columnIndex === -1) {
     startDrag(hit.tableName, canvasPos, e.shiftKey);
+  } else if (hit && hit.columnIndex >= 0) {
+    handleColumnClick(hit.tableName, hit.columnIndex, e.shiftKey);
   } else if (hit) {
     handleBlockClick(hit.tableName, e.shiftKey);
   } else {
@@ -237,6 +239,26 @@ function handleMouseUp() {
     isPanning = false;
     panStart = null;
     panViewportStart = null;
+  }
+}
+
+function handleColumnClick(tableName, columnIndex, shiftKey) {
+  const tables = State.getTables();
+  const table = tables.find((t) => t.name === tableName);
+  if (!table || !table.columns[columnIndex]) return;
+
+  const col = table.columns[columnIndex];
+  const current = State.getSelectedColumn();
+
+  // Toggle: clicking the same column again deselects it
+  if (current && current.table === tableName && current.column === col.name) {
+    State.setSelectedColumn(null);
+  } else {
+    State.setSelectedColumn({ table: tableName, column: col.name });
+  }
+
+  if (!shiftKey) {
+    State.setSelectedTables([tableName]);
   }
 }
 
@@ -391,6 +413,7 @@ function wireKeyboard() {
     }
 
     if (e.key === 'Escape') {
+      State.setSelectedColumn(null);
       State.setSelectedTables([]);
       return;
     }
@@ -492,6 +515,8 @@ function init() {
   wireToolbar();
   wireKeyboard();
   wireSidebarCollapseToggles();
+  wireLegend();
+  wireClearSelection();
   render();
   updateZoomLabel();
 }
@@ -503,6 +528,34 @@ if (document.readyState === 'loading') {
 }
 
 // ---- Sidebar section collapse/expand ----
+
+function wireClearSelection() {
+  const btn = document.getElementById('btn-clear-selection');
+  if (!btn) return;
+
+  btn.addEventListener('click', () => {
+    State.setSelectedColumn(null);
+    State.setSelectedTables([]);
+  });
+
+  // Show/hide button based on selectedColumn state
+  EventBus.on('stateChanged', ({ key }) => {
+    if (key === 'selectedColumn') {
+      const col = State.getSelectedColumn();
+      btn.hidden = !col;
+    }
+  });
+}
+
+function wireLegend() {
+  const legend = document.getElementById('legend');
+  const closeBtn = document.getElementById('legend-close');
+  if (!legend || !closeBtn) return;
+
+  closeBtn.addEventListener('click', () => {
+    legend.classList.add('legend--hidden');
+  });
+}
 
 function wireSidebarCollapseToggles() {
   document.querySelectorAll('.sidebar__section-title--toggle').forEach((title) => {

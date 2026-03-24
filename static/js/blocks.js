@@ -54,7 +54,7 @@ function getBlockFilterResult(tableName, activeFilters) {
 }
 
 function getBlockVisualState(tableName, state, traceTableSet) {
-  const { selectedTables, hoveredTable, hoveredColumn, hoveredConnection, activeFilters } = state;
+  const { selectedTables, hoveredTable, hoveredColumn, hoveredConnection, activeFilters, selectedColumn, connections } = state;
 
   // Trace mode: dim tables not in the trace path
   if (traceTableSet && !traceTableSet.has(tableName)) return 'dimmed';
@@ -70,6 +70,13 @@ function getBlockVisualState(tableName, state, traceTableSet) {
   if (selectedTables.includes(tableName)) return 'selected';
   if (tableName === hoveredTable) return 'hover';
 
+  // Selected column mode: dim unrelated tables
+  if (selectedColumn && !hasActiveHover) {
+    if (selectedColumn.table === tableName) return 'default';
+    if (isTableConnectedToColumn(tableName, selectedColumn, connections)) return 'default';
+    return 'dimmed';
+  }
+
   if (hasActiveHover) {
     const isRelated = tableName === hoveredTable ||
       (hoveredColumn && hoveredColumn.table === tableName) ||
@@ -78,6 +85,15 @@ function getBlockVisualState(tableName, state, traceTableSet) {
   }
 
   return 'default';
+}
+
+function isTableConnectedToColumn(tableName, selectedColumn, connections) {
+  if (!connections) return false;
+  for (const conn of connections) {
+    if (conn.source.table === selectedColumn.table && conn.source.column === selectedColumn.column && conn.target.table === tableName) return true;
+    if (conn.target.table === selectedColumn.table && conn.target.column === selectedColumn.column && conn.source.table === tableName) return true;
+  }
+  return false;
 }
 
 function isTableInHoveredConnection(tableName, hoveredConnection) {
@@ -235,15 +251,20 @@ function drawCollapsedBadge(ctx, textX, cy, columnCount) {
   ctx.fillText(text, textX, cy);
 }
 
-function drawColumnRows(ctx, table, x, y, w, hoveredColumn) {
+function drawColumnRows(ctx, table, x, y, w, hoveredColumn, selectedColumn) {
   const startY = y + HEADER_HEIGHT;
 
   for (let i = 0; i < table.columns.length; i++) {
     const col = table.columns[i];
     const rowY = startY + i * ROW_HEIGHT;
 
-    // Row hover highlight
-    if (hoveredColumn && hoveredColumn.table === table.name && hoveredColumn.column === col.name) {
+    // Selected column highlight (persistent)
+    const isSelected = selectedColumn && selectedColumn.table === table.name && selectedColumn.column === col.name;
+    if (isSelected) {
+      ctx.fillStyle = BLOCK_COLORS.headerSelected;
+      ctx.fillRect(x, rowY, w, ROW_HEIGHT);
+    } else if (hoveredColumn && hoveredColumn.table === table.name && hoveredColumn.column === col.name) {
+      // Row hover highlight
       ctx.fillStyle = BLOCK_COLORS.rowHover;
       ctx.fillRect(x, rowY, w, ROW_HEIGHT);
     }
@@ -349,7 +370,7 @@ export function redrawAll() {
     drawHeader(ctx, pos.x, pos.y, width, table.name, vs, isCollapsed, table.columns.length);
 
     if (!isCollapsed) {
-      drawColumnRows(ctx, table, pos.x, pos.y, width, state.hoveredColumn);
+      drawColumnRows(ctx, table, pos.x, pos.y, width, state.hoveredColumn, state.selectedColumn);
     }
 
     ctx.globalAlpha = 1.0;
