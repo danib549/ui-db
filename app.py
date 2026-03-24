@@ -69,9 +69,14 @@ def upload_csv():
         table_name = filename.rsplit(".", 1)[0]
 
         try:
-            df = pd.read_csv(file)
+            df = pd.read_csv(file, engine="python", sep=None)
         except Exception:
             continue
+
+        # Drop unnamed index columns (common in SQL Server exports)
+        unnamed_cols = [c for c in df.columns if str(c).startswith("Unnamed:")]
+        if unnamed_cols:
+            df = df.drop(columns=unnamed_cols)
 
         if df.empty and df.columns.empty:
             continue
