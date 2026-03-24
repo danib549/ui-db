@@ -1,6 +1,7 @@
 """Flask application — thin route layer for the DB Diagram Visualizer."""
 
 import json
+import mimetypes
 
 from flask import Flask, request, jsonify, render_template
 import pandas as pd
@@ -12,6 +13,9 @@ from relationship_analyzer import detect_relationships
 from search import search_all_tables
 from trace import trace_value
 
+# Ensure .js files are served with the correct MIME type
+mimetypes.add_type('application/javascript', '.js')
+mimetypes.add_type('text/css', '.css')
 
 app = Flask(__name__)
 
