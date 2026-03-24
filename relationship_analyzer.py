@@ -11,12 +11,18 @@ def detect_relationships(
 ) -> list[dict]:
     """Detect FK relationships across all loaded tables.
 
-    Builds a PK index, then matches FK columns to PK columns in other
-    tables using name-based heuristics.
+    Uses three strategies in order:
+      1. Name-based: FK columns matched to PK columns by naming convention
+      2. Value-based: columns with matching values across tables
+      3. Self-references: FK columns pointing back to same table
+    Deduplicates results so the same pair isn't reported twice.
     """
     pk_index = _build_pk_index(tables)
+    unique_index = _build_unique_index(tables)
     relationships: list[dict] = []
+    seen: set[tuple[str, str, str, str]] = set()
 
+    # Strategy 1: name-based matching (FK columns -> PK columns)
     for table in tables:
         table_name = table["name"]
         source_df = dataframes.get(table_name)
@@ -27,6 +33,11 @@ def detect_relationships(
 
             matches = _find_target_table(col["name"], table_name, pk_index, tables)
             for target_table, target_column in matches:
+                key = (table_name, col["name"], target_table, target_column)
+                if key in seen:
+                    continue
+                seen.add(key)
+
                 target_df = dataframes.get(target_table)
                 cardinality = infer_cardinality(
                     source_df, col["name"], target_df, target_column,
@@ -44,8 +55,23 @@ def detect_relationships(
                     "confidence": confidence,
                 })
 
+    # Strategy 2: value-based matching (compare actual data across tables)
+    value_rels = _detect_by_values(tables, dataframes, unique_index, seen)
+    relationships.extend(value_rels)
+
+    # Strategy 3: self-references
+    for table in tables:
+        table_name = table["name"]
+        source_df = dataframes.get(table_name)
+
         self_refs = detect_self_reference(table_name, table["columns"])
         for ref in self_refs:
+            key = (ref["source_table"], ref["source_column"],
+                   ref["target_table"], ref["target_column"])
+            if key in seen:
+                continue
+            seen.add(key)
+
             if source_df is not None:
                 cardinality = infer_cardinality(
                     source_df, ref["source_column"], source_df, ref["target_column"],
@@ -54,6 +80,128 @@ def detect_relationships(
             relationships.append(ref)
 
     return relationships
+
+
+def _detect_by_values(
+    tables: list[dict],
+    dataframes: dict[str, pd.DataFrame],
+    unique_index: dict[str, list[str]],
+    seen: set[tuple[str, str, str, str]],
+) -> list[dict]:
+    """Detect relationships by comparing actual column values across tables.
+
+    For each unique/PK column in table A, check if any column in table B
+    has values that are a subset. This catches relationships regardless
+    of column naming conventions.
+    """
+    relationships: list[dict] = []
+
+    # Build lookup: for each table, its unique/PK columns and their value sets
+    value_sets: dict[str, dict[str, set]] = {}
+    for table_name, cols in unique_index.items():
+        df = dataframes.get(table_name)
+        if df is None:
+            continue
+        value_sets[table_name] = {}
+        for col_name in cols:
+            if col_name not in df.columns:
+                continue
+            vals = set(df[col_name].dropna().astype(str))
+            if len(vals) < 2:
+                continue
+            value_sets[table_name][col_name] = vals
+
+    table_list = list(dataframes.keys())
+
+    for src_name in table_list:
+        src_df = dataframes.get(src_name)
+        if src_df is None:
+            continue
+        src_table = _find_table_meta(tables, src_name)
+        if src_table is None:
+            continue
+
+        for src_col in src_table["columns"]:
+            src_col_name = src_col["name"]
+            if src_col_name not in src_df.columns:
+                continue
+            # Skip columns already detected as PK/UQ in this table
+            if src_col.get("key_type") in ("PK", "UQ"):
+                continue
+            # Skip text/desc columns (too many false positives)
+            if src_col.get("type") in ("TEXT",):
+                continue
+
+            src_vals = set(src_df[src_col_name].dropna().astype(str))
+            if len(src_vals) < 2:
+                continue
+
+            # Compare against unique/PK columns in other tables
+            for tgt_name, tgt_cols in value_sets.items():
+                if tgt_name == src_name:
+                    continue
+
+                for tgt_col_name, tgt_vals in tgt_cols.items():
+                    key = (src_name, src_col_name, tgt_name, tgt_col_name)
+                    reverse_key = (tgt_name, tgt_col_name, src_name, src_col_name)
+                    if key in seen or reverse_key in seen:
+                        continue
+
+                    overlap = src_vals & tgt_vals
+                    if len(overlap) == 0:
+                        continue
+
+                    # Source values should be a subset of target values
+                    # (FK values must exist in the referenced PK column)
+                    overlap_ratio = len(overlap) / len(src_vals)
+                    if overlap_ratio < 0.5:
+                        continue
+
+                    seen.add(key)
+                    tgt_df = dataframes.get(tgt_name)
+                    cardinality = infer_cardinality(
+                        src_df, src_col_name, tgt_df, tgt_col_name,
+                    )
+
+                    # Score confidence based on overlap ratio and name similarity
+                    if overlap_ratio >= 0.9:
+                        confidence = "high"
+                    elif overlap_ratio >= 0.7:
+                        confidence = "medium"
+                    else:
+                        confidence = "low"
+
+                    relationships.append({
+                        "source_table": src_name,
+                        "source_column": src_col_name,
+                        "target_table": tgt_name,
+                        "target_column": tgt_col_name,
+                        "type": cardinality,
+                        "confidence": confidence,
+                    })
+
+    return relationships
+
+
+def _build_unique_index(tables: list[dict]) -> dict[str, list[str]]:
+    """Build a mapping of table_name -> columns that are PK or UQ."""
+    index: dict[str, list[str]] = {}
+    for table in tables:
+        cols = [
+            c["name"] for c in table["columns"]
+            if c.get("key_type") in ("PK", "UQ")
+        ]
+        if cols:
+            index[table["name"]] = cols
+    return index
+
+
+def _find_table_meta(tables: list[dict], table_name: str) -> dict | None:
+    """Find table metadata dict by name."""
+    for t in tables:
+        if t["name"] == table_name:
+            return t
+    return None
 
 
 def infer_cardinality(
@@ -87,11 +235,7 @@ def detect_junction_table(
     columns: list[dict],
     relationships: list[dict],
 ) -> bool:
-    """Detect whether a table is a junction/bridge table.
-
-    A junction table has 2+ FK columns and at most 1 non-metadata,
-    non-FK column.
-    """
+    """Detect whether a table is a junction/bridge table."""
     metadata_names = {"id", "created_at", "updated_at", "deleted_at"}
     fk_columns = [c for c in columns if c.get("key_type") == "FK"]
 
@@ -112,10 +256,7 @@ def detect_self_reference(
     table_name: str,
     columns: list[dict],
 ) -> list[dict]:
-    """Detect FK columns that reference the same table.
-
-    Example: 'manager_id' in an 'employees' table references 'employee'/'employees'.
-    """
+    """Detect FK columns that reference the same table."""
     results: list[dict] = []
     table_lower = table_name.lower()
     singular = table_lower.rstrip("s") if table_lower.endswith("s") else table_lower
@@ -147,23 +288,17 @@ def score_relationship(
     source_dtype: str,
     target_dtype: str,
 ) -> str:
-    """Score the confidence of a detected relationship.
-
-    Returns 'high', 'medium', or 'low'.
-    """
+    """Score the confidence of a detected relationship."""
     score = 0
 
-    # Name match: FK column base matches target table
     candidates = find_fk_candidates(source_col)
     target_lower = target_table.lower()
     if target_lower in candidates:
         score += 2
 
-    # Target column is 'id' (most common PK name)
     if target_col.lower() == "id":
         score += 1
 
-    # Type compatibility
     if source_dtype and target_dtype and source_dtype == target_dtype:
         score += 1
 
