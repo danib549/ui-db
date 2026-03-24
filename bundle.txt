@@ -386,6 +386,13 @@ from werkzeug.utils import secure_filename
 
 from csv_handler import parse_csv_columns
 from key_detector import detect_keys
+from metadata_parser import (
+    is_metadata_file,
+    parse_metadata_csvs,
+    build_table_name_map,
+    apply_metadata_keys,
+    build_metadata_relationships,
+)
 from relationship_analyzer import detect_relationships
 from search import search_all_tables
 from trace import trace_value
@@ -400,6 +407,8 @@ app = Flask(__name__)
 loaded_tables: dict[str, dict] = {}
 loaded_dataframes: dict[str, pd.DataFrame] = {}
 detected_relationships: list[dict] = []
+metadata_relationships: list[dict] = []  # from SQL Server metadata CSVs
+has_metadata_loaded: bool = False
 
 
 @app.route("/")
@@ -415,7 +424,7 @@ def upload_csv():
     Expects multipart form data with a 'files' field (one or more CSV files).
     Optionally accepts 'existing_tables' as a JSON string for incremental upload.
     """
-    global detected_relationships
+    global detected_relationships, metadata_relationships, has_metadata_loaded
 
     files = request.files.getlist("files")
     if not files:
@@ -432,8 +441,9 @@ def upload_csv():
         except (json.JSONDecodeError, TypeError):
             pass
 
-    new_tables: list[dict] = []
-    all_table_names = list(loaded_tables.keys())
+    # Separate metadata files from data files
+    metadata_raw: dict[str, bytes] = {}
+    data_files = []
 
     for file in files:
         if not file or not file.filename:
@@ -443,11 +453,25 @@ def upload_csv():
         if not filename.lower().endswith(".csv"):
             continue
 
+        raw = file.read()
+        file.seek(0)
+
+        if is_metadata_file(filename):
+            metadata_raw[filename] = raw
+        else:
+            data_files.append((filename, raw))
+
+    # Parse metadata CSVs (PKs, FKs, column types) if present
+    metadata = parse_metadata_csvs(metadata_raw)
+    has_metadata = bool(metadata_raw)
+
+    new_tables: list[dict] = []
+    all_table_names = list(loaded_tables.keys())
+
+    for filename, raw in data_files:
         table_name = filename.rsplit(".", 1)[0]
 
         try:
-            raw = file.read()
-            file.seek(0)
             # Try utf-8-sig first (handles BOM from SQL Server exports)
             for encoding in ("utf-8-sig", "utf-8", "latin-1"):
                 try:
@@ -488,28 +512,71 @@ def upload_csv():
         loaded_dataframes[table_name] = df
         new_tables.append(table_info)
 
-    value_matching = request.form.get("value_matching", "").lower() == "true"
-    detected_relationships = detect_relationships(
-        list(loaded_tables.values()), loaded_dataframes,
-        value_matching=value_matching,
+    # If metadata CSVs were provided, use them for accurate keys and relationships
+    if has_metadata:
+        has_metadata_loaded = True
+
+        # Collect all table names referenced in metadata
+        meta_table_names: set[str] = set()
+        for pk_table in metadata["primary_keys"]:
+            meta_table_names.add(pk_table)
+        for fk in metadata["foreign_keys"]:
+            meta_table_names.add(fk["parent_table"])
+            meta_table_names.add(fk["referenced_table"])
+        for (tbl, _col) in metadata["columns"]:
+            meta_table_names.add(tbl)
+
+        # Map metadata table names -> loaded table names
+        name_map = build_table_name_map(
+            list(loaded_tables.keys()), meta_table_names,
+        )
+
+        # Apply PK and column type metadata to each table
+        for meta_name, loaded_name in name_map.items():
+            if loaded_name in loaded_tables:
+                apply_metadata_keys(
+                    loaded_tables[loaded_name],
+                    metadata["primary_keys"],
+                    metadata["columns"],
+                    meta_name,
+                )
+
+        # Build and store metadata relationships separately
+        metadata_relationships = build_metadata_relationships(
+            metadata["foreign_keys"],
+            name_map,
+            loaded_tables,
+            loaded_dataframes,
+        )
+
+    # Combine relationships from all enabled sources
+    detected_relationships = _combine_relationships(
+        use_metadata=has_metadata,
+        use_name_based=True,
+        use_value_matching=request.form.get("value_matching", "").lower() == "true",
     )
 
     return jsonify({
         "tables": list(loaded_tables.values()),
         "relationships": detected_relationships,
+        "has_metadata": has_metadata_loaded,
     })
 
 
 @app.route("/api/detect-relationships", methods=["POST"])
 def redetect_relationships():
-    """Re-detect relationships for all currently loaded tables."""
+    """Re-detect relationships for all currently loaded tables.
+
+    Accepts JSON body with boolean flags:
+      metadata (default true), name_based (default true), value_matching (default false).
+    """
     global detected_relationships
 
     data = request.get_json(silent=True) or {}
-    value_matching = data.get("value_matching", False)
-    detected_relationships = detect_relationships(
-        list(loaded_tables.values()), loaded_dataframes,
-        value_matching=value_matching,
+    detected_relationships = _combine_relationships(
+        use_metadata=data.get("metadata", True),
+        use_name_based=data.get("name_based", True),
+        use_value_matching=data.get("value_matching", False),
     )
 
     return jsonify({"relationships": detected_relationships})
@@ -624,6 +691,41 @@ def debug_table():
         "df_shape": list(df.shape),
         "first_row": first_row[0] if first_row else [],
     })
+
+
+def _combine_relationships(
+    use_metadata: bool = True,
+    use_name_based: bool = True,
+    use_value_matching: bool = False,
+) -> list[dict]:
+    """Combine relationships from enabled sources, deduplicating by key."""
+    combined: list[dict] = []
+    seen: set[tuple[str, str, str, str]] = set()
+
+    # Metadata relationships first (highest confidence)
+    if use_metadata and metadata_relationships:
+        for rel in metadata_relationships:
+            key = (rel["source_table"], rel["source_column"],
+                   rel["target_table"], rel["target_column"])
+            if key not in seen:
+                seen.add(key)
+                combined.append(rel)
+
+    # Heuristic relationships (name-based and/or value-based)
+    if use_name_based or use_value_matching:
+        heuristic = detect_relationships(
+            list(loaded_tables.values()), loaded_dataframes,
+            value_matching=use_value_matching,
+            name_matching=use_name_based,
+        )
+        for rel in heuristic:
+            key = (rel["source_table"], rel["source_column"],
+                   rel["target_table"], rel["target_column"])
+            if key not in seen:
+                seen.add(key)
+                combined.append(rel)
+
+    return combined
 
 
 def _detect_group(table_name: str) -> str:
@@ -988,6 +1090,314 @@ def _pluralize(base: str) -> list[str]:
         forms.append(base + "s")
     return forms
 ===== END: key_detector.py =====
+===== FILE: metadata_parser.py =====
+"""Metadata parser — reads PK, FK, and column metadata from SQL Server export CSVs."""
+
+import io
+
+import pandas as pd
+
+
+METADATA_SUFFIXES = (
+    "Database_ForeignKeys.csv",
+    "Database_PrimaryKeys.csv",
+    "Database_Columns.csv",
+)
+
+
+def is_metadata_file(filename: str) -> bool:
+    """Check if a filename is one of the metadata CSV files.
+
+    Handles both original names (e.g. '_Database_ForeignKeys.csv') and
+    sanitized names where secure_filename strips the leading underscore.
+    """
+    for suffix in METADATA_SUFFIXES:
+        if filename.endswith(suffix):
+            return True
+    return False
+
+
+def parse_metadata_csvs(
+    raw_files: dict[str, bytes],
+) -> dict:
+    """Parse metadata CSV files into structured lookups.
+
+    Args:
+        raw_files: mapping of filename -> raw bytes for each metadata CSV.
+
+    Returns a dict with keys:
+        primary_keys: dict[table_name, list[column_name]]
+        foreign_keys: list[dict] with keys:
+            fk_name, parent_table, parent_column, referenced_table, referenced_column
+        columns: dict[(table_name, column_name), dict] with type info
+    """
+    result = {
+        "primary_keys": {},
+        "foreign_keys": [],
+        "columns": {},
+    }
+
+    for filename, raw in raw_files.items():
+        df = _read_metadata_csv(raw)
+        if df is None:
+            continue
+
+        if filename.endswith("Database_PrimaryKeys.csv"):
+            result["primary_keys"] = _parse_primary_keys(df)
+        elif filename.endswith("Database_ForeignKeys.csv"):
+            result["foreign_keys"] = _parse_foreign_keys(df)
+        elif filename.endswith("Database_Columns.csv"):
+            result["columns"] = _parse_columns(df)
+
+    return result
+
+
+def build_table_name_map(
+    loaded_table_names: list[str],
+    metadata_table_names: set[str],
+) -> dict[str, str]:
+    """Build a mapping from metadata table names to loaded table names.
+
+    The SQL export names data CSVs as '{schema}_{table}.csv' (e.g. 'dbo_Users.csv'),
+    but metadata references just '{table}' (e.g. 'Users').
+
+    Returns: dict mapping metadata_name -> loaded_name.
+    """
+    name_map: dict[str, str] = {}
+
+    for meta_name in metadata_table_names:
+        meta_lower = meta_name.lower()
+
+        # Direct match first
+        for loaded in loaded_table_names:
+            if loaded.lower() == meta_lower:
+                name_map[meta_name] = loaded
+                break
+        else:
+            # Try suffix match: 'dbo_Users' ends with '_Users'
+            for loaded in loaded_table_names:
+                loaded_lower = loaded.lower()
+                if loaded_lower.endswith("_" + meta_lower):
+                    name_map[meta_name] = loaded
+                    break
+
+    return name_map
+
+
+def apply_metadata_keys(
+    table_info: dict,
+    pk_lookup: dict[str, list[str]],
+    col_lookup: dict[tuple[str, str], dict],
+    meta_table_name: str,
+) -> dict:
+    """Apply PK and column type metadata to a table's columns.
+
+    Overrides heuristic key_type and type with exact metadata values.
+    """
+    pk_columns = set(pk_lookup.get(meta_table_name, []))
+
+    for col in table_info["columns"]:
+        col_name = col["name"]
+
+        # Apply PK from metadata
+        if col_name in pk_columns:
+            col["key_type"] = "PK"
+
+        # Apply column type from metadata
+        col_meta = col_lookup.get((meta_table_name, col_name))
+        if col_meta:
+            col["type"] = col_meta["data_type"]
+            col["nullable"] = col_meta["is_nullable"]
+
+    return table_info
+
+
+def build_metadata_relationships(
+    fk_list: list[dict],
+    name_map: dict[str, str],
+    tables: dict[str, dict],
+    dataframes: dict[str, pd.DataFrame],
+) -> list[dict]:
+    """Build relationship objects from FK metadata.
+
+    Maps metadata table names to loaded table names and creates
+    relationship dicts compatible with the existing format.
+    """
+    from relationship_analyzer import infer_cardinality
+
+    relationships: list[dict] = []
+    seen: set[tuple[str, str, str, str]] = set()
+
+    for fk in fk_list:
+        parent = fk["parent_table"]
+        referenced = fk["referenced_table"]
+
+        # Map metadata names to loaded table names
+        source_table = name_map.get(parent)
+        target_table = name_map.get(referenced)
+
+        if not source_table or not target_table:
+            continue
+
+        # Verify the tables are actually loaded
+        if source_table not in tables or target_table not in tables:
+            continue
+
+        source_col = fk["parent_column"]
+        target_col = fk["referenced_column"]
+
+        key = (source_table, source_col, target_table, target_col)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        # Mark source column as FK
+        table_info = tables[source_table]
+        for col in table_info["columns"]:
+            if col["name"] == source_col and col.get("key_type") != "PK":
+                col["key_type"] = "FK"
+
+        # Infer cardinality from actual data
+        source_df = dataframes.get(source_table)
+        target_df = dataframes.get(target_table)
+        cardinality = infer_cardinality(source_df, source_col, target_df, target_col)
+
+        relationships.append({
+            "source_table": source_table,
+            "source_column": source_col,
+            "target_table": target_table,
+            "target_column": target_col,
+            "type": cardinality,
+            "confidence": "high",
+        })
+
+    return relationships
+
+
+# --- Private helpers ---
+
+def _read_metadata_csv(raw: bytes) -> pd.DataFrame | None:
+    """Read a metadata CSV from raw bytes, trying multiple encodings."""
+    for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            text = raw.decode(encoding)
+            df = pd.read_csv(io.StringIO(text), engine="python", sep=None)
+            df.columns = [str(c).strip() for c in df.columns]
+            return df
+        except (UnicodeDecodeError, pd.errors.ParserError):
+            continue
+    return None
+
+
+def _parse_primary_keys(df: pd.DataFrame) -> dict[str, list[str]]:
+    """Parse _Database_PrimaryKeys.csv into {table_name: [pk_columns]}.
+
+    Expected columns: TableName, PrimaryKeyName, ColumnName
+    """
+    pk_index: dict[str, list[str]] = {}
+
+    required = {"TableName", "ColumnName"}
+    if not required.issubset(set(df.columns)):
+        return pk_index
+
+    for _, row in df.iterrows():
+        table = str(row["TableName"]).strip()
+        column = str(row["ColumnName"]).strip()
+        if table and column:
+            pk_index.setdefault(table, []).append(column)
+
+    return pk_index
+
+
+def _parse_foreign_keys(df: pd.DataFrame) -> list[dict]:
+    """Parse _Database_ForeignKeys.csv into a list of FK dicts.
+
+    Expected columns: ForeignKeyName, ParentTable, ParentColumn,
+                      ReferencedTable, ReferencedColumn
+    """
+    fk_list: list[dict] = []
+
+    required = {"ParentTable", "ParentColumn", "ReferencedTable", "ReferencedColumn"}
+    if not required.issubset(set(df.columns)):
+        return fk_list
+
+    for _, row in df.iterrows():
+        fk_list.append({
+            "fk_name": str(row.get("ForeignKeyName", "")).strip(),
+            "parent_table": str(row["ParentTable"]).strip(),
+            "parent_column": str(row["ParentColumn"]).strip(),
+            "referenced_table": str(row["ReferencedTable"]).strip(),
+            "referenced_column": str(row["ReferencedColumn"]).strip(),
+        })
+
+    return fk_list
+
+
+def _parse_columns(df: pd.DataFrame) -> dict[tuple[str, str], dict]:
+    """Parse _Database_Columns.csv into {(table, column): type_info}.
+
+    Expected columns: TableName, ColumnName, DataType, MaxLength, IsNullable
+    """
+    col_index: dict[tuple[str, str], dict] = {}
+
+    required = {"TableName", "ColumnName", "DataType"}
+    if not required.issubset(set(df.columns)):
+        return col_index
+
+    for _, row in df.iterrows():
+        table = str(row["TableName"]).strip()
+        column = str(row["ColumnName"]).strip()
+        data_type = _normalize_sql_type(str(row["DataType"]).strip())
+        max_length = int(row.get("MaxLength", 0) or 0)
+        raw_nullable = row.get("IsNullable")
+        is_nullable = bool(int(raw_nullable)) if pd.notna(raw_nullable) else True
+
+        col_index[(table, column)] = {
+            "data_type": data_type,
+            "max_length": max_length,
+            "is_nullable": is_nullable,
+        }
+
+    return col_index
+
+
+def _normalize_sql_type(sql_type: str) -> str:
+    """Normalize a SQL Server data type to our display types."""
+    sql_upper = sql_type.upper()
+
+    int_types = {"INT", "BIGINT", "SMALLINT", "TINYINT"}
+    if sql_upper in int_types:
+        return "INT"
+
+    float_types = {"FLOAT", "REAL", "DECIMAL", "NUMERIC", "MONEY", "SMALLMONEY"}
+    if sql_upper in float_types:
+        return "FLOAT"
+
+    if sql_upper in ("BIT",):
+        return "BOOLEAN"
+
+    text_types = {"TEXT", "NTEXT", "XML"}
+    if sql_upper in text_types:
+        return "TEXT"
+
+    varchar_types = {"VARCHAR", "NVARCHAR", "CHAR", "NCHAR", "SYSNAME"}
+    if sql_upper in varchar_types:
+        return "VARCHAR"
+
+    date_types = {"DATETIME", "DATETIME2", "SMALLDATETIME", "DATE", "TIME",
+                  "DATETIMEOFFSET", "TIMESTAMP"}
+    if sql_upper in date_types:
+        return "TIMESTAMP"
+
+    if sql_upper == "UNIQUEIDENTIFIER":
+        return "UUID"
+
+    binary_types = {"BINARY", "VARBINARY", "IMAGE"}
+    if sql_upper in binary_types:
+        return "BINARY"
+
+    return sql_upper
+===== END: metadata_parser.py =====
 ===== FILE: relationship_analyzer.py =====
 """Relationship analysis module — detects FK relationships between tables."""
 
@@ -1000,6 +1410,7 @@ def detect_relationships(
     tables: list[dict],
     dataframes: dict[str, pd.DataFrame],
     value_matching: bool = False,
+    name_matching: bool = True,
 ) -> list[dict]:
     """Detect FK relationships across all loaded tables.
 
@@ -1015,44 +1426,48 @@ def detect_relationships(
     seen: set[tuple[str, str, str, str]] = set()
 
     # Strategy 1: name-based matching (FK columns -> PK columns)
-    for table in tables:
-        table_name = table["name"]
-        source_df = dataframes.get(table_name)
+    if name_matching:
+        for table in tables:
+            table_name = table["name"]
+            source_df = dataframes.get(table_name)
 
-        for col in table["columns"]:
-            if col.get("key_type") != "FK":
-                continue
-
-            matches = _find_target_table(col["name"], table_name, pk_index, tables)
-            for target_table, target_column in matches:
-                key = (table_name, col["name"], target_table, target_column)
-                if key in seen:
+            for col in table["columns"]:
+                if col.get("key_type") != "FK":
                     continue
-                seen.add(key)
 
-                target_df = dataframes.get(target_table)
-                cardinality = infer_cardinality(
-                    source_df, col["name"], target_df, target_column,
-                )
-                confidence = score_relationship(
-                    col["name"], target_table, target_column,
-                    col.get("type", ""), _get_column_type(tables, target_table, target_column),
-                )
-                relationships.append({
-                    "source_table": table_name,
-                    "source_column": col["name"],
-                    "target_table": target_table,
-                    "target_column": target_column,
-                    "type": cardinality,
-                    "confidence": confidence,
-                })
+                matches = _find_target_table(col["name"], table_name, pk_index, tables)
+                for target_table, target_column in matches:
+                    key = (table_name, col["name"], target_table, target_column)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+
+                    target_df = dataframes.get(target_table)
+                    cardinality = infer_cardinality(
+                        source_df, col["name"], target_df, target_column,
+                    )
+                    confidence = score_relationship(
+                        col["name"], target_table, target_column,
+                        col.get("type", ""), _get_column_type(tables, target_table, target_column),
+                    )
+                    relationships.append({
+                        "source_table": table_name,
+                        "source_column": col["name"],
+                        "target_table": target_table,
+                        "target_column": target_column,
+                        "type": cardinality,
+                        "confidence": confidence,
+                    })
 
     # Strategy 2: value-based matching (compare actual data across tables)
     if value_matching:
         value_rels = _detect_by_values(tables, dataframes, unique_index, seen)
         relationships.extend(value_rels)
 
-    # Strategy 3: self-references
+    # Strategy 3: self-references (part of name-based detection)
+    if not name_matching:
+        return relationships
+
     for table in tables:
         table_name = table["name"]
         source_df = dataframes.get(table_name)
@@ -5942,6 +6357,26 @@ ul {
   line-height: 1.3;
 }
 
+.settings-panel__toggle--hidden,
+.settings-panel__hint--hidden {
+  display: none;
+}
+
+.settings-panel__clear-btn {
+  margin-top: 6px;
+  padding: 4px 10px;
+  font-size: 12px;
+  color: var(--chrome-text);
+  background: var(--chrome-hover);
+  border: 1px solid var(--chrome-border);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.settings-panel__clear-btn:hover {
+  background: var(--chrome-input-bg);
+}
+
 /* Search Bar */
 .search-bar {
   position: relative;
@@ -6134,6 +6569,112 @@ ul {
 
 .zoom-indicator--visible {
   opacity: 1;
+}
+
+/* ============================================
+   Legend
+   ============================================ */
+.legend {
+  position: absolute;
+  bottom: 16px;
+  right: 16px;
+  background: var(--chrome-bg);
+  border: 1px solid var(--chrome-border);
+  border-radius: var(--radius-md, 8px);
+  padding: 10px 14px;
+  min-width: 170px;
+  z-index: 20;
+  box-shadow: var(--shadow-md);
+  font-size: 12px;
+  color: var(--chrome-text);
+}
+
+.legend--hidden {
+  display: none;
+}
+
+.legend__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.legend__title {
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.legend__close {
+  background: none;
+  border: none;
+  color: var(--chrome-text-secondary);
+  cursor: pointer;
+  font-size: 16px;
+  padding: 0 2px;
+  line-height: 1;
+}
+
+.legend__close:hover {
+  color: var(--chrome-text);
+}
+
+.legend__section {
+  margin-bottom: 8px;
+}
+
+.legend__section:last-child {
+  margin-bottom: 0;
+}
+
+.legend__section-label {
+  display: block;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--chrome-text-secondary);
+  margin-bottom: 4px;
+}
+
+.legend__item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0;
+}
+
+.legend__line {
+  display: inline-block;
+  width: 24px;
+  height: 3px;
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+
+.legend__line--one-to-one   { background: var(--rel-one-one); }
+.legend__line--one-to-many  { background: var(--rel-one-many); }
+.legend__line--many-to-many { background: var(--rel-many-many); }
+.legend__line--self          { background: var(--rel-self); }
+
+.legend__badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 16px;
+  border-radius: 3px;
+  font-size: 9px;
+  font-weight: 700;
+  color: #fff;
+  flex-shrink: 0;
+}
+
+.legend__badge--pk { background: var(--pk-color); }
+.legend__badge--fk { background: var(--fk-color); }
+.legend__badge--uq { background: var(--uq-color); }
+
+.legend__label {
+  color: var(--chrome-text);
 }
 
 /* ============================================
@@ -6667,6 +7208,8 @@ function handleMouseDown(e) {
 
   if (hit && hit.columnIndex === -1) {
     startDrag(hit.tableName, canvasPos, e.shiftKey);
+  } else if (hit && hit.columnIndex >= 0) {
+    handleColumnClick(hit.tableName, hit.columnIndex, e.shiftKey);
   } else if (hit) {
     handleBlockClick(hit.tableName, e.shiftKey);
   } else {
@@ -6786,6 +7329,26 @@ function handleMouseUp() {
     isPanning = false;
     panStart = null;
     panViewportStart = null;
+  }
+}
+
+function handleColumnClick(tableName, columnIndex, shiftKey) {
+  const tables = State.getTables();
+  const table = tables.find((t) => t.name === tableName);
+  if (!table || !table.columns[columnIndex]) return;
+
+  const col = table.columns[columnIndex];
+  const current = State.getSelectedColumn();
+
+  // Toggle: clicking the same column again deselects it
+  if (current && current.table === tableName && current.column === col.name) {
+    State.setSelectedColumn(null);
+  } else {
+    State.setSelectedColumn({ table: tableName, column: col.name });
+  }
+
+  if (!shiftKey) {
+    State.setSelectedTables([tableName]);
   }
 }
 
@@ -6940,6 +7503,7 @@ function wireKeyboard() {
     }
 
     if (e.key === 'Escape') {
+      State.setSelectedColumn(null);
       State.setSelectedTables([]);
       return;
     }
@@ -7041,6 +7605,8 @@ function init() {
   wireToolbar();
   wireKeyboard();
   wireSidebarCollapseToggles();
+  wireLegend();
+  wireClearSelection();
   render();
   updateZoomLabel();
 }
@@ -7052,6 +7618,34 @@ if (document.readyState === 'loading') {
 }
 
 // ---- Sidebar section collapse/expand ----
+
+function wireClearSelection() {
+  const btn = document.getElementById('btn-clear-selection');
+  if (!btn) return;
+
+  btn.addEventListener('click', () => {
+    State.setSelectedColumn(null);
+    State.setSelectedTables([]);
+  });
+
+  // Show/hide button based on selectedColumn state
+  EventBus.on('stateChanged', ({ key }) => {
+    if (key === 'selectedColumn') {
+      const col = State.getSelectedColumn();
+      btn.hidden = !col;
+    }
+  });
+}
+
+function wireLegend() {
+  const legend = document.getElementById('legend');
+  const closeBtn = document.getElementById('legend-close');
+  if (!legend || !closeBtn) return;
+
+  closeBtn.addEventListener('click', () => {
+    legend.classList.add('legend--hidden');
+  });
+}
 
 function wireSidebarCollapseToggles() {
   document.querySelectorAll('.sidebar__section-title--toggle').forEach((title) => {
@@ -7119,7 +7713,7 @@ function getBlockFilterResult(tableName, activeFilters) {
 }
 
 function getBlockVisualState(tableName, state, traceTableSet) {
-  const { selectedTables, hoveredTable, hoveredColumn, hoveredConnection, activeFilters } = state;
+  const { selectedTables, hoveredTable, hoveredColumn, hoveredConnection, activeFilters, selectedColumn, connections } = state;
 
   // Trace mode: dim tables not in the trace path
   if (traceTableSet && !traceTableSet.has(tableName)) return 'dimmed';
@@ -7135,6 +7729,13 @@ function getBlockVisualState(tableName, state, traceTableSet) {
   if (selectedTables.includes(tableName)) return 'selected';
   if (tableName === hoveredTable) return 'hover';
 
+  // Selected column mode: dim unrelated tables
+  if (selectedColumn && !hasActiveHover) {
+    if (selectedColumn.table === tableName) return 'default';
+    if (isTableConnectedToColumn(tableName, selectedColumn, connections)) return 'default';
+    return 'dimmed';
+  }
+
   if (hasActiveHover) {
     const isRelated = tableName === hoveredTable ||
       (hoveredColumn && hoveredColumn.table === tableName) ||
@@ -7143,6 +7744,15 @@ function getBlockVisualState(tableName, state, traceTableSet) {
   }
 
   return 'default';
+}
+
+function isTableConnectedToColumn(tableName, selectedColumn, connections) {
+  if (!connections) return false;
+  for (const conn of connections) {
+    if (conn.source.table === selectedColumn.table && conn.source.column === selectedColumn.column && conn.target.table === tableName) return true;
+    if (conn.target.table === selectedColumn.table && conn.target.column === selectedColumn.column && conn.source.table === tableName) return true;
+  }
+  return false;
 }
 
 function isTableInHoveredConnection(tableName, hoveredConnection) {
@@ -7300,15 +7910,20 @@ function drawCollapsedBadge(ctx, textX, cy, columnCount) {
   ctx.fillText(text, textX, cy);
 }
 
-function drawColumnRows(ctx, table, x, y, w, hoveredColumn) {
+function drawColumnRows(ctx, table, x, y, w, hoveredColumn, selectedColumn) {
   const startY = y + HEADER_HEIGHT;
 
   for (let i = 0; i < table.columns.length; i++) {
     const col = table.columns[i];
     const rowY = startY + i * ROW_HEIGHT;
 
-    // Row hover highlight
-    if (hoveredColumn && hoveredColumn.table === table.name && hoveredColumn.column === col.name) {
+    // Selected column highlight (persistent)
+    const isSelected = selectedColumn && selectedColumn.table === table.name && selectedColumn.column === col.name;
+    if (isSelected) {
+      ctx.fillStyle = BLOCK_COLORS.headerSelected;
+      ctx.fillRect(x, rowY, w, ROW_HEIGHT);
+    } else if (hoveredColumn && hoveredColumn.table === table.name && hoveredColumn.column === col.name) {
+      // Row hover highlight
       ctx.fillStyle = BLOCK_COLORS.rowHover;
       ctx.fillRect(x, rowY, w, ROW_HEIGHT);
     }
@@ -7414,7 +8029,7 @@ export function redrawAll() {
     drawHeader(ctx, pos.x, pos.y, width, table.name, vs, isCollapsed, table.columns.length);
 
     if (!isCollapsed) {
-      drawColumnRows(ctx, table, pos.x, pos.y, width, state.hoveredColumn);
+      drawColumnRows(ctx, table, pos.x, pos.y, width, state.hoveredColumn, state.selectedColumn);
     }
 
     ctx.globalAlpha = 1.0;
@@ -8166,10 +8781,16 @@ import { HEADER_HEIGHT, ROW_HEIGHT, GRID_GAP, GRID_COL_WIDTH, GRID_ROW_HEIGHT, G
 const GRID_START_X = 40;
 const GRID_START_Y = 40;
 
-/** Check if value-based matching is enabled. */
-function isValueMatchingEnabled() {
-  const toggle = document.getElementById('toggle-value-matching');
-  return toggle ? toggle.checked : false;
+/** Get current state of all relationship source toggles. */
+function getRelationshipToggles() {
+  const metadata = document.getElementById('toggle-metadata');
+  const nameBased = document.getElementById('toggle-name-matching');
+  const valueBased = document.getElementById('toggle-value-matching');
+  return {
+    metadata: metadata ? metadata.checked : true,
+    name_based: nameBased ? nameBased.checked : true,
+    value_matching: valueBased ? valueBased.checked : false,
+  };
 }
 
 /** Wire file input and drag-and-drop events. */
@@ -8192,7 +8813,7 @@ export async function uploadCSVFiles(files) {
     formData.append('existing_tables', JSON.stringify(existingTables));
   }
 
-  formData.append('value_matching', String(isValueMatchingEnabled()));
+  formData.append('value_matching', String(getRelationshipToggles().value_matching));
 
   const response = await fetch('/api/upload-csv', { method: 'POST', body: formData });
   if (!response.ok) return;
@@ -8220,6 +8841,11 @@ function processUploadResponse(data) {
   if (relationships && relationships.length > 0) {
     const connections = transformRelationships(relationships);
     State.setConnections(connections);
+  }
+
+  // Show metadata checkbox only when metadata CSVs were uploaded
+  if (data.has_metadata) {
+    showMetadataToggle();
   }
 
   updateSidebarTableList();
@@ -8394,24 +9020,38 @@ function updateSidebarTableList() {
 }
 
 function wireValueMatchingToggle() {
-  const toggle = document.getElementById('toggle-value-matching');
-  if (!toggle) return;
+  const ids = ['toggle-metadata', 'toggle-name-matching', 'toggle-value-matching'];
 
-  toggle.addEventListener('change', async () => {
-    const tables = State.getTables();
-    if (tables.length === 0) return;
+  ids.forEach((id) => {
+    const toggle = document.getElementById(id);
+    if (!toggle) return;
 
-    const response = await fetch('/api/detect-relationships', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ value_matching: toggle.checked }),
-    });
-    if (!response.ok) return;
-
-    const data = await response.json();
-    const connections = transformRelationships(data.relationships || []);
-    State.setConnections(connections);
+    toggle.addEventListener('change', () => redetectRelationships());
   });
+}
+
+async function redetectRelationships() {
+  const tables = State.getTables();
+  if (tables.length === 0) return;
+
+  const toggles = getRelationshipToggles();
+  const response = await fetch('/api/detect-relationships', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(toggles),
+  });
+  if (!response.ok) return;
+
+  const data = await response.json();
+  const connections = transformRelationships(data.relationships || []);
+  State.setConnections(connections);
+}
+
+function showMetadataToggle() {
+  const label = document.getElementById('toggle-metadata-label');
+  const hint = document.getElementById('hint-metadata');
+  if (label) label.classList.remove('settings-panel__toggle--hidden');
+  if (hint) hint.classList.remove('settings-panel__hint--hidden');
 }
 
 // Re-render sidebar when tables change
@@ -9175,6 +9815,7 @@ const initialState = () => ({
   hoveredTable: null,
   hoveredColumn: null,
   hoveredConnection: null,
+  selectedColumn: null,
   activeFilters: [],
   searchQuery: null,
   searchMode: 'contains',
@@ -9362,6 +10003,15 @@ export const setSelectedTables = (tables) => {
   state.selectedTables = [...tables];
   emitChange('stateChanged', { key: 'selectedTables' }, 'selectedTables');
 };
+
+export const setSelectedColumn = (col) => {
+  if (state.selectedColumn === col) return;
+  if (col && state.selectedColumn && col.table === state.selectedColumn.table && col.column === state.selectedColumn.column) return;
+  state.selectedColumn = col;
+  emitChange('stateChanged', { key: 'selectedColumn' }, 'selectedColumn');
+};
+
+export const getSelectedColumn = () => state.selectedColumn;
 
 // --------------- Full State ---------------
 
@@ -9674,11 +10324,22 @@ export function escapeHtml(str) {
           <span class="sidebar__section-arrow"></span>Settings
         </h2>
         <div class="settings-panel" id="settings-panel">
+          <label class="settings-panel__toggle settings-panel__toggle--hidden" id="toggle-metadata-label">
+            <input type="checkbox" id="toggle-metadata" checked>
+            <span class="settings-panel__label">Schema connections</span>
+          </label>
+          <p class="settings-panel__hint settings-panel__hint--hidden" id="hint-metadata">Exact FK relationships from database metadata</p>
+          <label class="settings-panel__toggle">
+            <input type="checkbox" id="toggle-name-matching" checked>
+            <span class="settings-panel__label">Name-based matching</span>
+          </label>
+          <p class="settings-panel__hint">Detect relationships by column naming conventions</p>
           <label class="settings-panel__toggle">
             <input type="checkbox" id="toggle-value-matching">
             <span class="settings-panel__label">Value-based matching</span>
           </label>
           <p class="settings-panel__hint">Connect tables by matching data values (may produce false positives)</p>
+          <button class="settings-panel__clear-btn" id="btn-clear-selection" hidden>Clear selection</button>
         </div>
       </div>
 
@@ -9737,6 +10398,47 @@ export function escapeHtml(str) {
         <!-- Drop overlay for drag-and-drop onto canvas -->
         <div class="canvas-container__drop-overlay" id="canvas-drop-overlay">
           <p>Drop CSV files to import</p>
+        </div>
+        <!-- Legend -->
+        <div class="legend" id="legend">
+          <div class="legend__header">
+            <span class="legend__title">Legend</span>
+            <button class="legend__close" id="legend-close" title="Close">&times;</button>
+          </div>
+          <div class="legend__section">
+            <span class="legend__section-label">Relationships</span>
+            <div class="legend__item">
+              <span class="legend__line legend__line--one-to-one"></span>
+              <span class="legend__label">One-to-one</span>
+            </div>
+            <div class="legend__item">
+              <span class="legend__line legend__line--one-to-many"></span>
+              <span class="legend__label">One-to-many</span>
+            </div>
+            <div class="legend__item">
+              <span class="legend__line legend__line--many-to-many"></span>
+              <span class="legend__label">Many-to-many</span>
+            </div>
+            <div class="legend__item">
+              <span class="legend__line legend__line--self"></span>
+              <span class="legend__label">Self-reference</span>
+            </div>
+          </div>
+          <div class="legend__section">
+            <span class="legend__section-label">Key Types</span>
+            <div class="legend__item">
+              <span class="legend__badge legend__badge--pk">PK</span>
+              <span class="legend__label">Primary Key</span>
+            </div>
+            <div class="legend__item">
+              <span class="legend__badge legend__badge--fk">FK</span>
+              <span class="legend__label">Foreign Key</span>
+            </div>
+            <div class="legend__item">
+              <span class="legend__badge legend__badge--uq">UQ</span>
+              <span class="legend__label">Unique</span>
+            </div>
+          </div>
         </div>
       </div>
     </main>
