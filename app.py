@@ -9,6 +9,13 @@ from werkzeug.utils import secure_filename
 
 from csv_handler import parse_csv_columns
 from key_detector import detect_keys
+from metadata_parser import (
+    is_metadata_file,
+    parse_metadata_csvs,
+    build_table_name_map,
+    apply_metadata_keys,
+    build_metadata_relationships,
+)
 from relationship_analyzer import detect_relationships
 from search import search_all_tables
 from trace import trace_value
@@ -55,8 +62,9 @@ def upload_csv():
         except (json.JSONDecodeError, TypeError):
             pass
 
-    new_tables: list[dict] = []
-    all_table_names = list(loaded_tables.keys())
+    # Separate metadata files from data files
+    metadata_raw: dict[str, bytes] = {}
+    data_files = []
 
     for file in files:
         if not file or not file.filename:
@@ -66,11 +74,25 @@ def upload_csv():
         if not filename.lower().endswith(".csv"):
             continue
 
+        raw = file.read()
+        file.seek(0)
+
+        if is_metadata_file(filename):
+            metadata_raw[filename] = raw
+        else:
+            data_files.append((filename, raw))
+
+    # Parse metadata CSVs (PKs, FKs, column types) if present
+    metadata = parse_metadata_csvs(metadata_raw)
+    has_metadata = bool(metadata_raw)
+
+    new_tables: list[dict] = []
+    all_table_names = list(loaded_tables.keys())
+
+    for filename, raw in data_files:
         table_name = filename.rsplit(".", 1)[0]
 
         try:
-            raw = file.read()
-            file.seek(0)
             # Try utf-8-sig first (handles BOM from SQL Server exports)
             for encoding in ("utf-8-sig", "utf-8", "latin-1"):
                 try:
@@ -111,11 +133,47 @@ def upload_csv():
         loaded_dataframes[table_name] = df
         new_tables.append(table_info)
 
-    value_matching = request.form.get("value_matching", "").lower() == "true"
-    detected_relationships = detect_relationships(
-        list(loaded_tables.values()), loaded_dataframes,
-        value_matching=value_matching,
-    )
+    # If metadata CSVs were provided, use them for accurate keys and relationships
+    if has_metadata:
+        # Collect all table names referenced in metadata
+        meta_table_names: set[str] = set()
+        for pk_table in metadata["primary_keys"]:
+            meta_table_names.add(pk_table)
+        for fk in metadata["foreign_keys"]:
+            meta_table_names.add(fk["parent_table"])
+            meta_table_names.add(fk["referenced_table"])
+        for (tbl, _col) in metadata["columns"]:
+            meta_table_names.add(tbl)
+
+        # Map metadata table names -> loaded table names
+        name_map = build_table_name_map(
+            list(loaded_tables.keys()), meta_table_names,
+        )
+
+        # Apply PK and column type metadata to each table
+        for meta_name, loaded_name in name_map.items():
+            if loaded_name in loaded_tables:
+                apply_metadata_keys(
+                    loaded_tables[loaded_name],
+                    metadata["primary_keys"],
+                    metadata["columns"],
+                    meta_name,
+                )
+
+        # Build relationships from FK metadata
+        detected_relationships = build_metadata_relationships(
+            metadata["foreign_keys"],
+            name_map,
+            loaded_tables,
+            loaded_dataframes,
+        )
+    else:
+        # Fall back to heuristic relationship detection
+        value_matching = request.form.get("value_matching", "").lower() == "true"
+        detected_relationships = detect_relationships(
+            list(loaded_tables.values()), loaded_dataframes,
+            value_matching=value_matching,
+        )
 
     return jsonify({
         "tables": list(loaded_tables.values()),
