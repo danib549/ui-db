@@ -248,14 +248,9 @@ function handleColumnClick(tableName, columnIndex, shiftKey) {
   if (!table || !table.columns[columnIndex]) return;
 
   const col = table.columns[columnIndex];
-  const current = State.getSelectedColumn();
 
-  // Toggle: clicking the same column again deselects it
-  if (current && current.table === tableName && current.column === col.name) {
-    State.setSelectedColumn(null);
-  } else {
-    State.setSelectedColumn({ table: tableName, column: col.name });
-  }
+  // Lock selection on this column — only ESC clears it
+  State.setSelectedColumn({ table: tableName, column: col.name });
 
   if (!shiftKey) {
     State.setSelectedTables([tableName]);

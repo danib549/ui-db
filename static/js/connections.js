@@ -202,11 +202,9 @@ function isHighlighted(connection, interactionState) {
 }
 
 /**
- * BFS from a selected column to find connections to highlight (locked hover mode).
+ * BFS from a selected column to find all connections to highlight (locked hover mode).
  * Returns a Set of connection keys ("srcTable.srcCol->tgtTable.tgtCol").
- * Shows all connections from the selected column's TABLE (matching hover behavior).
- * For many-to-many connections, extends the path beyond the closest tables
- * by following ALL connections from M:M-reached tables (full chain).
+ * Follows ALL connection types to show the full relationship path.
  */
 function buildSelectedColumnPathSet(selectedColumn, connections) {
   if (!selectedColumn || !connections || connections.length === 0) return null;
@@ -214,42 +212,23 @@ function buildSelectedColumnPathSet(selectedColumn, connections) {
   const pathSet = new Set();
   const visitedTables = new Set();
   visitedTables.add(selectedColumn.table);
-  const m2mQueue = [];
 
-  // Find all connections from the selected column's table
-  for (const conn of connections) {
-    const isSource = conn.source.table === selectedColumn.table;
-    const isTarget = conn.target.table === selectedColumn.table;
-    if (!isSource && !isTarget) continue;
-
-    pathSet.add(connKey(conn));
-    const neighbor = isSource ? conn.target.table : conn.source.table;
-    if (!visitedTables.has(neighbor)) {
-      visitedTables.add(neighbor);
-    }
-    // For M:M connections, queue the neighbor for extended traversal
-    if (conn.type === 'many-to-many') {
-      m2mQueue.push(neighbor);
-    }
-  }
-
-  // BFS: for M:M connections, follow ALL connections from M:M-reached tables
+  // BFS: follow ALL connections from the selected column's table to show full path
+  const queue = [selectedColumn.table];
   let idx = 0;
-  while (idx < m2mQueue.length) {
-    const tableName = m2mQueue[idx++];
-    for (const conn of connections) {
-      const key = connKey(conn);
-      if (pathSet.has(key)) continue;
 
+  while (idx < queue.length) {
+    const tableName = queue[idx++];
+    for (const conn of connections) {
       let neighbor = null;
       if (conn.source.table === tableName) neighbor = conn.target.table;
       else if (conn.target.table === tableName) neighbor = conn.source.table;
       else continue;
 
-      pathSet.add(key);
+      pathSet.add(connKey(conn));
       if (!visitedTables.has(neighbor)) {
         visitedTables.add(neighbor);
-        m2mQueue.push(neighbor);
+        queue.push(neighbor);
       }
     }
   }
