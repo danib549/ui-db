@@ -201,20 +201,70 @@ function isHighlighted(connection, interactionState) {
   return false;
 }
 
-function isSelectedColumnConnection(connection, selectedColumn) {
-  if (!selectedColumn) return false;
-  return (connection.source.table === selectedColumn.table && connection.source.column === selectedColumn.column) ||
-    (connection.target.table === selectedColumn.table && connection.target.column === selectedColumn.column);
+/**
+ * BFS from a selected column to find all reachable connections (full path).
+ * Returns a Set of connection keys ("srcTable.srcCol->tgtTable.tgtCol")
+ * for every connection in the reachable chain.
+ */
+function buildSelectedColumnPathSet(selectedColumn, connections) {
+  if (!selectedColumn || !connections || connections.length === 0) return null;
+
+  const pathSet = new Set();
+  const visitedTables = new Set();
+  const queue = [selectedColumn.table];
+  visitedTables.add(selectedColumn.table);
+
+  // First pass: find direct connections from the selected column
+  for (const conn of connections) {
+    if (conn.source.table === selectedColumn.table && conn.source.column === selectedColumn.column) {
+      const key = connKey(conn);
+      pathSet.add(key);
+      if (!visitedTables.has(conn.target.table)) {
+        visitedTables.add(conn.target.table);
+        queue.push(conn.target.table);
+      }
+    }
+    if (conn.target.table === selectedColumn.table && conn.target.column === selectedColumn.column) {
+      const key = connKey(conn);
+      pathSet.add(key);
+      if (!visitedTables.has(conn.source.table)) {
+        visitedTables.add(conn.source.table);
+        queue.push(conn.source.table);
+      }
+    }
+  }
+
+  // BFS: follow connections from reached tables
+  let idx = 1; // start after the origin table
+  while (idx < queue.length) {
+    const tableName = queue[idx++];
+    for (const conn of connections) {
+      const key = connKey(conn);
+      if (pathSet.has(key)) continue;
+
+      let neighbor = null;
+      if (conn.source.table === tableName) neighbor = conn.target.table;
+      else if (conn.target.table === tableName) neighbor = conn.source.table;
+      else continue;
+
+      pathSet.add(key);
+      if (!visitedTables.has(neighbor)) {
+        visitedTables.add(neighbor);
+        queue.push(neighbor);
+      }
+    }
+  }
+
+  return pathSet;
+}
+
+function connKey(conn) {
+  return `${conn.source.table}.${conn.source.column}->${conn.target.table}.${conn.target.column}`;
 }
 
 function isDimmed(connection, interactionState) {
-  const { hoveredTable, hoveredColumn, hoveredConnection, selectedColumn } = interactionState;
+  const { hoveredTable, hoveredColumn, hoveredConnection } = interactionState;
   const hasActiveHover = hoveredTable || hoveredColumn || hoveredConnection;
-
-  // Selected column mode: dim unrelated connections, highlight related ones
-  if (selectedColumn && !hasActiveHover) {
-    return !isSelectedColumnConnection(connection, selectedColumn);
-  }
 
   if (!hasActiveHover) return false;
   return !isHighlighted(connection, interactionState);
@@ -250,7 +300,7 @@ function getFilterResult(connection, activeFilters) {
   return 'none';
 }
 
-function resolveConnectionStyle(connection, interactionState, traceEdgeSet) {
+function resolveConnectionStyle(connection, interactionState, traceEdgeSet, selectedPathSet) {
   const isSelfRef = connection.source.table === connection.target.table;
   const baseColor = isSelfRef
     ? CONNECTION_COLORS['self']
@@ -275,9 +325,9 @@ function resolveConnectionStyle(connection, interactionState, traceEdgeSet) {
     return { color: baseColor, width: 2.5, dash: [], opacity: 1.0 };
   }
 
-  // Selected column: highlight its connections, dim everything else
-  if (interactionState.selectedColumn && !interactionState.hoveredTable && !interactionState.hoveredColumn && !interactionState.hoveredConnection) {
-    if (isSelectedColumnConnection(connection, interactionState.selectedColumn)) {
+  // Selected column: highlight full path, dim everything else
+  if (selectedPathSet && !interactionState.hoveredTable && !interactionState.hoveredColumn && !interactionState.hoveredConnection) {
+    if (selectedPathSet.has(connKey(connection))) {
       return { color: baseColor, width: 2.5, dash: [], opacity: 1.0 };
     }
     return { color: DIMMED_COLOR, width: 1, dash: [4, 4], opacity: 0.15 };
@@ -328,23 +378,24 @@ export function redrawAll() {
     activeFilters: state.activeFilters,
   };
   const traceEdgeSet = buildTraceEdgeSet(state.traceResults);
+  const selectedPathSet = buildSelectedColumnPathSet(state.selectedColumn, state.connections);
 
   ctx.save();
   applyViewportTransform(ctx, state.viewport);
 
   for (const connection of state.connections) {
-    drawSingleConnection(ctx, connection, blocks, interactionState, traceEdgeSet);
+    drawSingleConnection(ctx, connection, blocks, interactionState, traceEdgeSet, selectedPathSet);
   }
 
   ctx.restore();
 }
 
-function drawSingleConnection(ctx, connection, blocks, interactionState, traceEdgeSet) {
+function drawSingleConnection(ctx, connection, blocks, interactionState, traceEdgeSet, selectedPathSet) {
   const srcBlock = blocks[connection.source.table];
   const tgtBlock = blocks[connection.target.table];
   if (!srcBlock || !tgtBlock) return;
 
-  const style = resolveConnectionStyle(connection, interactionState, traceEdgeSet);
+  const style = resolveConnectionStyle(connection, interactionState, traceEdgeSet, selectedPathSet);
   if (!style) return; // null = skip (e.g. non-traced during active trace)
 
   if (style.animate) {

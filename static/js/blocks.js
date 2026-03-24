@@ -53,8 +53,8 @@ function getBlockFilterResult(tableName, activeFilters) {
   return 'none';
 }
 
-function getBlockVisualState(tableName, state, traceTableSet) {
-  const { selectedTables, hoveredTable, hoveredColumn, hoveredConnection, activeFilters, selectedColumn, connections } = state;
+function getBlockVisualState(tableName, state, traceTableSet, selectedPathTableSet) {
+  const { selectedTables, hoveredTable, hoveredColumn, hoveredConnection, activeFilters, selectedColumn } = state;
 
   // Trace mode: dim tables not in the trace path
   if (traceTableSet && !traceTableSet.has(tableName)) return 'dimmed';
@@ -70,10 +70,9 @@ function getBlockVisualState(tableName, state, traceTableSet) {
   if (selectedTables.includes(tableName)) return 'selected';
   if (tableName === hoveredTable) return 'hover';
 
-  // Selected column mode: dim unrelated tables
+  // Selected column mode: dim tables not in the full path
   if (selectedColumn && !hasActiveHover) {
-    if (selectedColumn.table === tableName) return 'default';
-    if (isTableConnectedToColumn(tableName, selectedColumn, connections)) return 'default';
+    if (selectedPathTableSet && selectedPathTableSet.has(tableName)) return 'default';
     return 'dimmed';
   }
 
@@ -87,13 +86,50 @@ function getBlockVisualState(tableName, state, traceTableSet) {
   return 'default';
 }
 
-function isTableConnectedToColumn(tableName, selectedColumn, connections) {
-  if (!connections) return false;
+/**
+ * BFS from a selected column to find all reachable tables through connections.
+ */
+function buildSelectedPathTableSet(selectedColumn, connections) {
+  if (!selectedColumn || !connections || connections.length === 0) return null;
+
+  const visited = new Set();
+  visited.add(selectedColumn.table);
+  const queue = [selectedColumn.table];
+
+  // First pass: only follow connections from the selected column itself
   for (const conn of connections) {
-    if (conn.source.table === selectedColumn.table && conn.source.column === selectedColumn.column && conn.target.table === tableName) return true;
-    if (conn.target.table === selectedColumn.table && conn.target.column === selectedColumn.column && conn.source.table === tableName) return true;
+    if (conn.source.table === selectedColumn.table && conn.source.column === selectedColumn.column) {
+      if (!visited.has(conn.target.table)) {
+        visited.add(conn.target.table);
+        queue.push(conn.target.table);
+      }
+    }
+    if (conn.target.table === selectedColumn.table && conn.target.column === selectedColumn.column) {
+      if (!visited.has(conn.source.table)) {
+        visited.add(conn.source.table);
+        queue.push(conn.source.table);
+      }
+    }
   }
-  return false;
+
+  // BFS: follow all connections from reached tables
+  let idx = 1;
+  while (idx < queue.length) {
+    const tbl = queue[idx++];
+    for (const conn of connections) {
+      let neighbor = null;
+      if (conn.source.table === tbl) neighbor = conn.target.table;
+      else if (conn.target.table === tbl) neighbor = conn.source.table;
+      else continue;
+
+      if (!visited.has(neighbor)) {
+        visited.add(neighbor);
+        queue.push(neighbor);
+      }
+    }
+  }
+
+  return visited;
 }
 
 function isTableInHoveredConnection(tableName, hoveredConnection) {
@@ -344,6 +380,9 @@ export function redrawAll() {
     ? new Set(state.traceResults.nodes.map(n => n.table))
     : null;
 
+  // Pre-build selected column path table set for full-path highlighting
+  const selectedPathTableSet = buildSelectedPathTableSet(state.selectedColumn, state.connections);
+
   ctx.save();
   applyViewportTransform(ctx, viewport);
 
@@ -358,7 +397,7 @@ export function redrawAll() {
 
     if (!isBlockVisible(block)) continue;
 
-    const visualState = getBlockVisualState(table.name, state, traceTableSet);
+    const visualState = getBlockVisualState(table.name, state, traceTableSet, selectedPathTableSet);
     if (visualState === 'hidden') continue;
     const vs = getVisualStyle(visualState);
 
