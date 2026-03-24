@@ -202,11 +202,10 @@ function isHighlighted(connection, interactionState) {
 }
 
 /**
- * BFS from a selected column to find connections to highlight (locked hover mode).
+ * BFS from a selected column to find ALL connections to highlight (persistent field hover mode).
  * Returns a Set of connection keys ("srcTable.srcCol->tgtTable.tgtCol").
- * Shows all connections from the selected column's TABLE (matching hover behavior).
- * For many-to-many connections, extends the path beyond the closest tables
- * by following ALL connections from M:M-reached tables (full chain).
+ * Traverses the full relationship graph — follows every connection type,
+ * not just immediate neighbors, so the entire chain is visible.
  */
 function buildSelectedColumnPathSet(selectedColumn, connections) {
   if (!selectedColumn || !connections || connections.length === 0) return null;
@@ -214,29 +213,11 @@ function buildSelectedColumnPathSet(selectedColumn, connections) {
   const pathSet = new Set();
   const visitedTables = new Set();
   visitedTables.add(selectedColumn.table);
-  const m2mQueue = [];
+  const queue = [selectedColumn.table];
 
-  // Find all connections from the selected column's table
-  for (const conn of connections) {
-    const isSource = conn.source.table === selectedColumn.table;
-    const isTarget = conn.target.table === selectedColumn.table;
-    if (!isSource && !isTarget) continue;
-
-    pathSet.add(connKey(conn));
-    const neighbor = isSource ? conn.target.table : conn.source.table;
-    if (!visitedTables.has(neighbor)) {
-      visitedTables.add(neighbor);
-    }
-    // For M:M connections, queue the neighbor for extended traversal
-    if (conn.type === 'many-to-many') {
-      m2mQueue.push(neighbor);
-    }
-  }
-
-  // BFS: for M:M connections, follow ALL connections from M:M-reached tables
   let idx = 0;
-  while (idx < m2mQueue.length) {
-    const tableName = m2mQueue[idx++];
+  while (idx < queue.length) {
+    const tableName = queue[idx++];
     for (const conn of connections) {
       const key = connKey(conn);
       if (pathSet.has(key)) continue;
@@ -249,7 +230,7 @@ function buildSelectedColumnPathSet(selectedColumn, connections) {
       pathSet.add(key);
       if (!visitedTables.has(neighbor)) {
         visitedTables.add(neighbor);
-        m2mQueue.push(neighbor);
+        queue.push(neighbor);
       }
     }
   }
