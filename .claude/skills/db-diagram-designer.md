@@ -526,15 +526,27 @@ After any table addition or removal, relationships should be re-analyzed:
 
 ---
 
-## Future: Search Integration
+## Integration: Search System
 
-The diagram designer will integrate with a cross-table search system that allows users to trace data values across related tables.
+The diagram integrates with a cross-table search system that allows users to trace data values across related tables.
 
-**Planned capabilities:**
+**Capabilities:**
 - Search for a specific value (e.g., user ID `42`) and highlight all tables/rows where it appears
 - Trace data flow: given a value in table A, follow FK relationships to find related records in tables B, C, D
 - Highlight the connection path on the diagram, showing the chain of joins
 - Display matched row counts as badges on table blocks during a search
 - Filter the diagram to show only tables involved in a search result
 
-This will connect the diagram's visual relationship mapping with actual data-level queries, turning the diagram from a static schema view into an interactive data exploration tool.
+---
+
+## Integration: PostgreSQL Schema Builder
+
+The diagram page serves as a **data source** for the PostgreSQL Schema Builder (`/builder`). Loaded CSV tables and their detected columns/keys are available to the builder for:
+
+- **Source-to-target mapping**: drag columns from source tables (loaded CSVs) to target tables (PG schema being built)
+- **Type suggestion**: the builder uses CSV column metadata (dtype, unique count, sample values) to suggest proper PG types
+- **Migration generation**: the builder generates INSERT INTO...SELECT scripts that reference the source tables
+
+**Data flow**: Diagram page loads CSVs → backend stores in memory → builder page fetches via `/api/table-data` → user maps columns → builder generates DDL + migration SQL.
+
+See skills: `pg-ddl-engine.md`, `pg-builder-ui.md`, `pg-validation.md`, `pg-migration.md`.
