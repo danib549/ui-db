@@ -7725,15 +7725,16 @@ function getBlockVisualState(tableName, state, traceTableSet, selectedPathTableS
 
   const hasActiveHover = hoveredTable || hoveredColumn || hoveredConnection;
 
+  // Selected column mode: takes priority over hover — dim tables not in the full path
+  if (selectedPathTableSet) {
+    if (selectedTables.includes(tableName)) return 'selected';
+    if (selectedPathTableSet.has(tableName)) return 'default';
+    return 'dimmed';
+  }
+
   if (selectedTables.includes(tableName) && tableName === hoveredTable) return 'selected-hover';
   if (selectedTables.includes(tableName)) return 'selected';
   if (tableName === hoveredTable) return 'hover';
-
-  // Selected column mode: dim tables not in the full path
-  if (selectedColumn && !hasActiveHover) {
-    if (selectedPathTableSet && selectedPathTableSet.has(tableName)) return 'default';
-    return 'dimmed';
-  }
 
   if (hasActiveHover) {
     const isRelated = tableName === hoveredTable ||
@@ -8604,16 +8605,16 @@ function resolveConnectionStyle(connection, interactionState, traceEdgeSet, sele
     return { color: DIMMED_COLOR, width: 1, dash: [4, 4], opacity: 0.15 };
   }
 
-  if (isHighlighted(connection, interactionState)) {
-    return { color: baseColor, width: 2.5, dash: [], opacity: 1.0 };
-  }
-
-  // Selected column: highlight full path, dim everything else
-  if (selectedPathSet && !interactionState.hoveredTable && !interactionState.hoveredColumn && !interactionState.hoveredConnection) {
+  // Selected column: highlight full path, dim everything else (takes priority over hover)
+  if (selectedPathSet) {
     if (selectedPathSet.has(connKey(connection))) {
       return { color: baseColor, width: 2.5, dash: [], opacity: 1.0 };
     }
     return { color: DIMMED_COLOR, width: 1, dash: [4, 4], opacity: 0.15 };
+  }
+
+  if (isHighlighted(connection, interactionState)) {
+    return { color: baseColor, width: 2.5, dash: [], opacity: 1.0 };
   }
 
   if (isDimmed(connection, interactionState)) {
