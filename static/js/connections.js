@@ -202,42 +202,41 @@ function isHighlighted(connection, interactionState) {
 }
 
 /**
- * BFS from a selected column to find all reachable connections (full path).
- * Returns a Set of connection keys ("srcTable.srcCol->tgtTable.tgtCol")
- * for every connection in the reachable chain.
+ * BFS from a selected column to find connections to highlight (locked hover mode).
+ * Returns a Set of connection keys ("srcTable.srcCol->tgtTable.tgtCol").
+ * Direct connections from the selected column are always included.
+ * For many-to-many connections, extends the path beyond the closest tables
+ * by following ALL connections from M:M-reached tables (full chain).
  */
 function buildSelectedColumnPathSet(selectedColumn, connections) {
   if (!selectedColumn || !connections || connections.length === 0) return null;
 
   const pathSet = new Set();
   const visitedTables = new Set();
-  const queue = [selectedColumn.table];
   visitedTables.add(selectedColumn.table);
+  const m2mQueue = [];
 
   // First pass: find direct connections from the selected column
   for (const conn of connections) {
-    if (conn.source.table === selectedColumn.table && conn.source.column === selectedColumn.column) {
-      const key = connKey(conn);
-      pathSet.add(key);
-      if (!visitedTables.has(conn.target.table)) {
-        visitedTables.add(conn.target.table);
-        queue.push(conn.target.table);
-      }
+    const isSource = conn.source.table === selectedColumn.table && conn.source.column === selectedColumn.column;
+    const isTarget = conn.target.table === selectedColumn.table && conn.target.column === selectedColumn.column;
+    if (!isSource && !isTarget) continue;
+
+    pathSet.add(connKey(conn));
+    const neighbor = isSource ? conn.target.table : conn.source.table;
+    if (!visitedTables.has(neighbor)) {
+      visitedTables.add(neighbor);
     }
-    if (conn.target.table === selectedColumn.table && conn.target.column === selectedColumn.column) {
-      const key = connKey(conn);
-      pathSet.add(key);
-      if (!visitedTables.has(conn.source.table)) {
-        visitedTables.add(conn.source.table);
-        queue.push(conn.source.table);
-      }
+    // For M:M connections, queue the neighbor for extended traversal
+    if (conn.type === 'many-to-many') {
+      m2mQueue.push(neighbor);
     }
   }
 
-  // BFS: follow connections from reached tables
-  let idx = 1; // start after the origin table
-  while (idx < queue.length) {
-    const tableName = queue[idx++];
+  // BFS: for M:M connections, follow ALL connections from M:M-reached tables
+  let idx = 0;
+  while (idx < m2mQueue.length) {
+    const tableName = m2mQueue[idx++];
     for (const conn of connections) {
       const key = connKey(conn);
       if (pathSet.has(key)) continue;
@@ -250,7 +249,7 @@ function buildSelectedColumnPathSet(selectedColumn, connections) {
       pathSet.add(key);
       if (!visitedTables.has(neighbor)) {
         visitedTables.add(neighbor);
-        queue.push(neighbor);
+        m2mQueue.push(neighbor);
       }
     }
   }
