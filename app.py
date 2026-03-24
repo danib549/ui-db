@@ -111,8 +111,10 @@ def upload_csv():
         loaded_dataframes[table_name] = df
         new_tables.append(table_info)
 
+    value_matching = request.form.get("value_matching", "").lower() == "true"
     detected_relationships = detect_relationships(
         list(loaded_tables.values()), loaded_dataframes,
+        value_matching=value_matching,
     )
 
     return jsonify({
@@ -126,8 +128,11 @@ def redetect_relationships():
     """Re-detect relationships for all currently loaded tables."""
     global detected_relationships
 
+    data = request.get_json(silent=True) or {}
+    value_matching = data.get("value_matching", False)
     detected_relationships = detect_relationships(
         list(loaded_tables.values()), loaded_dataframes,
+        value_matching=value_matching,
     )
 
     return jsonify({"relationships": detected_relationships})
