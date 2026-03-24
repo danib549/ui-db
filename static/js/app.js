@@ -475,7 +475,7 @@ function wireEventSubscriptions() {
 
 // ---- Initialization ----
 
-document.addEventListener('DOMContentLoaded', () => {
+function init() {
   const canvasEl = document.getElementById('diagram-canvas');
   if (!canvasEl) return;
 
@@ -494,7 +494,13 @@ document.addEventListener('DOMContentLoaded', () => {
   wireSidebarCollapseToggles();
   render();
   updateZoomLabel();
-});
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', init);
+} else {
+  init();
+}
 
 // ---- Sidebar section collapse/expand ----
 
