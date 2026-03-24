@@ -43,6 +43,16 @@
           <span class="sidebar__section-arrow"></span>Settings
         </h2>
         <div class="settings-panel" id="settings-panel">
+          <label class="settings-panel__toggle settings-panel__toggle--hidden" id="toggle-metadata-label">
+            <input type="checkbox" id="toggle-metadata" checked>
+            <span class="settings-panel__label">Schema connections</span>
+          </label>
+          <p class="settings-panel__hint settings-panel__hint--hidden" id="hint-metadata">Exact FK relationships from database metadata</p>
+          <label class="settings-panel__toggle">
+            <input type="checkbox" id="toggle-name-matching" checked>
+            <span class="settings-panel__label">Name-based matching</span>
+          </label>
+          <p class="settings-panel__hint">Detect relationships by column naming conventions</p>
           <label class="settings-panel__toggle">
             <input type="checkbox" id="toggle-value-matching">
             <span class="settings-panel__label">Value-based matching</span>
@@ -106,6 +116,47 @@
         <!-- Drop overlay for drag-and-drop onto canvas -->
         <div class="canvas-container__drop-overlay" id="canvas-drop-overlay">
           <p>Drop CSV files to import</p>
+        </div>
+        <!-- Legend -->
+        <div class="legend" id="legend">
+          <div class="legend__header">
+            <span class="legend__title">Legend</span>
+            <button class="legend__close" id="legend-close" title="Close">&times;</button>
+          </div>
+          <div class="legend__section">
+            <span class="legend__section-label">Relationships</span>
+            <div class="legend__item">
+              <span class="legend__line legend__line--one-to-one"></span>
+              <span class="legend__label">One-to-one</span>
+            </div>
+            <div class="legend__item">
+              <span class="legend__line legend__line--one-to-many"></span>
+              <span class="legend__label">One-to-many</span>
+            </div>
+            <div class="legend__item">
+              <span class="legend__line legend__line--many-to-many"></span>
+              <span class="legend__label">Many-to-many</span>
+            </div>
+            <div class="legend__item">
+              <span class="legend__line legend__line--self"></span>
+              <span class="legend__label">Self-reference</span>
+            </div>
+          </div>
+          <div class="legend__section">
+            <span class="legend__section-label">Key Types</span>
+            <div class="legend__item">
+              <span class="legend__badge legend__badge--pk">PK</span>
+              <span class="legend__label">Primary Key</span>
+            </div>
+            <div class="legend__item">
+              <span class="legend__badge legend__badge--fk">FK</span>
+              <span class="legend__label">Foreign Key</span>
+            </div>
+            <div class="legend__item">
+              <span class="legend__badge legend__badge--uq">UQ</span>
+              <span class="legend__label">Unique</span>
+            </div>
+          </div>
         </div>
       </div>
     </main>

@@ -30,6 +30,8 @@ app = Flask(__name__)
 loaded_tables: dict[str, dict] = {}
 loaded_dataframes: dict[str, pd.DataFrame] = {}
 detected_relationships: list[dict] = []
+metadata_relationships: list[dict] = []  # from SQL Server metadata CSVs
+has_metadata_loaded: bool = False
 
 
 @app.route("/")
@@ -45,7 +47,7 @@ def upload_csv():
     Expects multipart form data with a 'files' field (one or more CSV files).
     Optionally accepts 'existing_tables' as a JSON string for incremental upload.
     """
-    global detected_relationships
+    global detected_relationships, metadata_relationships, has_metadata_loaded
 
     files = request.files.getlist("files")
     if not files:
@@ -135,6 +137,8 @@ def upload_csv():
 
     # If metadata CSVs were provided, use them for accurate keys and relationships
     if has_metadata:
+        has_metadata_loaded = True
+
         # Collect all table names referenced in metadata
         meta_table_names: set[str] = set()
         for pk_table in metadata["primary_keys"]:
@@ -160,37 +164,42 @@ def upload_csv():
                     meta_name,
                 )
 
-        # Build relationships from FK metadata
-        detected_relationships = build_metadata_relationships(
+        # Build and store metadata relationships separately
+        metadata_relationships = build_metadata_relationships(
             metadata["foreign_keys"],
             name_map,
             loaded_tables,
             loaded_dataframes,
         )
-    else:
-        # Fall back to heuristic relationship detection
-        value_matching = request.form.get("value_matching", "").lower() == "true"
-        detected_relationships = detect_relationships(
-            list(loaded_tables.values()), loaded_dataframes,
-            value_matching=value_matching,
-        )
+
+    # Combine relationships from all enabled sources
+    detected_relationships = _combine_relationships(
+        use_metadata=has_metadata,
+        use_name_based=True,
+        use_value_matching=request.form.get("value_matching", "").lower() == "true",
+    )
 
     return jsonify({
         "tables": list(loaded_tables.values()),
         "relationships": detected_relationships,
+        "has_metadata": has_metadata_loaded,
     })
 
 
 @app.route("/api/detect-relationships", methods=["POST"])
 def redetect_relationships():
-    """Re-detect relationships for all currently loaded tables."""
+    """Re-detect relationships for all currently loaded tables.
+
+    Accepts JSON body with boolean flags:
+      metadata (default true), name_based (default true), value_matching (default false).
+    """
     global detected_relationships
 
     data = request.get_json(silent=True) or {}
-    value_matching = data.get("value_matching", False)
-    detected_relationships = detect_relationships(
-        list(loaded_tables.values()), loaded_dataframes,
-        value_matching=value_matching,
+    detected_relationships = _combine_relationships(
+        use_metadata=data.get("metadata", True),
+        use_name_based=data.get("name_based", True),
+        use_value_matching=data.get("value_matching", False),
     )
 
     return jsonify({"relationships": detected_relationships})
@@ -305,6 +314,41 @@ def debug_table():
         "df_shape": list(df.shape),
         "first_row": first_row[0] if first_row else [],
     })
+
+
+def _combine_relationships(
+    use_metadata: bool = True,
+    use_name_based: bool = True,
+    use_value_matching: bool = False,
+) -> list[dict]:
+    """Combine relationships from enabled sources, deduplicating by key."""
+    combined: list[dict] = []
+    seen: set[tuple[str, str, str, str]] = set()
+
+    # Metadata relationships first (highest confidence)
+    if use_metadata and metadata_relationships:
+        for rel in metadata_relationships:
+            key = (rel["source_table"], rel["source_column"],
+                   rel["target_table"], rel["target_column"])
+            if key not in seen:
+                seen.add(key)
+                combined.append(rel)
+
+    # Heuristic relationships (name-based and/or value-based)
+    if use_name_based or use_value_matching:
+        heuristic = detect_relationships(
+            list(loaded_tables.values()), loaded_dataframes,
+            value_matching=use_value_matching,
+            name_matching=use_name_based,
+        )
+        for rel in heuristic:
+            key = (rel["source_table"], rel["source_column"],
+                   rel["target_table"], rel["target_column"])
+            if key not in seen:
+                seen.add(key)
+                combined.append(rel)
+
+    return combined
 
 
 def _detect_group(table_name: str) -> str:

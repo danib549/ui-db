@@ -11,10 +11,16 @@ import { HEADER_HEIGHT, ROW_HEIGHT, GRID_GAP, GRID_COL_WIDTH, GRID_ROW_HEIGHT, G
 const GRID_START_X = 40;
 const GRID_START_Y = 40;
 
-/** Check if value-based matching is enabled. */
-function isValueMatchingEnabled() {
-  const toggle = document.getElementById('toggle-value-matching');
-  return toggle ? toggle.checked : false;
+/** Get current state of all relationship source toggles. */
+function getRelationshipToggles() {
+  const metadata = document.getElementById('toggle-metadata');
+  const nameBased = document.getElementById('toggle-name-matching');
+  const valueBased = document.getElementById('toggle-value-matching');
+  return {
+    metadata: metadata ? metadata.checked : true,
+    name_based: nameBased ? nameBased.checked : true,
+    value_matching: valueBased ? valueBased.checked : false,
+  };
 }
 
 /** Wire file input and drag-and-drop events. */
@@ -37,7 +43,7 @@ export async function uploadCSVFiles(files) {
     formData.append('existing_tables', JSON.stringify(existingTables));
   }
 
-  formData.append('value_matching', String(isValueMatchingEnabled()));
+  formData.append('value_matching', String(getRelationshipToggles().value_matching));
 
   const response = await fetch('/api/upload-csv', { method: 'POST', body: formData });
   if (!response.ok) return;
@@ -65,6 +71,11 @@ function processUploadResponse(data) {
   if (relationships && relationships.length > 0) {
     const connections = transformRelationships(relationships);
     State.setConnections(connections);
+  }
+
+  // Show metadata checkbox only when metadata CSVs were uploaded
+  if (data.has_metadata) {
+    showMetadataToggle();
   }
 
   updateSidebarTableList();
@@ -239,24 +250,38 @@ function updateSidebarTableList() {
 }
 
 function wireValueMatchingToggle() {
-  const toggle = document.getElementById('toggle-value-matching');
-  if (!toggle) return;
+  const ids = ['toggle-metadata', 'toggle-name-matching', 'toggle-value-matching'];
 
-  toggle.addEventListener('change', async () => {
-    const tables = State.getTables();
-    if (tables.length === 0) return;
+  ids.forEach((id) => {
+    const toggle = document.getElementById(id);
+    if (!toggle) return;
 
-    const response = await fetch('/api/detect-relationships', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ value_matching: toggle.checked }),
-    });
-    if (!response.ok) return;
-
-    const data = await response.json();
-    const connections = transformRelationships(data.relationships || []);
-    State.setConnections(connections);
+    toggle.addEventListener('change', () => redetectRelationships());
   });
+}
+
+async function redetectRelationships() {
+  const tables = State.getTables();
+  if (tables.length === 0) return;
+
+  const toggles = getRelationshipToggles();
+  const response = await fetch('/api/detect-relationships', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(toggles),
+  });
+  if (!response.ok) return;
+
+  const data = await response.json();
+  const connections = transformRelationships(data.relationships || []);
+  State.setConnections(connections);
+}
+
+function showMetadataToggle() {
+  const label = document.getElementById('toggle-metadata-label');
+  const hint = document.getElementById('hint-metadata');
+  if (label) label.classList.remove('settings-panel__toggle--hidden');
+  if (hint) hint.classList.remove('settings-panel__hint--hidden');
 }
 
 // Re-render sidebar when tables change

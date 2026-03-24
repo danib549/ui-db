@@ -9,6 +9,7 @@ def detect_relationships(
     tables: list[dict],
     dataframes: dict[str, pd.DataFrame],
     value_matching: bool = False,
+    name_matching: bool = True,
 ) -> list[dict]:
     """Detect FK relationships across all loaded tables.
 
@@ -24,44 +25,48 @@ def detect_relationships(
     seen: set[tuple[str, str, str, str]] = set()
 
     # Strategy 1: name-based matching (FK columns -> PK columns)
-    for table in tables:
-        table_name = table["name"]
-        source_df = dataframes.get(table_name)
+    if name_matching:
+        for table in tables:
+            table_name = table["name"]
+            source_df = dataframes.get(table_name)
 
-        for col in table["columns"]:
-            if col.get("key_type") != "FK":
-                continue
-
-            matches = _find_target_table(col["name"], table_name, pk_index, tables)
-            for target_table, target_column in matches:
-                key = (table_name, col["name"], target_table, target_column)
-                if key in seen:
+            for col in table["columns"]:
+                if col.get("key_type") != "FK":
                     continue
-                seen.add(key)
 
-                target_df = dataframes.get(target_table)
-                cardinality = infer_cardinality(
-                    source_df, col["name"], target_df, target_column,
-                )
-                confidence = score_relationship(
-                    col["name"], target_table, target_column,
-                    col.get("type", ""), _get_column_type(tables, target_table, target_column),
-                )
-                relationships.append({
-                    "source_table": table_name,
-                    "source_column": col["name"],
-                    "target_table": target_table,
-                    "target_column": target_column,
-                    "type": cardinality,
-                    "confidence": confidence,
-                })
+                matches = _find_target_table(col["name"], table_name, pk_index, tables)
+                for target_table, target_column in matches:
+                    key = (table_name, col["name"], target_table, target_column)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+
+                    target_df = dataframes.get(target_table)
+                    cardinality = infer_cardinality(
+                        source_df, col["name"], target_df, target_column,
+                    )
+                    confidence = score_relationship(
+                        col["name"], target_table, target_column,
+                        col.get("type", ""), _get_column_type(tables, target_table, target_column),
+                    )
+                    relationships.append({
+                        "source_table": table_name,
+                        "source_column": col["name"],
+                        "target_table": target_table,
+                        "target_column": target_column,
+                        "type": cardinality,
+                        "confidence": confidence,
+                    })
 
     # Strategy 2: value-based matching (compare actual data across tables)
     if value_matching:
         value_rels = _detect_by_values(tables, dataframes, unique_index, seen)
         relationships.extend(value_rels)
 
-    # Strategy 3: self-references
+    # Strategy 3: self-references (part of name-based detection)
+    if not name_matching:
+        return relationships
+
     for table in tables:
         table_name = table["name"]
         source_df = dataframes.get(table_name)

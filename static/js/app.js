@@ -492,6 +492,7 @@ function init() {
   wireToolbar();
   wireKeyboard();
   wireSidebarCollapseToggles();
+  wireLegend();
   render();
   updateZoomLabel();
 }
@@ -503,6 +504,16 @@ if (document.readyState === 'loading') {
 }
 
 // ---- Sidebar section collapse/expand ----
+
+function wireLegend() {
+  const legend = document.getElementById('legend');
+  const closeBtn = document.getElementById('legend-close');
+  if (!legend || !closeBtn) return;
+
+  closeBtn.addEventListener('click', () => {
+    legend.classList.add('legend--hidden');
+  });
+}
 
 function wireSidebarCollapseToggles() {
   document.querySelectorAll('.sidebar__section-title--toggle').forEach((title) => {
