@@ -183,7 +183,7 @@ function drawCardinalityIndicators(ctx, connection, sourceAnchor, targetAnchor, 
 // ---- Style resolution ----
 
 function isHighlighted(connection, interactionState) {
-  const { hoveredTable, hoveredColumn, hoveredConnection } = interactionState;
+  const { hoveredTable, hoveredColumn, hoveredConnection, selectedColumn } = interactionState;
 
   if (hoveredConnection) {
     return connection.source.table === hoveredConnection.source.table &&
@@ -201,9 +201,21 @@ function isHighlighted(connection, interactionState) {
   return false;
 }
 
+function isSelectedColumnConnection(connection, selectedColumn) {
+  if (!selectedColumn) return false;
+  return (connection.source.table === selectedColumn.table && connection.source.column === selectedColumn.column) ||
+    (connection.target.table === selectedColumn.table && connection.target.column === selectedColumn.column);
+}
+
 function isDimmed(connection, interactionState) {
-  const { hoveredTable, hoveredColumn, hoveredConnection } = interactionState;
+  const { hoveredTable, hoveredColumn, hoveredConnection, selectedColumn } = interactionState;
   const hasActiveHover = hoveredTable || hoveredColumn || hoveredConnection;
+
+  // Selected column mode: dim unrelated connections, highlight related ones
+  if (selectedColumn && !hasActiveHover) {
+    return !isSelectedColumnConnection(connection, selectedColumn);
+  }
+
   if (!hasActiveHover) return false;
   return !isHighlighted(connection, interactionState);
 }
@@ -262,6 +274,15 @@ function resolveConnectionStyle(connection, interactionState, traceEdgeSet) {
   if (isHighlighted(connection, interactionState)) {
     return { color: baseColor, width: 2.5, dash: [], opacity: 1.0 };
   }
+
+  // Selected column: highlight its connections, dim everything else
+  if (interactionState.selectedColumn && !interactionState.hoveredTable && !interactionState.hoveredColumn && !interactionState.hoveredConnection) {
+    if (isSelectedColumnConnection(connection, interactionState.selectedColumn)) {
+      return { color: baseColor, width: 2.5, dash: [], opacity: 1.0 };
+    }
+    return { color: DIMMED_COLOR, width: 1, dash: [4, 4], opacity: 0.15 };
+  }
+
   if (isDimmed(connection, interactionState)) {
     return { color: DIMMED_COLOR, width: 1, dash: [4, 4], opacity: 0.15 };
   }
@@ -303,6 +324,7 @@ export function redrawAll() {
     hoveredTable: state.hoveredTable,
     hoveredColumn: state.hoveredColumn,
     hoveredConnection: state.hoveredConnection,
+    selectedColumn: state.selectedColumn,
     activeFilters: state.activeFilters,
   };
   const traceEdgeSet = buildTraceEdgeSet(state.traceResults);
