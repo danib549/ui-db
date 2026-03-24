@@ -66,15 +66,16 @@ function getBlockVisualState(tableName, state, traceTableSet, selectedPathTableS
 
   const hasActiveHover = hoveredTable || hoveredColumn || hoveredConnection;
 
+  // Selected column mode: takes priority over hover — dim tables not in the full path
+  if (selectedPathTableSet) {
+    if (selectedTables.includes(tableName)) return 'selected';
+    if (selectedPathTableSet.has(tableName)) return 'default';
+    return 'dimmed';
+  }
+
   if (selectedTables.includes(tableName) && tableName === hoveredTable) return 'selected-hover';
   if (selectedTables.includes(tableName)) return 'selected';
   if (tableName === hoveredTable) return 'hover';
-
-  // Selected column mode: dim tables not in the full path
-  if (selectedColumn && !hasActiveHover) {
-    if (selectedPathTableSet && selectedPathTableSet.has(tableName)) return 'default';
-    return 'dimmed';
-  }
 
   if (hasActiveHover) {
     const isRelated = tableName === hoveredTable ||

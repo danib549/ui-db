@@ -321,16 +321,16 @@ function resolveConnectionStyle(connection, interactionState, traceEdgeSet, sele
     return { color: DIMMED_COLOR, width: 1, dash: [4, 4], opacity: 0.15 };
   }
 
-  if (isHighlighted(connection, interactionState)) {
-    return { color: baseColor, width: 2.5, dash: [], opacity: 1.0 };
-  }
-
-  // Selected column: highlight full path, dim everything else
-  if (selectedPathSet && !interactionState.hoveredTable && !interactionState.hoveredColumn && !interactionState.hoveredConnection) {
+  // Selected column: highlight full path, dim everything else (takes priority over hover)
+  if (selectedPathSet) {
     if (selectedPathSet.has(connKey(connection))) {
       return { color: baseColor, width: 2.5, dash: [], opacity: 1.0 };
     }
     return { color: DIMMED_COLOR, width: 1, dash: [4, 4], opacity: 0.15 };
+  }
+
+  if (isHighlighted(connection, interactionState)) {
+    return { color: baseColor, width: 2.5, dash: [], opacity: 1.0 };
   }
 
   if (isDimmed(connection, interactionState)) {
