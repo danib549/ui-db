@@ -76,7 +76,7 @@ def upload_csv():
                 try:
                     import io
                     text = raw.decode(encoding)
-                    df = pd.read_csv(io.StringIO(text), engine="python", sep=None)
+                    df = pd.read_csv(io.StringIO(text), engine="python", sep=None, index_col=False)
                     break
                 except (UnicodeDecodeError, pd.errors.ParserError):
                     continue
