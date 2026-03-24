@@ -378,6 +378,7 @@ MIT
 """Flask application — thin route layer for the DB Diagram Visualizer."""
 
 import json
+import mimetypes
 
 from flask import Flask, request, jsonify, render_template
 import pandas as pd
@@ -389,6 +390,9 @@ from relationship_analyzer import detect_relationships
 from search import search_all_tables
 from trace import trace_value
 
+# Ensure .js files are served with the correct MIME type
+mimetypes.add_type('application/javascript', '.js')
+mimetypes.add_type('text/css', '.css')
 
 app = Flask(__name__)
 
@@ -442,9 +446,29 @@ def upload_csv():
         table_name = filename.rsplit(".", 1)[0]
 
         try:
-            df = pd.read_csv(file)
+            raw = file.read()
+            file.seek(0)
+            # Try utf-8-sig first (handles BOM from SQL Server exports)
+            for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+                try:
+                    import io
+                    text = raw.decode(encoding)
+                    df = pd.read_csv(io.StringIO(text), engine="python", sep=None, index_col=False)
+                    break
+                except (UnicodeDecodeError, pd.errors.ParserError):
+                    continue
+            else:
+                continue
         except Exception:
             continue
+
+        # Clean column names: strip whitespace
+        df.columns = [str(c).strip() for c in df.columns]
+
+        # Drop unnamed index columns (common in SQL Server exports)
+        unnamed_cols = [c for c in df.columns if c.startswith("Unnamed:")]
+        if unnamed_cols:
+            df = df.drop(columns=unnamed_cols)
 
         if df.empty and df.columns.empty:
             continue
@@ -464,8 +488,10 @@ def upload_csv():
         loaded_dataframes[table_name] = df
         new_tables.append(table_info)
 
+    value_matching = request.form.get("value_matching", "").lower() == "true"
     detected_relationships = detect_relationships(
         list(loaded_tables.values()), loaded_dataframes,
+        value_matching=value_matching,
     )
 
     return jsonify({
@@ -479,8 +505,11 @@ def redetect_relationships():
     """Re-detect relationships for all currently loaded tables."""
     global detected_relationships
 
+    data = request.get_json(silent=True) or {}
+    value_matching = data.get("value_matching", False)
     detected_relationships = detect_relationships(
         list(loaded_tables.values()), loaded_dataframes,
+        value_matching=value_matching,
     )
 
     return jsonify({"relationships": detected_relationships})
@@ -575,6 +604,28 @@ def column_values():
     return jsonify({"table": table, "column": column, "values": values_list})
 
 
+@app.route("/api/debug-table")
+def debug_table():
+    """Debug endpoint — shows raw column info for a loaded table."""
+    table = request.args.get("table", "")
+    df = loaded_dataframes.get(table)
+    table_info = loaded_tables.get(table)
+    if df is None:
+        return jsonify({"error": "table not found"}), 404
+
+    df_cols = list(df.columns)
+    meta_cols = [c["name"] for c in table_info.get("columns", [])]
+    first_row = df.head(1).fillna("").astype(str).values.tolist()
+
+    return jsonify({
+        "df_columns": df_cols,
+        "meta_columns": meta_cols,
+        "match": df_cols == meta_cols,
+        "df_shape": list(df.shape),
+        "first_row": first_row[0] if first_row else [],
+    })
+
+
 def _detect_group(table_name: str) -> str:
     """Auto-detect a group from a table name prefix.
 
@@ -588,7 +639,7 @@ def _detect_group(table_name: str) -> str:
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    app.run(debug=True, host="0.0.0.0", port=5000)
 ===== END: app.py =====
 ===== FILE: bundle_code.py =====
 #!/usr/bin/env python3
@@ -796,6 +847,8 @@ def _average_string_length(series: pd.Series) -> float:
 ===== FILE: key_detector.py =====
 """Key detection module — identifies PKs, FKs, and unique columns."""
 
+import re
+
 
 def detect_keys(
     table_name: str,
@@ -805,9 +858,10 @@ def detect_keys(
     """Detect key types for each column in a table.
 
     Rules:
-      - Column named 'id' with all unique non-null values -> PK
+      - Column named 'id' (any case) with all unique non-null values -> PK
+      - Column named '<TableName>ID' with all unique non-null values -> PK
       - Column named 'uuid' or 'guid' with all unique values -> PK
-      - Column ending in '_id', '_ref', or '_key' -> FK candidate
+      - Column ending in '_id', '_ref', '_key', 'Id', 'ID' -> FK candidate
       - All values unique, non-null, and not a FK candidate -> UQ
     """
     for col in columns:
@@ -822,23 +876,50 @@ def _classify_column(
     all_table_names: list[str] | None,
 ) -> str | None:
     """Return the key type for a single column, or None."""
-    name = col["name"].lower()
+    name = col["name"]
+    name_lower = name.lower()
     is_all_unique = col["unique_count"] == col["total_count"] and col["total_count"] > 0
     is_non_null = not col["nullable"]
 
-    if name == "id" and is_all_unique and is_non_null:
+    # PK: 'id', 'ID', 'Id'
+    if name_lower == "id" and is_all_unique and is_non_null:
         return "PK"
 
-    if name in ("uuid", "guid") and is_all_unique:
+    # PK: '<TableName>ID' e.g. 'CustomerID' in table 'Customers'
+    if _is_table_pk(name, table_name) and is_all_unique and is_non_null:
         return "PK"
 
+    # PK: uuid/guid
+    if name_lower in ("uuid", "guid") and is_all_unique:
+        return "PK"
+
+    # FK: check if column name references another table
     if _is_fk_candidate(name):
         return "FK"
 
+    # UQ: all unique non-null values
     if is_all_unique and is_non_null:
         return "UQ"
 
     return None
+
+
+def _is_table_pk(column_name: str, table_name: str) -> bool:
+    """Check if column is '<TableName>ID' pattern for its own table.
+
+    Handles: CustomerID in Customers, customer_id in customers,
+    OrderId in Orders, etc.
+    """
+    col_lower = column_name.lower()
+    table_lower = table_name.lower()
+    singular = table_lower.rstrip("s") if table_lower.endswith("s") else table_lower
+
+    # customer_id in customers table, or customerid in customers table
+    col_base = col_lower.replace("_", "")
+    if col_base == singular + "id" or col_base == table_lower + "id":
+        return True
+
+    return False
 
 
 def _is_fk_candidate(column_name: str) -> bool:
@@ -846,24 +927,66 @@ def _is_fk_candidate(column_name: str) -> bool:
     return len(find_fk_candidates(column_name)) > 0
 
 
+def _split_camel_case(name: str) -> list[str]:
+    """Split a CamelCase or PascalCase name into parts.
+
+    'CustomerID' -> ['Customer', 'ID']
+    'orderItemId' -> ['order', 'Item', 'Id']
+    'user_id' -> ['user_id'] (not camelCase, handled elsewhere)
+    """
+    parts = re.sub(r'([a-z])([A-Z])', r'\1_\2', name)
+    parts = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1_\2', parts)
+    return parts.split('_')
+
+
 def find_fk_candidates(column_name: str) -> list[str]:
     """Derive possible target table names from an FK column name.
 
-    Strips the suffix (_id, _ref, _key) and returns both singular
-    and plural forms.
-
-    Examples:
-        'user_id'   -> ['user', 'users']
-        'order_ref' -> ['order', 'orders']
+    Handles both snake_case and PascalCase/camelCase naming:
+      'user_id'     -> ['user', 'users']
+      'order_ref'   -> ['order', 'orders']
+      'CustomerID'  -> ['customer', 'customers']
+      'OrderId'     -> ['order', 'orders']
+      'categoryId'  -> ['category', 'categorys', 'categorie', 'categories']
     """
-    lower = column_name.lower()
+    candidates: list[str] = []
 
+    # Try snake_case suffixes first
+    lower = column_name.lower()
     for suffix in ("_id", "_ref", "_key"):
         if lower.endswith(suffix):
             base = lower[: -len(suffix)]
-            return [base, base + "s"]
+            if base:
+                candidates.extend(_pluralize(base))
+            return candidates
 
-    return []
+    # Try PascalCase/camelCase: split and check if last part is Id/ID/Ref/Key
+    parts = _split_camel_case(column_name)
+    if len(parts) >= 2:
+        last = parts[-1].lower()
+        if last in ("id", "ref", "key"):
+            base = "_".join(parts[:-1]).lower()
+            if base:
+                candidates.extend(_pluralize(base))
+            return candidates
+
+    return candidates
+
+
+def _pluralize(base: str) -> list[str]:
+    """Return singular and plural forms of a base name."""
+    forms = [base]
+    if base.endswith("s"):
+        # Already plural-looking, add singular
+        forms.append(base.rstrip("s"))
+    elif base.endswith("y"):
+        # category -> categories
+        forms.append(base + "s")
+        forms.append(base[:-1] + "ie")
+        forms.append(base[:-1] + "ies")
+    else:
+        forms.append(base + "s")
+    return forms
 ===== END: key_detector.py =====
 ===== FILE: relationship_analyzer.py =====
 """Relationship analysis module — detects FK relationships between tables."""
@@ -876,15 +999,22 @@ from key_detector import find_fk_candidates
 def detect_relationships(
     tables: list[dict],
     dataframes: dict[str, pd.DataFrame],
+    value_matching: bool = False,
 ) -> list[dict]:
     """Detect FK relationships across all loaded tables.
 
-    Builds a PK index, then matches FK columns to PK columns in other
-    tables using name-based heuristics.
+    Uses three strategies in order:
+      1. Name-based: FK columns matched to PK columns by naming convention
+      2. Value-based: columns with matching values across tables
+      3. Self-references: FK columns pointing back to same table
+    Deduplicates results so the same pair isn't reported twice.
     """
     pk_index = _build_pk_index(tables)
+    unique_index = _build_unique_index(tables)
     relationships: list[dict] = []
+    seen: set[tuple[str, str, str, str]] = set()
 
+    # Strategy 1: name-based matching (FK columns -> PK columns)
     for table in tables:
         table_name = table["name"]
         source_df = dataframes.get(table_name)
@@ -895,6 +1025,11 @@ def detect_relationships(
 
             matches = _find_target_table(col["name"], table_name, pk_index, tables)
             for target_table, target_column in matches:
+                key = (table_name, col["name"], target_table, target_column)
+                if key in seen:
+                    continue
+                seen.add(key)
+
                 target_df = dataframes.get(target_table)
                 cardinality = infer_cardinality(
                     source_df, col["name"], target_df, target_column,
@@ -912,8 +1047,24 @@ def detect_relationships(
                     "confidence": confidence,
                 })
 
+    # Strategy 2: value-based matching (compare actual data across tables)
+    if value_matching:
+        value_rels = _detect_by_values(tables, dataframes, unique_index, seen)
+        relationships.extend(value_rels)
+
+    # Strategy 3: self-references
+    for table in tables:
+        table_name = table["name"]
+        source_df = dataframes.get(table_name)
+
         self_refs = detect_self_reference(table_name, table["columns"])
         for ref in self_refs:
+            key = (ref["source_table"], ref["source_column"],
+                   ref["target_table"], ref["target_column"])
+            if key in seen:
+                continue
+            seen.add(key)
+
             if source_df is not None:
                 cardinality = infer_cardinality(
                     source_df, ref["source_column"], source_df, ref["target_column"],
@@ -922,6 +1073,128 @@ def detect_relationships(
             relationships.append(ref)
 
     return relationships
+
+
+def _detect_by_values(
+    tables: list[dict],
+    dataframes: dict[str, pd.DataFrame],
+    unique_index: dict[str, list[str]],
+    seen: set[tuple[str, str, str, str]],
+) -> list[dict]:
+    """Detect relationships by comparing actual column values across tables.
+
+    For each unique/PK column in table A, check if any column in table B
+    has values that are a subset. This catches relationships regardless
+    of column naming conventions.
+    """
+    relationships: list[dict] = []
+
+    # Build lookup: for each table, its unique/PK columns and their value sets
+    value_sets: dict[str, dict[str, set]] = {}
+    for table_name, cols in unique_index.items():
+        df = dataframes.get(table_name)
+        if df is None:
+            continue
+        value_sets[table_name] = {}
+        for col_name in cols:
+            if col_name not in df.columns:
+                continue
+            vals = set(df[col_name].dropna().astype(str))
+            if len(vals) < 2:
+                continue
+            value_sets[table_name][col_name] = vals
+
+    table_list = list(dataframes.keys())
+
+    for src_name in table_list:
+        src_df = dataframes.get(src_name)
+        if src_df is None:
+            continue
+        src_table = _find_table_meta(tables, src_name)
+        if src_table is None:
+            continue
+
+        for src_col in src_table["columns"]:
+            src_col_name = src_col["name"]
+            if src_col_name not in src_df.columns:
+                continue
+            # Skip columns already detected as PK/UQ in this table
+            if src_col.get("key_type") in ("PK", "UQ"):
+                continue
+            # Skip text/desc columns (too many false positives)
+            if src_col.get("type") in ("TEXT",):
+                continue
+
+            src_vals = set(src_df[src_col_name].dropna().astype(str))
+            if len(src_vals) < 2:
+                continue
+
+            # Compare against unique/PK columns in other tables
+            for tgt_name, tgt_cols in value_sets.items():
+                if tgt_name == src_name:
+                    continue
+
+                for tgt_col_name, tgt_vals in tgt_cols.items():
+                    key = (src_name, src_col_name, tgt_name, tgt_col_name)
+                    reverse_key = (tgt_name, tgt_col_name, src_name, src_col_name)
+                    if key in seen or reverse_key in seen:
+                        continue
+
+                    overlap = src_vals & tgt_vals
+                    if len(overlap) == 0:
+                        continue
+
+                    # Source values should be a subset of target values
+                    # (FK values must exist in the referenced PK column)
+                    overlap_ratio = len(overlap) / len(src_vals)
+                    if overlap_ratio < 0.5:
+                        continue
+
+                    seen.add(key)
+                    tgt_df = dataframes.get(tgt_name)
+                    cardinality = infer_cardinality(
+                        src_df, src_col_name, tgt_df, tgt_col_name,
+                    )
+
+                    # Score confidence based on overlap ratio and name similarity
+                    if overlap_ratio >= 0.9:
+                        confidence = "high"
+                    elif overlap_ratio >= 0.7:
+                        confidence = "medium"
+                    else:
+                        confidence = "low"
+
+                    relationships.append({
+                        "source_table": src_name,
+                        "source_column": src_col_name,
+                        "target_table": tgt_name,
+                        "target_column": tgt_col_name,
+                        "type": cardinality,
+                        "confidence": confidence,
+                    })
+
+    return relationships
+
+
+def _build_unique_index(tables: list[dict]) -> dict[str, list[str]]:
+    """Build a mapping of table_name -> columns that are PK or UQ."""
+    index: dict[str, list[str]] = {}
+    for table in tables:
+        cols = [
+            c["name"] for c in table["columns"]
+            if c.get("key_type") in ("PK", "UQ")
+        ]
+        if cols:
+            index[table["name"]] = cols
+    return index
+
+
+def _find_table_meta(tables: list[dict], table_name: str) -> dict | None:
+    """Find table metadata dict by name."""
+    for t in tables:
+        if t["name"] == table_name:
+            return t
+    return None
 
 
 def infer_cardinality(
@@ -955,11 +1228,7 @@ def detect_junction_table(
     columns: list[dict],
     relationships: list[dict],
 ) -> bool:
-    """Detect whether a table is a junction/bridge table.
-
-    A junction table has 2+ FK columns and at most 1 non-metadata,
-    non-FK column.
-    """
+    """Detect whether a table is a junction/bridge table."""
     metadata_names = {"id", "created_at", "updated_at", "deleted_at"}
     fk_columns = [c for c in columns if c.get("key_type") == "FK"]
 
@@ -980,10 +1249,7 @@ def detect_self_reference(
     table_name: str,
     columns: list[dict],
 ) -> list[dict]:
-    """Detect FK columns that reference the same table.
-
-    Example: 'manager_id' in an 'employees' table references 'employee'/'employees'.
-    """
+    """Detect FK columns that reference the same table."""
     results: list[dict] = []
     table_lower = table_name.lower()
     singular = table_lower.rstrip("s") if table_lower.endswith("s") else table_lower
@@ -1015,23 +1281,17 @@ def score_relationship(
     source_dtype: str,
     target_dtype: str,
 ) -> str:
-    """Score the confidence of a detected relationship.
-
-    Returns 'high', 'medium', or 'low'.
-    """
+    """Score the confidence of a detected relationship."""
     score = 0
 
-    # Name match: FK column base matches target table
     candidates = find_fk_candidates(source_col)
     target_lower = target_table.lower()
     if target_lower in candidates:
         score += 2
 
-    # Target column is 'id' (most common PK name)
     if target_col.lower() == "id":
         score += 1
 
-    # Type compatibility
     if source_dtype and target_dtype and source_dtype == target_dtype:
         score += 1
 
@@ -1356,7 +1616,7 @@ def _get_linked_values(
     target_matches = target_df[target_df[target_column].astype(str).isin(source_vals)]
     return [str(v) for v in target_matches[target_column].unique().tolist()]
 ===== END: trace.py =====
-===== FILE: .claude\rules\canvas-redraw-guarantee.md =====
+===== FILE: .claude/rules/canvas-redraw-guarantee.md =====
 ---
 description: Guarantee that connection lines always redraw when canvas state changes
 globs: ["static/js/**/*.js"]
@@ -1402,8 +1662,8 @@ globs: ["static/js/**/*.js"]
 - Never assume previous line positions are still valid
 - Never draw lines in a module other than connections.js
 - Never store computed line paths in state — they are derived data
-===== END: .claude\rules\canvas-redraw-guarantee.md =====
-===== FILE: .claude\rules\code-style.md =====
+===== END: .claude/rules/canvas-redraw-guarantee.md =====
+===== FILE: .claude/rules/code-style.md =====
 ---
 description: Code style and conventions for the DB Diagram Visualizer
 globs: ["**/*.py", "**/*.js", "**/*.html", "**/*.css"]
@@ -1437,8 +1697,8 @@ globs: ["**/*.py", "**/*.js", "**/*.html", "**/*.css"]
 - Python files: snake_case everywhere
 - CSS: kebab-case for classes
 - Events: camelCase strings (`tableMoved`, `filterChanged`)
-===== END: .claude\rules\code-style.md =====
-===== FILE: .claude\rules\local-only.md =====
+===== END: .claude/rules/code-style.md =====
+===== FILE: .claude/rules/local-only.md =====
 ---
 description: All files, data, and processing must stay local — no external connections, CDNs, or remote services
 globs: ["**/*.py", "**/*.js", "**/*.html", "**/*.css"]
@@ -1468,8 +1728,8 @@ Before adding any dependency or asset:
 - Does it require a network connection to load? → **Reject it. Find a local alternative.**
 - Does it phone home or send data externally? → **Reject it.**
 - Can it work fully offline? → **Good. Use it.**
-===== END: .claude\rules\local-only.md =====
-===== FILE: .claude\rules\modular-architecture.md =====
+===== END: .claude/rules/local-only.md =====
+===== FILE: .claude/rules/modular-architecture.md =====
 ---
 description: Enforce modular architecture for the DB Diagram Visualizer project
 globs: ["**/*.py", "**/*.js", "**/*.html", "**/*.css"]
@@ -1533,8 +1793,8 @@ globs: ["**/*.py", "**/*.js", "**/*.html", "**/*.css"]
 1. Each module should be testable in isolation.
 2. State changes should be verifiable without rendering.
 3. Backend functions should have unit tests.
-===== END: .claude\rules\modular-architecture.md =====
-===== FILE: .claude\skills\connection-line-manager.md =====
+===== END: .claude/rules/modular-architecture.md =====
+===== FILE: .claude/skills/connection-line-manager.md =====
 # Skill: Connection Line Manager
 
 ## When to Use
@@ -2516,8 +2776,8 @@ function activateTracePath(startTable, endTable) {
 - Assume previous anchor points are still valid after any state change
 - Perform relationship detection in frontend code (backend only)
 - Hard-code column indices instead of looking them up from state
-===== END: .claude\skills\connection-line-manager.md =====
-===== FILE: .claude\skills\db-canvas-engine.md =====
+===== END: .claude/skills/connection-line-manager.md =====
+===== FILE: .claude/skills/db-canvas-engine.md =====
 # Skill: DB Canvas Rendering Engine
 
 ## When to Use
@@ -2964,8 +3224,8 @@ The engine is event-driven. Rendering happens in response to state changes, not 
 
 ### Never assume previous anchor points are still valid
 After ANY state change — even one that seems unrelated — anchor points may have shifted. A filter change can collapse a block; a layout change moves everything. Always recalculate.
-===== END: .claude\skills\db-canvas-engine.md =====
-===== FILE: .claude\skills\db-canvas-ui.md =====
+===== END: .claude/skills/db-canvas-engine.md =====
+===== FILE: .claude/skills/db-canvas-ui.md =====
 # DB Canvas UI & Interaction
 
 Skill for the UI and interaction layer of the database diagram canvas. Covers table block design, user interactions, visual states, typography, colors, layout, and toolbar controls.
@@ -3211,8 +3471,8 @@ Dropdown with options:
 - **PNG** — rasterize current view at 2x resolution.
 - **SVG** — vector export of all visible blocks and lines.
 - **SQL DDL** — generate CREATE TABLE statements from the loaded schema.
-===== END: .claude\skills\db-canvas-ui.md =====
-===== FILE: .claude\skills\db-diagram-designer.md =====
+===== END: .claude/skills/db-canvas-ui.md =====
+===== FILE: .claude/skills/db-diagram-designer.md =====
 # Skill: DB Diagram Designer — System Design and Lifecycle
 
 ## When to Use
@@ -3753,8 +4013,8 @@ The diagram designer will integrate with a cross-table search system that allows
 - Filter the diagram to show only tables involved in a search result
 
 This will connect the diagram's visual relationship mapping with actual data-level queries, turning the diagram from a static schema view into an interactive data exploration tool.
-===== END: .claude\skills\db-diagram-designer.md =====
-===== FILE: .claude\skills\db-search-system.md =====
+===== END: .claude/skills/db-diagram-designer.md =====
+===== FILE: .claude/skills/db-search-system.md =====
 # DB Search & Value Trace System
 
 Skill for implementing cross-table value search and data flow tracing in the DB Diagram Visualizer.
@@ -4826,8 +5086,8 @@ Search results integrate with the existing filter system:
 - If both a search and a filter are active, apply both (intersection)
 - Clearing search does not clear user-set filters, and vice versa
 - The filter system reads `searchResults` from state alongside its own filter criteria
-===== END: .claude\skills\db-search-system.md =====
-===== FILE: .claude\skills\frontend-design.md =====
+===== END: .claude/skills/db-search-system.md =====
+===== FILE: .claude/skills/frontend-design.md =====
 # Skill: DB Diagram Frontend Design
 
 ## When to Use
@@ -5101,8 +5361,8 @@ Apply this skill when building or modifying the frontend UI for the DB Diagram V
 
 ### "Fit to View" Button
 - Separate button (magnifying glass with arrows or a "fit" icon) that adjusts zoom and pan so the entire diagram is visible within the viewport with 40px padding on all sides.
-===== END: .claude\skills\frontend-design.md =====
-===== FILE: .claude\skills\frontend-patterns.md =====
+===== END: .claude/skills/frontend-design.md =====
+===== FILE: .claude/skills/frontend-patterns.md =====
 ---
 skill: Frontend Development Patterns for DB Visualizer
 ---
@@ -5238,8 +5498,8 @@ def upload_csv():
         })
     return jsonify({"name": file.filename, "columns": columns})
 ```
-===== END: .claude\skills\frontend-patterns.md =====
-===== FILE: .claude\skills\interactive-filtering.md =====
+===== END: .claude/skills/frontend-patterns.md =====
+===== FILE: .claude/skills/interactive-filtering.md =====
 ---
 Skill name: Interactive Filtering and Connection Highlighting
 
@@ -5284,8 +5544,8 @@ Skill name: Interactive Filtering and Connection Highlighting
    - Canvas listens and triggers full line redraw
    - Block visibility/opacity managed by filter state
    - Selected filters persist in URL hash for sharing
-===== END: .claude\skills\interactive-filtering.md =====
-===== FILE: static\css\dark-mode.css =====
+===== END: .claude/skills/interactive-filtering.md =====
+===== FILE: static/css/dark-mode.css =====
 /* ============================================
    Dark Mode Theme Overrides
    Applied when body has the "dark" class.
@@ -5370,8 +5630,8 @@ body.dark #btn-theme {
   border-color: var(--accent);
   color: var(--accent);
 }
-===== END: static\css\dark-mode.css =====
-===== FILE: static\css\styles.css =====
+===== END: static/css/dark-mode.css =====
+===== FILE: static/css/styles.css =====
 /* ============================================
    CSS Custom Properties
    ============================================ */
@@ -5657,6 +5917,29 @@ ul {
 .filter-panel__chip--active {
   background: var(--accent);
   color: #fff;
+}
+
+/* Settings Panel */
+.settings-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.settings-panel__toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--chrome-text);
+}
+
+.settings-panel__hint {
+  margin: 0;
+  font-size: 11px;
+  color: var(--chrome-text-secondary, #888);
+  line-height: 1.3;
 }
 
 /* Search Bar */
@@ -6262,8 +6545,8 @@ ul {
 .table-viewer__badge--pk { background: var(--pk-color); }
 .table-viewer__badge--fk { background: var(--fk-color); }
 .table-viewer__badge--uq { background: var(--uq-color); }
-===== END: static\css\styles.css =====
-===== FILE: static\js\app.js =====
+===== END: static/css/styles.css =====
+===== FILE: static/js/app.js =====
 /**
  * app.js — Main orchestrator for the DB Diagram Visualizer.
  * Wires canvas interactions, toolbar, keyboard shortcuts, and event-driven rendering.
@@ -6741,7 +7024,7 @@ function wireEventSubscriptions() {
 
 // ---- Initialization ----
 
-document.addEventListener('DOMContentLoaded', () => {
+function init() {
   const canvasEl = document.getElementById('diagram-canvas');
   if (!canvasEl) return;
 
@@ -6760,7 +7043,13 @@ document.addEventListener('DOMContentLoaded', () => {
   wireSidebarCollapseToggles();
   render();
   updateZoomLabel();
-});
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', init);
+} else {
+  init();
+}
 
 // ---- Sidebar section collapse/expand ----
 
@@ -6772,8 +7061,8 @@ function wireSidebarCollapseToggles() {
     });
   });
 }
-===== END: static\js\app.js =====
-===== FILE: static\js\blocks.js =====
+===== END: static/js/app.js =====
+===== FILE: static/js/blocks.js =====
 /**
  * blocks.js — Table Block Rendering
  * Draws table blocks (header, columns, keys, badges) on the canvas.
@@ -7169,8 +7458,8 @@ export function getBlockAtPoint(canvasX, canvasY) {
 
   return null;
 }
-===== END: static\js\blocks.js =====
-===== FILE: static\js\canvas.js =====
+===== END: static/js/blocks.js =====
+===== FILE: static/js/canvas.js =====
 /**
  * canvas.js — Canvas Rendering Engine
  * Manages the HTML5 canvas element, viewport transforms, coordinate conversion,
@@ -7336,8 +7625,8 @@ function handleResize() {
   resizeToContainer();
   EventBus.emit('viewportChanged', getViewport());
 }
-===== END: static\js\canvas.js =====
-===== FILE: static\js\connections.js =====
+===== END: static/js/canvas.js =====
+===== FILE: static/js/connections.js =====
 /**
  * connections.js — THE IRON RULE Module
  * Connection lines MUST be fully recalculated and redrawn on every state change.
@@ -7754,8 +8043,8 @@ function isPointNearBezier(point, p0, p1, p2, p3) {
 
 // Event subscriptions removed — app.js render() pipeline calls redrawAll() directly.
 // This avoids double-rendering (connections drawn twice per event).
-===== END: static\js\connections.js =====
-===== FILE: static\js\constants.js =====
+===== END: static/js/connections.js =====
+===== FILE: static/js/constants.js =====
 /**
  * constants.js — Shared constants for the DB Diagram Visualizer.
  * Single source of truth for layout dimensions, colors, and theme values.
@@ -7862,8 +8151,8 @@ export function calculateBlockHeight(table, collapsed) {
   if (collapsed) return HEADER_HEIGHT;
   return HEADER_HEIGHT + table.columns.length * ROW_HEIGHT;
 }
-===== END: static\js\constants.js =====
-===== FILE: static\js\csv-import.js =====
+===== END: static/js/constants.js =====
+===== FILE: static/js/csv-import.js =====
 /**
  * csv-import.js — CSV file upload and drag-and-drop handling.
  * Sends files to backend, processes response, adds tables to state.
@@ -7877,10 +8166,17 @@ import { HEADER_HEIGHT, ROW_HEIGHT, GRID_GAP, GRID_COL_WIDTH, GRID_ROW_HEIGHT, G
 const GRID_START_X = 40;
 const GRID_START_Y = 40;
 
+/** Check if value-based matching is enabled. */
+function isValueMatchingEnabled() {
+  const toggle = document.getElementById('toggle-value-matching');
+  return toggle ? toggle.checked : false;
+}
+
 /** Wire file input and drag-and-drop events. */
 export function initUpload() {
   wireFileInput();
   wireDragAndDrop();
+  wireValueMatchingToggle();
 }
 
 /** Send files to backend, process response, add tables to state. */
@@ -7895,6 +8191,8 @@ export async function uploadCSVFiles(files) {
   if (existingTables.length > 0) {
     formData.append('existing_tables', JSON.stringify(existingTables));
   }
+
+  formData.append('value_matching', String(isValueMatchingEnabled()));
 
   const response = await fetch('/api/upload-csv', { method: 'POST', body: formData });
   if (!response.ok) return;
@@ -8095,10 +8393,31 @@ function updateSidebarTableList() {
   });
 }
 
+function wireValueMatchingToggle() {
+  const toggle = document.getElementById('toggle-value-matching');
+  if (!toggle) return;
+
+  toggle.addEventListener('change', async () => {
+    const tables = State.getTables();
+    if (tables.length === 0) return;
+
+    const response = await fetch('/api/detect-relationships', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ value_matching: toggle.checked }),
+    });
+    if (!response.ok) return;
+
+    const data = await response.json();
+    const connections = transformRelationships(data.relationships || []);
+    State.setConnections(connections);
+  });
+}
+
 // Re-render sidebar when tables change
 EventBus.on('tableRemoved', updateSidebarTableList);
-===== END: static\js\csv-import.js =====
-===== FILE: static\js\events.js =====
+===== END: static/js/csv-import.js =====
+===== FILE: static/js/events.js =====
 /**
  * EventBus — Simple pub/sub system for inter-module communication.
  * All module communication flows through this bus.
@@ -8152,8 +8471,8 @@ export const EventBus = {
  * traceStarted, traceResultsReady,
  * panToTable, stateChanged
  */
-===== END: static\js\events.js =====
-===== FILE: static\js\export.js =====
+===== END: static/js/events.js =====
+===== FILE: static/js/export.js =====
 /**
  * export.js — Diagram export (PNG, JSON).
  */
@@ -8241,8 +8560,8 @@ function downloadBlob(blob, filename) {
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
 }
-===== END: static\js\export.js =====
-===== FILE: static\js\filters.js =====
+===== END: static/js/export.js =====
+===== FILE: static/js/filters.js =====
 /**
  * filters.js — Interactive filter panel for key types, relationship types, and tables.
  * Filters update state.activeFilters, triggering connection/block re-rendering.
@@ -8389,8 +8708,8 @@ function applyCurrentFilters(panel) {
 
   State.setActiveFilters(filters);
 }
-===== END: static\js\filters.js =====
-===== FILE: static\js\layout.js =====
+===== END: static/js/filters.js =====
+===== FILE: static/js/layout.js =====
 /**
  * layout.js — Layout algorithms and animated transitions.
  * Each algorithm returns a position map { tableName: {x, y} }.
@@ -8716,8 +9035,8 @@ function getBlockWidth(table, positions, name) {
   return calculateBlockWidth(table);
 }
 
-===== END: static\js\layout.js =====
-===== FILE: static\js\search.js =====
+===== END: static/js/layout.js =====
+===== FILE: static/js/search.js =====
 /**
  * search.js — Cross-table value search UI.
  * Debounced search input, results panel, click-to-pan.
@@ -8834,8 +9153,8 @@ function groupByTable(matches) {
   return groups;
 }
 
-===== END: static\js\search.js =====
-===== FILE: static\js\state.js =====
+===== END: static/js/search.js =====
+===== FILE: static/js/state.js =====
 /**
  * state.js — Central State Store
  * Single source of truth for the entire application.
@@ -9070,8 +9389,8 @@ export const importState = (data) => {
   });
   emitChange('stateReset', null, 'all');
 };
-===== END: static\js\state.js =====
-===== FILE: static\js\table-viewer.js =====
+===== END: static/js/state.js =====
+===== FILE: static/js/table-viewer.js =====
 /**
  * table-viewer.js — Modal popup showing table data in an Excel-like grid.
  * Clicking a cell value triggers a trace across FK relationships.
@@ -9148,10 +9467,12 @@ function renderGrid(data) {
     return `<th class="table-viewer__th">${esc(col.name)}${badge}</th>`;
   }).join('');
 
+  const colCount = columns.length;
   const tbodyRows = rows.map((row) =>
-    '<tr>' + row.map((val, ci) =>
-      `<td class="table-viewer__td" data-col="${esc(columns[ci].name)}" data-val="${esc(val)}">${esc(val)}</td>`
-    ).join('') + '</tr>'
+    '<tr>' + columns.map((col, ci) => {
+      const val = ci < row.length ? row[ci] : '';
+      return `<td class="table-viewer__td" data-col="${esc(col.name)}" data-val="${esc(val)}">${esc(val)}</td>`;
+    }).join('') + '</tr>'
   ).join('');
 
   gridEl.innerHTML = `
@@ -9182,8 +9503,8 @@ function closeViewer() {
     modalEl = null;
   }
 }
-===== END: static\js\table-viewer.js =====
-===== FILE: static\js\theme.js =====
+===== END: static/js/table-viewer.js =====
+===== FILE: static/js/theme.js =====
 /**
  * theme.js — Dark/light theme toggle.
  * Manages body.dark class, swaps canvas color constants,
@@ -9225,8 +9546,8 @@ function wireToggle() {
   if (!btn) return;
   btn.addEventListener('click', toggleTheme);
 }
-===== END: static\js\theme.js =====
-===== FILE: static\js\trace.js =====
+===== END: static/js/theme.js =====
+===== FILE: static/js/trace.js =====
 /**
  * trace.js — Value tracing across FK relationships.
  * Triggered by per-result trace buttons in search.js.
@@ -9293,8 +9614,8 @@ function renderTracePath(trace) {
   });
 }
 
-===== END: static\js\trace.js =====
-===== FILE: static\js\utils.js =====
+===== END: static/js/trace.js =====
+===== FILE: static/js/utils.js =====
 /**
  * utils.js — Shared utility functions.
  */
@@ -9306,16 +9627,16 @@ export function escapeHtml(str) {
   _escDiv.textContent = String(str);
   return _escDiv.innerHTML;
 }
-===== END: static\js\utils.js =====
-===== FILE: templates\index.html =====
+===== END: static/js/utils.js =====
+===== FILE: templates/index.html =====
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>DB Diagram Visualizer</title>
-  <link rel="stylesheet" href="/static/css/styles.css">
-  <link rel="stylesheet" href="/static/css/dark-mode.css">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/dark-mode.css') }}">
 </head>
 <body>
   <div class="app">
@@ -9345,6 +9666,20 @@ export function escapeHtml(str) {
         <ul class="sidebar__table-list" id="table-list">
           <!-- Table items populated by JS -->
         </ul>
+      </div>
+
+      <!-- Settings -->
+      <div class="sidebar__section sidebar__section--settings">
+        <h2 class="sidebar__section-title sidebar__section-title--toggle">
+          <span class="sidebar__section-arrow"></span>Settings
+        </h2>
+        <div class="settings-panel" id="settings-panel">
+          <label class="settings-panel__toggle">
+            <input type="checkbox" id="toggle-value-matching">
+            <span class="settings-panel__label">Value-based matching</span>
+          </label>
+          <p class="settings-panel__hint">Connect tables by matching data values (may produce false positives)</p>
+        </div>
       </div>
 
       <!-- Filter Panel Placeholder -->
@@ -9417,7 +9752,7 @@ export function escapeHtml(str) {
     <span id="zoom-indicator-value">100%</span>
   </div>
 
-  <script type="module" src="/static/js/app.js"></script>
+  <script type="module" src="{{ url_for('static', filename='js/app.js') }}"></script>
 </body>
 </html>
-===== END: templates\index.html =====
+===== END: templates/index.html =====
