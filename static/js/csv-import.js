@@ -11,10 +11,17 @@ import { HEADER_HEIGHT, ROW_HEIGHT, GRID_GAP, GRID_COL_WIDTH, GRID_ROW_HEIGHT, G
 const GRID_START_X = 40;
 const GRID_START_Y = 40;
 
+/** Check if value-based matching is enabled. */
+function isValueMatchingEnabled() {
+  const toggle = document.getElementById('toggle-value-matching');
+  return toggle ? toggle.checked : false;
+}
+
 /** Wire file input and drag-and-drop events. */
 export function initUpload() {
   wireFileInput();
   wireDragAndDrop();
+  wireValueMatchingToggle();
 }
 
 /** Send files to backend, process response, add tables to state. */
@@ -29,6 +36,8 @@ export async function uploadCSVFiles(files) {
   if (existingTables.length > 0) {
     formData.append('existing_tables', JSON.stringify(existingTables));
   }
+
+  formData.append('value_matching', String(isValueMatchingEnabled()));
 
   const response = await fetch('/api/upload-csv', { method: 'POST', body: formData });
   if (!response.ok) return;
@@ -226,6 +235,27 @@ function updateSidebarTableList() {
     });
 
     listEl.appendChild(li);
+  });
+}
+
+function wireValueMatchingToggle() {
+  const toggle = document.getElementById('toggle-value-matching');
+  if (!toggle) return;
+
+  toggle.addEventListener('change', async () => {
+    const tables = State.getTables();
+    if (tables.length === 0) return;
+
+    const response = await fetch('/api/detect-relationships', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ value_matching: toggle.checked }),
+    });
+    if (!response.ok) return;
+
+    const data = await response.json();
+    const connections = transformRelationships(data.relationships || []);
+    State.setConnections(connections);
   });
 }
 

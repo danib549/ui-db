@@ -69,9 +69,29 @@ def upload_csv():
         table_name = filename.rsplit(".", 1)[0]
 
         try:
-            df = pd.read_csv(file)
+            raw = file.read()
+            file.seek(0)
+            # Try utf-8-sig first (handles BOM from SQL Server exports)
+            for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+                try:
+                    import io
+                    text = raw.decode(encoding)
+                    df = pd.read_csv(io.StringIO(text), engine="python", sep=None, index_col=False)
+                    break
+                except (UnicodeDecodeError, pd.errors.ParserError):
+                    continue
+            else:
+                continue
         except Exception:
             continue
+
+        # Clean column names: strip whitespace
+        df.columns = [str(c).strip() for c in df.columns]
+
+        # Drop unnamed index columns (common in SQL Server exports)
+        unnamed_cols = [c for c in df.columns if c.startswith("Unnamed:")]
+        if unnamed_cols:
+            df = df.drop(columns=unnamed_cols)
 
         if df.empty and df.columns.empty:
             continue
@@ -91,8 +111,10 @@ def upload_csv():
         loaded_dataframes[table_name] = df
         new_tables.append(table_info)
 
+    value_matching = request.form.get("value_matching", "").lower() == "true"
     detected_relationships = detect_relationships(
         list(loaded_tables.values()), loaded_dataframes,
+        value_matching=value_matching,
     )
 
     return jsonify({
@@ -106,8 +128,11 @@ def redetect_relationships():
     """Re-detect relationships for all currently loaded tables."""
     global detected_relationships
 
+    data = request.get_json(silent=True) or {}
+    value_matching = data.get("value_matching", False)
     detected_relationships = detect_relationships(
         list(loaded_tables.values()), loaded_dataframes,
+        value_matching=value_matching,
     )
 
     return jsonify({"relationships": detected_relationships})
@@ -200,6 +225,28 @@ def column_values():
     values = df[column].dropna().unique()
     values_list = [str(v) for v in values[:100]]
     return jsonify({"table": table, "column": column, "values": values_list})
+
+
+@app.route("/api/debug-table")
+def debug_table():
+    """Debug endpoint — shows raw column info for a loaded table."""
+    table = request.args.get("table", "")
+    df = loaded_dataframes.get(table)
+    table_info = loaded_tables.get(table)
+    if df is None:
+        return jsonify({"error": "table not found"}), 404
+
+    df_cols = list(df.columns)
+    meta_cols = [c["name"] for c in table_info.get("columns", [])]
+    first_row = df.head(1).fillna("").astype(str).values.tolist()
+
+    return jsonify({
+        "df_columns": df_cols,
+        "meta_columns": meta_cols,
+        "match": df_cols == meta_cols,
+        "df_shape": list(df.shape),
+        "first_row": first_row[0] if first_row else [],
+    })
 
 
 def _detect_group(table_name: str) -> str:

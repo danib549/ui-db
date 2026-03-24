@@ -74,10 +74,12 @@ function renderGrid(data) {
     return `<th class="table-viewer__th">${esc(col.name)}${badge}</th>`;
   }).join('');
 
+  const colCount = columns.length;
   const tbodyRows = rows.map((row) =>
-    '<tr>' + row.map((val, ci) =>
-      `<td class="table-viewer__td" data-col="${esc(columns[ci].name)}" data-val="${esc(val)}">${esc(val)}</td>`
-    ).join('') + '</tr>'
+    '<tr>' + columns.map((col, ci) => {
+      const val = ci < row.length ? row[ci] : '';
+      return `<td class="table-viewer__td" data-col="${esc(col.name)}" data-val="${esc(val)}">${esc(val)}</td>`;
+    }).join('') + '</tr>'
   ).join('');
 
   gridEl.innerHTML = `

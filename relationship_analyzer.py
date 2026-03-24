@@ -8,6 +8,7 @@ from key_detector import find_fk_candidates
 def detect_relationships(
     tables: list[dict],
     dataframes: dict[str, pd.DataFrame],
+    value_matching: bool = False,
 ) -> list[dict]:
     """Detect FK relationships across all loaded tables.
 
@@ -56,8 +57,9 @@ def detect_relationships(
                 })
 
     # Strategy 2: value-based matching (compare actual data across tables)
-    value_rels = _detect_by_values(tables, dataframes, unique_index, seen)
-    relationships.extend(value_rels)
+    if value_matching:
+        value_rels = _detect_by_values(tables, dataframes, unique_index, seen)
+        relationships.extend(value_rels)
 
     # Strategy 3: self-references
     for table in tables:
