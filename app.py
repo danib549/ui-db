@@ -19,12 +19,14 @@ from metadata_parser import (
 from relationship_analyzer import detect_relationships
 from search import search_all_tables
 from trace import trace_value
+from builder_routes import builder_bp
 
 # Ensure .js files are served with the correct MIME type
 mimetypes.add_type('application/javascript', '.js')
 mimetypes.add_type('text/css', '.css')
 
 app = Flask(__name__)
+app.register_blueprint(builder_bp)
 
 # In-memory storage
 loaded_tables: dict[str, dict] = {}
@@ -33,11 +35,21 @@ detected_relationships: list[dict] = []
 metadata_relationships: list[dict] = []  # from SQL Server metadata CSVs
 has_metadata_loaded: bool = False
 
+# Expose shared data on app object so blueprints can access via current_app
+app.loaded_tables = loaded_tables
+app.loaded_dataframes = loaded_dataframes
+
 
 @app.route("/")
 def index():
     """Serve the main page."""
     return render_template("index.html")
+
+
+@app.route("/builder")
+def builder():
+    """Serve the PostgreSQL Schema Builder page."""
+    return render_template("builder.html")
 
 
 @app.route("/api/upload-csv", methods=["POST"])

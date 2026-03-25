@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PostgreSQL Schema Builder — DB Diagram Visualizer</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/dark-mode.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/builder.css') }}">
+
+</head>
+<body>
+  <script>
+    // Apply dark mode immediately to prevent flash of light theme
+    if (localStorage.getItem('db-diagram-theme') === 'dark') {
+      document.body.classList.add('dark');
+    }
+  </script>
+  <!-- Top Navigation -->
+  <nav class="builder-nav">
+    <a href="/" class="builder-nav__back" title="Back to Diagram">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+        <path d="M10.5 3L5.5 8l5 5" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      Diagram
+    </a>
+    <h1 class="builder-nav__title">PostgreSQL Schema Builder</h1>
+    <div class="builder-nav__actions">
+      <button class="builder-nav__btn" id="btn-theme" title="Toggle dark mode">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+          <path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm0 12.5V2.5a5.5 5.5 0 0 1 0 11z"/>
+        </svg>
+      </button>
+    </div>
+  </nav>
+
+  <!-- Three-panel layout -->
+  <div class="builder-layout">
+
+    <!-- Source Panel (Left) -->
+    <aside class="builder-source" id="source-panel">
+      <!-- SQL Import Section -->
+      <div class="builder-source__import">
+        <h3 class="builder-source__import-title">Import SQL
+        <span class="builder-info" data-tooltip="Import an existing .sql file (pg_dump output, hand-written DDL, or migration files). The parser extracts CREATE TABLE, CREATE TYPE, CREATE INDEX, and ALTER TABLE statements. After importing, modify the schema and export ALTER-based migrations.">?</span>
+      </h3>
+        <div class="builder-source__import-zone" id="sql-import-zone">
+          <p class="builder-source__import-text">Drop .sql file or click to browse</p>
+          <input type="file" id="sql-file-input" accept=".sql" hidden>
+        </div>
+        <div class="builder-source__import-status" id="sql-import-status" hidden>
+          <span class="builder-source__import-icon">&#10003;</span>
+          <span class="builder-source__import-info" id="sql-import-info"></span>
+          <button class="builder-source__import-clear" id="sql-import-clear" title="Clear imported schema">&times;</button>
+        </div>
+      </div>
+
+      <hr class="builder-source__divider">
+
+      <!-- CSV Source Tables -->
+      <h3 class="builder-source__section-title">Source Tables
+        <span class="builder-info" data-tooltip="CSV tables loaded on the Diagram page. Expand a table to see columns, then drag columns onto target tables to create column mappings. Mapped columns generate INSERT INTO...SELECT migration scripts.">?</span>
+      </h3>
+      <div class="builder-source__search">
+        <input type="text" id="source-search" placeholder="Filter tables..." class="builder-source__search-input">
+      </div>
+      <div class="builder-source__list" id="source-table-list">
+        <div class="builder-empty" id="source-empty">
+          <p class="builder-empty__message">No source tables loaded</p>
+          <p class="builder-empty__hint">Import CSV files on the <a href="/">Diagram page</a> first</p>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Target Schema Panel (Center) -->
+    <main class="builder-target" id="target-panel">
+      <div class="builder-target__header">
+        <h2 class="builder-target__title">Target Schema
+        <span class="builder-info" data-tooltip="Design your PostgreSQL tables here. Each card is a table with columns, constraints, and indexes. Click column names or types to edit. Use the pencil icon for the full editor with key toggles, defaults, and checks.">?</span>
+      </h2>
+        <div class="builder-target__actions">
+          <button class="builder-btn builder-btn--primary" id="btn-add-table">+ Add Table</button>
+          <button class="builder-btn builder-btn--secondary" id="btn-add-enum">+ Add Enum</button>
+        </div>
+      </div>
+
+      <div class="builder-target__tables" id="target-tables">
+        <div class="builder-empty" id="target-empty">
+          <p class="builder-empty__message">No tables yet</p>
+          <p class="builder-empty__hint">Click "+ Add Table" to start building your schema</p>
+        </div>
+      </div>
+
+      <!-- Enum list -->
+      <div class="builder-target__enums" id="target-enums"></div>
+    </main>
+
+    <!-- Resize Handle -->
+    <div class="builder-resize-handle" id="output-resize-handle"></div>
+
+    <!-- Output Panel (Right) -->
+    <aside class="builder-output" id="output-panel">
+      <div class="builder-output__tabs">
+        <button class="builder-output__tab builder-output__tab--active" data-tab="ddl">DDL <span class="builder-info builder-info--sm" data-tooltip="Live SQL preview. Regenerates automatically as you edit. Shows CREATE TABLE, CREATE TYPE, CREATE INDEX with correct FK ordering and transaction wrapping.">?</span></button>
+        <button class="builder-output__tab" data-tab="validation">Errors <span class="builder-info builder-info--sm" data-tooltip="Real-time schema validation. Red = must fix before export. Yellow = warnings (reserved words, missing PKs). Green = all good.">?</span></button>
+        <button class="builder-output__tab" data-tab="migration">Migration <span class="builder-info builder-info--sm" data-tooltip="Context-aware migration SQL:\n\nFrom scratch: full CREATE DDL\nFrom CSV: INSERT INTO...SELECT data migration\nFrom imported SQL: ALTER-based schema diff (only changes)">?</span></button>
+        <button class="builder-output__tab" data-tab="map">Map</button>
+      </div>
+
+      <!-- DDL Tab -->
+      <div class="builder-output__content builder-output__content--active" id="tab-ddl">
+        <pre class="builder-output__code"><code id="ddl-preview">-- Generated DDL will appear here as you build your schema</code></pre>
+        <div class="builder-output__actions">
+          <button class="builder-btn" id="copy-ddl" title="Ctrl+Shift+C">Copy SQL</button>
+          <button class="builder-btn" id="export-sql" title="Ctrl+S">Export .sql</button>
+          <button class="builder-btn" id="export-json">Export JSON</button>
+        </div>
+      </div>
+
+      <!-- Validation Tab -->
+      <div class="builder-output__content" id="tab-validation">
+        <div class="builder-validation" id="validation-list">
+          <div class="builder-validation__item builder-validation__item--ok">
+            <span class="builder-validation__icon">&#10003;</span>
+            <span>Schema is valid — no issues found</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Migration Tab -->
+      <div class="builder-output__content" id="tab-migration">
+        <pre class="builder-output__code"><code id="migration-preview">-- Migration SQL will appear here</code></pre>
+        <div class="builder-output__actions">
+          <button class="builder-btn" id="copy-migration">Copy Migration</button>
+          <button class="builder-btn" id="export-migration">Export .sql</button>
+        </div>
+      </div>
+
+      <!-- Map Tab -->
+      <div class="builder-output__content" id="tab-map">
+        <canvas id="builder-map-canvas"></canvas>
+      </div>
+    </aside>
+  </div>
+
+  <!-- Column Editor Modal -->
+  <div class="builder-column-editor" id="column-editor" hidden>
+    <div class="builder-column-editor__backdrop"></div>
+    <div class="builder-column-editor__dialog">
+      <div class="builder-column-editor__header">
+        <h3>Edit Column: <span id="editor-table-name"></span>.<span id="editor-col-name"></span></h3>
+        <button class="builder-column-editor__close" id="editor-close">&times;</button>
+      </div>
+      <div class="builder-column-editor__body" id="editor-body">
+        <!-- Populated by builder-editors.js -->
+      </div>
+      <div class="builder-column-editor__footer">
+        <button class="builder-btn builder-btn--secondary" id="editor-cancel">Cancel</button>
+        <button class="builder-btn builder-btn--primary" id="editor-apply">Apply</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Constraint Picker Modal -->
+  <div class="builder-constraint-picker" id="constraint-picker" hidden>
+    <div class="builder-constraint-picker__backdrop"></div>
+    <div class="builder-constraint-picker__dialog">
+      <div class="builder-constraint-picker__header">
+        <h3>Add Constraint to <span id="constraint-table-name"></span></h3>
+        <button class="builder-constraint-picker__close" id="constraint-close">&times;</button>
+      </div>
+      <div class="builder-constraint-picker__body" id="constraint-body">
+        <!-- Populated by builder-pickers.js -->
+      </div>
+      <div class="builder-constraint-picker__footer">
+        <button class="builder-btn builder-btn--secondary" id="constraint-cancel">Cancel</button>
+        <button class="builder-btn builder-btn--primary" id="constraint-apply">Add</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Confirmation Dialog -->
+  <div class="builder-confirm" id="confirm-dialog" hidden role="alertdialog" aria-modal="true">
+    <div class="builder-confirm__backdrop"></div>
+    <div class="builder-confirm__dialog">
+      <p class="builder-confirm__message" id="confirm-message"></p>
+      <div class="builder-confirm__actions">
+        <button class="builder-btn builder-btn--secondary" id="confirm-cancel">Cancel</button>
+        <button class="builder-btn builder-btn--danger" id="confirm-ok">Delete</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tooltip (positioned by JS) -->
+  <div class="builder-tooltip" id="builder-tooltip">
+    <div class="builder-tooltip__arrow" id="builder-tooltip-arrow"></div>
+    <span id="builder-tooltip-text"></span>
+  </div>
+
+  <!-- Toast Notification -->
+  <div class="builder-toast" id="builder-toast">
+    <span class="builder-toast__message" id="builder-toast-message"></span>
+  </div>
+
+  <script type="module" src="{{ url_for('static', filename='js/builder/builder-app.js') }}"></script>
+</body>
+</html>

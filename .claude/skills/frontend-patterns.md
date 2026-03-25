@@ -28,7 +28,19 @@ skill: Frontend Development Patterns for DB Visualizer
 - `/static/js/filters.js` - Filter panel (key type, relationship type, table)
 - `/static/js/export.js` - PNG and JSON export
 - `/static/css/styles.css` - All styles
-- `/templates/index.html` - Main page template
+- `/templates/index.html` - Main page template (diagram)
+
+### Builder Page Modules (`/static/js/builder/`)
+- `builder-app.js` - Main orchestrator for builder page (reuses `events.js`)
+- `builder-state.js` - State store for target PG schema
+- `builder-panels.js` - Source panel (loaded CSV tables) + target panel
+- `builder-editors.js` - Table editor + column editor UI
+- `builder-pickers.js` - PG type selector + constraint picker
+- `builder-output.js` - Live DDL preview + export controls
+- `builder-relationships.js` - FK relationship wiring UI
+- `builder-constants.js` - PG type catalog, constraint options, colors
+- `/static/css/builder.css` - Builder page styles
+- `/templates/builder.html` - Builder page template
 
 ## 3. State Management Pattern
 
