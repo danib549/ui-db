@@ -2813,6 +2813,71 @@ def generate_export_filename(schema_name: str, export_type: str) -> str:
     }
     return suffixes.get(export_type, f"{safe_name}_{timestamp}.sql")
 ===== END: migration_generator.py =====
+===== FILE: package-lock.json =====
+{
+  "name": "ui-db",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {
+    "": {
+      "dependencies": {
+        "playwright": "^1.58.2"
+      }
+    },
+    "node_modules/fsevents": {
+      "version": "2.3.2",
+      "resolved": "https://registry.npmjs.org/fsevents/-/fsevents-2.3.2.tgz",
+      "integrity": "sha512-xiqMQR4xAeHTuB9uWm+fFRcIOgKBMiOBP+eXiyT7jsgVCq1bkVygt00oASowB7EdtpOHaaPgKt812P9ab+DDKA==",
+      "hasInstallScript": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "darwin"
+      ],
+      "engines": {
+        "node": "^8.16.0 || ^10.6.0 || >=11.0.0"
+      }
+    },
+    "node_modules/playwright": {
+      "version": "1.58.2",
+      "resolved": "https://registry.npmjs.org/playwright/-/playwright-1.58.2.tgz",
+      "integrity": "sha512-vA30H8Nvkq/cPBnNw4Q8TWz1EJyqgpuinBcHET0YVJVFldr8JDNiU9LaWAE1KqSkRYazuaBhTpB5ZzShOezQ6A==",
+      "license": "Apache-2.0",
+      "dependencies": {
+        "playwright-core": "1.58.2"
+      },
+      "bin": {
+        "playwright": "cli.js"
+      },
+      "engines": {
+        "node": ">=18"
+      },
+      "optionalDependencies": {
+        "fsevents": "2.3.2"
+      }
+    },
+    "node_modules/playwright-core": {
+      "version": "1.58.2",
+      "resolved": "https://registry.npmjs.org/playwright-core/-/playwright-core-1.58.2.tgz",
+      "integrity": "sha512-yZkEtftgwS8CsfYo7nm0KE8jsvm6i/PTgVtB8DL726wNf6H2IMsDuxCpJj59KDaxCtSnrWan2AeDqM7JBaultg==",
+      "license": "Apache-2.0",
+      "bin": {
+        "playwright-core": "cli.js"
+      },
+      "engines": {
+        "node": ">=18"
+      }
+    }
+  }
+}
+===== END: package-lock.json =====
+===== FILE: package.json =====
+{
+  "dependencies": {
+    "playwright": "^1.58.2"
+  }
+}
+===== END: package.json =====
 ===== FILE: pg_validator.py =====
 """PostgreSQL schema validator — naming, constraints, FK targets, safety checks."""
 
@@ -19264,11 +19329,13 @@ function initTooltips() {
 
   // Event delegation — works for dynamically created .builder-info elements too
   document.addEventListener('mouseenter', (e) => {
+    if (!e.target || !e.target.closest) return;
     const info = e.target.closest('.builder-info');
     if (info) show(info);
   }, true);
 
   document.addEventListener('mouseleave', (e) => {
+    if (!e.target || !e.target.closest) return;
     const info = e.target.closest('.builder-info');
     if (info) hide();
   }, true);
@@ -19771,6 +19838,12 @@ function applyColumnEditor() {
     changes.defaultValue = null;
   }
 
+  // Sync key toggles with column properties
+  const pkInput = body.querySelector('#editor-pk');
+  const uqInput = body.querySelector('#editor-unique');
+  if (pkInput) changes.isPrimaryKey = pkInput.checked;
+  if (uqInput) changes.isUnique = uqInput.checked;
+
   updateColumn(editor.table, editor.column, changes);
 
   // Handle key constraint changes
@@ -19778,8 +19851,8 @@ function applyColumnEditor() {
   const colName = changes.name || editor.column;
 
   if (table) {
-    _applyKeyToggle(table, colName, 'pk', body.querySelector('#editor-pk'));
-    _applyKeyToggle(table, colName, 'unique', body.querySelector('#editor-unique'));
+    _applyKeyToggle(table, colName, 'pk', pkInput);
+    _applyKeyToggle(table, colName, 'unique', uqInput);
     _applyFKToggle(table, colName, body);
   }
 
@@ -21081,7 +21154,8 @@ function renderMigration() {
 // ---- Helpers ----
 
 function copyToClipboard(text, successMsg) {
-  if (!text || text.startsWith('--')) {
+  if (!text || text === '-- Generated DDL will appear here as you build your schema'
+             || text === '-- Migration SQL will appear here') {
     showToast('Nothing to copy');
     return;
   }
@@ -21092,7 +21166,8 @@ function copyToClipboard(text, successMsg) {
 }
 
 function downloadFile(content, filename, mimeType) {
-  if (!content || content.startsWith('--')) {
+  if (!content || content === '-- Generated DDL will appear here as you build your schema'
+               || content === '-- Migration SQL will appear here') {
     showToast('Nothing to export');
     return;
   }

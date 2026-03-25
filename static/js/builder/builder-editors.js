@@ -155,6 +155,12 @@ function applyColumnEditor() {
     changes.defaultValue = null;
   }
 
+  // Sync key toggles with column properties
+  const pkInput = body.querySelector('#editor-pk');
+  const uqInput = body.querySelector('#editor-unique');
+  if (pkInput) changes.isPrimaryKey = pkInput.checked;
+  if (uqInput) changes.isUnique = uqInput.checked;
+
   updateColumn(editor.table, editor.column, changes);
 
   // Handle key constraint changes
@@ -162,8 +168,8 @@ function applyColumnEditor() {
   const colName = changes.name || editor.column;
 
   if (table) {
-    _applyKeyToggle(table, colName, 'pk', body.querySelector('#editor-pk'));
-    _applyKeyToggle(table, colName, 'unique', body.querySelector('#editor-unique'));
+    _applyKeyToggle(table, colName, 'pk', pkInput);
+    _applyKeyToggle(table, colName, 'unique', uqInput);
     _applyFKToggle(table, colName, body);
   }
 
