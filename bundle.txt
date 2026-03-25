@@ -21154,7 +21154,8 @@ function renderMigration() {
 // ---- Helpers ----
 
 function copyToClipboard(text, successMsg) {
-  if (!text || text.startsWith('--')) {
+  if (!text || text === '-- Generated DDL will appear here as you build your schema'
+             || text === '-- Migration SQL will appear here') {
     showToast('Nothing to copy');
     return;
   }
@@ -21165,7 +21166,8 @@ function copyToClipboard(text, successMsg) {
 }
 
 function downloadFile(content, filename, mimeType) {
-  if (!content || content.startsWith('--')) {
+  if (!content || content === '-- Generated DDL will appear here as you build your schema'
+               || content === '-- Migration SQL will appear here') {
     showToast('Nothing to export');
     return;
   }
