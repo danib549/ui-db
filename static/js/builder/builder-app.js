@@ -180,11 +180,13 @@ function initTooltips() {
 
   // Event delegation — works for dynamically created .builder-info elements too
   document.addEventListener('mouseenter', (e) => {
+    if (!e.target || !e.target.closest) return;
     const info = e.target.closest('.builder-info');
     if (info) show(info);
   }, true);
 
   document.addEventListener('mouseleave', (e) => {
+    if (!e.target || !e.target.closest) return;
     const info = e.target.closest('.builder-info');
     if (info) hide();
   }, true);
