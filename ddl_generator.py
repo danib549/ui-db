@@ -64,7 +64,7 @@ def generate_column_def(col: dict) -> str:
 
 def generate_constraint_def(constraint: dict) -> str:
     """Generate a table-level constraint definition."""
-    cols = ", ".join(quote_identifier(c) for c in constraint["columns"])
+    cols = ", ".join(quote_identifier(c) for c in constraint.get("columns", []))
 
     if constraint["type"] == "pk":
         return f'CONSTRAINT {quote_identifier(constraint["name"])} PRIMARY KEY ({cols})'
