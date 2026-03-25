@@ -595,6 +595,59 @@ body {
   color: var(--builder-error);
 }
 
+/* ---- Table card options (partitioning, IF NOT EXISTS) ---- */
+.builder-table-card__options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 6px 12px 8px;
+  border-top: 1px solid var(--builder-card-border);
+  align-items: center;
+}
+
+.builder-table-card__option {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.builder-table-card__option--toggle {
+  cursor: pointer;
+}
+
+.builder-table-card__option--toggle span {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+}
+
+.builder-table-card__partition {
+  font-size: 10px;
+  padding: 2px 4px;
+  border: 1px solid var(--builder-input-border);
+  border-radius: var(--radius-sm);
+  background: var(--builder-input-bg);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.builder-table-card__partition-cols {
+  font-size: 11px;
+  padding: 2px 6px;
+  border: 1px solid var(--builder-input-border);
+  border-radius: var(--radius-sm);
+  background: var(--builder-input-bg);
+  color: var(--text-primary);
+  width: 120px;
+  font-family: 'JetBrains Mono', monospace;
+  outline: none;
+}
+
+.builder-table-card__partition-cols:focus {
+  border-color: var(--accent);
+}
+
 .builder-table-card__add-constraint,
 .builder-table-card__add-index {
   font-size: 10px;

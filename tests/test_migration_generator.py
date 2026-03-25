@@ -74,3 +74,57 @@ def test_single_source_unchanged():
     sql = generate_migration_sql(mapping, {"tables": []})
     assert sql.count("INSERT INTO") == 1
     assert 'FROM "src_users"' in sql
+
+
+# ---- All transform types ----
+
+def _transform_sql(transform):
+    mapping = {"t.col": {"sourceTable": "s", "sourceColumn": "x", "transform": transform}}
+    return generate_migration_sql(mapping, {"tables": []})
+
+
+def test_cast_bigint_transform():
+    assert 'CAST("x" AS BIGINT)' in _transform_sql("CAST_BIGINT")
+
+
+def test_cast_boolean_transform():
+    assert 'CAST("x" AS BOOLEAN)' in _transform_sql("CAST_BOOLEAN")
+
+
+def test_cast_timestamptz_transform():
+    assert 'CAST("x" AS TIMESTAMPTZ)' in _transform_sql("CAST_TIMESTAMPTZ")
+
+
+def test_cast_uuid_transform():
+    assert 'CAST("x" AS UUID)' in _transform_sql("CAST_UUID")
+
+
+def test_cast_numeric_transform():
+    assert 'CAST("x" AS NUMERIC)' in _transform_sql("CAST_NUMERIC")
+
+
+def test_cast_jsonb_transform():
+    assert 'CAST("x" AS JSONB)' in _transform_sql("CAST_JSONB")
+
+
+def test_upper_transform():
+    assert 'UPPER("x")' in _transform_sql("UPPER")
+
+
+def test_trim_transform():
+    assert 'TRIM("x")' in _transform_sql("TRIM")
+
+
+def test_lower_transform():
+    assert 'LOWER("x")' in _transform_sql("LOWER")
+
+
+def test_unknown_transform_passthrough():
+    sql = _transform_sql("NONEXISTENT")
+    assert '"x"' in sql  # just the quoted column name
+
+
+def test_empty_mapping_no_insert():
+    sql = generate_migration_sql({}, {"tables": []})
+    assert "INSERT INTO" not in sql
+    assert "BEGIN;" in sql

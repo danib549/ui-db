@@ -37,11 +37,20 @@ def generate_column_def(col: dict) -> str:
     """Generate a single column definition line."""
     parts = [quote_identifier(col["name"])]
 
+    # Generated/computed column
+    if col.get("generatedExpression"):
+        parts.append(_format_type(col["type"]))
+        parts.append(f"GENERATED ALWAYS AS ({col['generatedExpression']}) STORED")
+        return " ".join(parts)
+
     if col.get("identity"):
         base_type = col["type"].upper()
         parts.append(f"{base_type} GENERATED {col['identity']} AS IDENTITY")
     else:
         parts.append(_format_type(col["type"]))
+
+    if col.get("collation"):
+        parts.append(f'COLLATE "{col["collation"]}"')
 
     if not col.get("nullable", True):
         parts.append("NOT NULL")
@@ -77,10 +86,16 @@ def generate_constraint_def(constraint: dict) -> str:
             parts.append(f'ON DELETE {on_delete}')
         if on_update != "NO ACTION":
             parts.append(f'ON UPDATE {on_update}')
+        deferrable = constraint.get("deferrable")
+        if deferrable == "DEFERRED":
+            parts.append("DEFERRABLE INITIALLY DEFERRED")
+        elif deferrable == "IMMEDIATE":
+            parts.append("DEFERRABLE INITIALLY IMMEDIATE")
         return " ".join(parts)
 
     if constraint["type"] == "unique":
-        return f'CONSTRAINT {quote_identifier(constraint["name"])} UNIQUE ({cols})'
+        nulls = " NULLS NOT DISTINCT" if constraint.get("nullsNotDistinct") else ""
+        return f'CONSTRAINT {quote_identifier(constraint["name"])} UNIQUE{nulls} ({cols})'
 
     if constraint["type"] == "check":
         from pg_validator import validate_check_expression
@@ -112,7 +127,21 @@ def generate_create_table(table: dict) -> str:
         col_defs.append("  " + generate_constraint_def(constraint))
 
     body = ",\n".join(col_defs)
-    sql = f"{header}\n{body}\n);"
+
+    # Closing paren + partitioning + ON COMMIT
+    close = ")"
+    partition = table.get("partitionBy")
+    if partition:
+        p_type = partition.get("type", "RANGE").upper()
+        p_cols = ", ".join(quote_identifier(c) for c in partition.get("columns", []))
+        if p_cols:
+            close += f" PARTITION BY {p_type} ({p_cols})"
+
+    on_commit = table.get("onCommit")
+    if on_commit and table.get("tableType") == "temp":
+        close += f" ON COMMIT {on_commit}"
+
+    sql = f"{header}\n{body}\n{close};"
 
     if table.get("comment"):
         comment = table["comment"].replace("'", "''")
@@ -123,12 +152,25 @@ def generate_create_table(table: dict) -> str:
 
 def generate_index(table_name: str, idx: dict) -> str:
     """Generate CREATE INDEX statement."""
-    cols = ", ".join(quote_identifier(c) for c in idx["columns"])
+    # Support expression indexes: if column starts with ( it's an expression
+    col_parts = []
+    for c in idx.get("columns", []):
+        if c.startswith("(") or c.startswith("LOWER") or c.startswith("UPPER"):
+            col_parts.append(c)  # expression — don't quote
+        else:
+            col_parts.append(quote_identifier(c))
+    cols = ", ".join(col_parts)
+
     unique = "UNIQUE " if idx.get("unique") else ""
     using = f" USING {idx['type'].upper()}" if idx.get("type", "btree") != "btree" else ""
     name = quote_identifier(idx["name"])
     table = quote_identifier(table_name)
-    return f'CREATE {unique}INDEX {name} ON {table}{using} ({cols});'
+
+    where = ""
+    if idx.get("where"):
+        where = f" WHERE {idx['where']}"
+
+    return f'CREATE {unique}INDEX {name} ON {table}{using} ({cols}){where};'
 
 
 def topological_sort_tables(tables: list[dict]) -> tuple[list[dict], list[dict]]:

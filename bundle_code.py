@@ -18,7 +18,7 @@ import os
 import sys
 
 # Directories and files to skip when bundling
-SKIP_DIRS = {".git", "__pycache__", ".venv", "venv", "node_modules", ".tox", ".mypy_cache", "tests", "test_data", "test_data_deep", "test_data_large"}
+SKIP_DIRS = {".git", "__pycache__", ".venv", "venv", "node_modules", ".tox", ".mypy_cache", ".pytest_cache", "tests", "test_data", "test_data_deep", "test_data_large"}
 SKIP_FILES = set()
 
 HEADER_FMT = "===== FILE: {} ====="

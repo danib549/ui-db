@@ -288,6 +288,21 @@ function createTableCard(table) {
       </span>`).join('')}
       <button class="builder-table-card__add-index">+ Index</button>
     </div>
+    <div class="builder-table-card__options">
+      <label class="builder-table-card__option" title="Partition this table by range, list, or hash">
+        <select class="builder-table-card__partition" data-table="${escapeHtml(table.name)}">
+          <option value="">No partition</option>
+          <option value="RANGE" ${table.partitionBy?.type === 'RANGE' ? 'selected' : ''}>PARTITION BY RANGE</option>
+          <option value="LIST" ${table.partitionBy?.type === 'LIST' ? 'selected' : ''}>PARTITION BY LIST</option>
+          <option value="HASH" ${table.partitionBy?.type === 'HASH' ? 'selected' : ''}>PARTITION BY HASH</option>
+        </select>
+      </label>
+      ${table.partitionBy ? `<input class="builder-table-card__partition-cols" placeholder="Partition column(s)" value="${escapeHtml((table.partitionBy.columns || []).join(', '))}" data-table="${escapeHtml(table.name)}">` : ''}
+      <label class="builder-table-card__option builder-table-card__option--toggle">
+        <input type="checkbox" class="builder-table-card__if-not-exists" ${table.ifNotExists ? 'checked' : ''} data-table="${escapeHtml(table.name)}">
+        <span>IF NOT EXISTS</span>
+      </label>
+    </div>
   `;
 
   // Wire events
@@ -304,6 +319,29 @@ function createTableCard(table) {
 
   card.querySelector('.builder-table-card__type').addEventListener('change', (e) => {
     updateTable(table.name, { tableType: e.target.value });
+  });
+
+  // Partition select
+  card.querySelector('.builder-table-card__partition')?.addEventListener('change', (e) => {
+    const pType = e.target.value;
+    if (pType) {
+      updateTable(table.name, { partitionBy: { type: pType, columns: table.partitionBy?.columns || [] } });
+    } else {
+      updateTable(table.name, { partitionBy: null });
+    }
+  });
+
+  // Partition columns input
+  card.querySelector('.builder-table-card__partition-cols')?.addEventListener('blur', (e) => {
+    const cols = e.target.value.split(',').map(c => c.trim()).filter(Boolean);
+    if (table.partitionBy) {
+      updateTable(table.name, { partitionBy: { ...table.partitionBy, columns: cols } });
+    }
+  });
+
+  // IF NOT EXISTS toggle
+  card.querySelector('.builder-table-card__if-not-exists')?.addEventListener('change', (e) => {
+    updateTable(table.name, { ifNotExists: e.target.checked });
   });
 
   card.querySelector('.builder-table-card__delete').addEventListener('click', () => {

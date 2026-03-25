@@ -358,3 +358,89 @@ def test_add_enum_value_uses_if_not_exists():
     ops = diff_schemas(original, modified)
     add_ops = [o for o in ops if o["type"] == "add_enum_value"]
     assert "IF NOT EXISTS" in add_ops[0]["sql"]
+
+
+# ---- Constraint changes ----
+
+def test_constraint_changed_fk_action():
+    original = _base_schema()
+    original["tables"][0]["constraints"].append(
+        {"type": "fk", "columns": ["email"], "refTable": "emails", "refColumns": ["id"],
+         "onDelete": "CASCADE", "onUpdate": "NO ACTION", "name": "users_email_fkey"})
+    modified = copy.deepcopy(original)
+    for c in modified["tables"][0]["constraints"]:
+        if c["name"] == "users_email_fkey":
+            c["onDelete"] = "SET NULL"
+    ops = diff_schemas(original, modified)
+    drop_c = [o for o in ops if o["type"] == "drop_constraint"]
+    add_c = [o for o in ops if o["type"] == "add_constraint"]
+    assert len(drop_c) >= 1
+    assert len(add_c) >= 1
+    assert "SET NULL" in add_c[0]["sql"]
+
+
+def test_constraint_changed_check_expression():
+    original = _base_schema()
+    original["tables"][0]["constraints"].append(
+        {"type": "check", "columns": [], "expression": '"id" > 0', "name": "check1"})
+    modified = copy.deepcopy(original)
+    for c in modified["tables"][0]["constraints"]:
+        if c["name"] == "check1":
+            c["expression"] = '"id" > 10'
+    ops = diff_schemas(original, modified)
+    drop_c = [o for o in ops if o["type"] == "drop_constraint"]
+    add_c = [o for o in ops if o["type"] == "add_constraint"]
+    assert len(drop_c) >= 1
+    assert len(add_c) >= 1
+
+
+def test_identity_swap_always_to_by_default():
+    original = _base_schema()
+    original["tables"][0]["columns"][0]["identity"] = "ALWAYS"
+    modified = copy.deepcopy(original)
+    modified["tables"][0]["columns"][0]["identity"] = "BY DEFAULT"
+    ops = diff_schemas(original, modified)
+    identity_ops = [o for o in ops if "IDENTITY" in o.get("sql", "")]
+    assert len(identity_ops) == 2
+    sqls = [o["sql"] for o in identity_ops]
+    assert any("DROP IDENTITY" in s for s in sqls)
+    assert any("BY DEFAULT" in s for s in sqls)
+
+
+def test_nullable_to_not_null():
+    original = _base_schema()
+    original["tables"][0]["columns"][1]["nullable"] = True
+    modified = copy.deepcopy(original)
+    modified["tables"][0]["columns"][1]["nullable"] = False
+    ops = diff_schemas(original, modified)
+    null_ops = [o for o in ops if o["type"] == "alter_column_nullable"]
+    assert len(null_ops) == 1
+    assert "SET NOT NULL" in null_ops[0]["sql"]
+
+
+def test_not_null_to_nullable():
+    original = _base_schema()
+    original["tables"][0]["columns"][1]["nullable"] = False
+    modified = copy.deepcopy(original)
+    modified["tables"][0]["columns"][1]["nullable"] = True
+    ops = diff_schemas(original, modified)
+    null_ops = [o for o in ops if o["type"] == "alter_column_nullable"]
+    assert len(null_ops) == 1
+    assert "DROP NOT NULL" in null_ops[0]["sql"]
+
+
+def test_default_added():
+    original = _base_schema()
+    modified = copy.deepcopy(original)
+    modified["tables"][0]["columns"][1]["defaultValue"] = "'default@test.com'"
+    ops = diff_schemas(original, modified)
+    assert any("SET DEFAULT" in o["sql"] for o in ops)
+
+
+def test_default_removed():
+    original = _base_schema()
+    original["tables"][0]["columns"][1]["defaultValue"] = "'old@test.com'"
+    modified = copy.deepcopy(original)
+    modified["tables"][0]["columns"][1]["defaultValue"] = None
+    ops = diff_schemas(original, modified)
+    assert any("DROP DEFAULT" in o["sql"] for o in ops)

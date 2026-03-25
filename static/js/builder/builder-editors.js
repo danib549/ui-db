@@ -10,6 +10,7 @@ import {
 } from './builder-state.js';
 import {
   PG_TYPE_CATEGORIES, PG_TYPE_DESCRIPTIONS, PG_TYPE_PARAMS, IDENTITY_OPTIONS,
+  DEFERRABLE_OPTIONS,
 } from './builder-constants.js';
 
 // ---- Column Editor ----
@@ -145,6 +146,15 @@ function applyColumnEditor() {
   const commentInput = body.querySelector('#editor-comment');
   if (commentInput) changes.comment = commentInput.value.trim() || null;
 
+  const generatedInput = body.querySelector('#editor-generated');
+  if (generatedInput) changes.generatedExpression = generatedInput.value.trim() || null;
+
+  // If generated, clear identity and default (mutually exclusive)
+  if (changes.generatedExpression) {
+    changes.identity = null;
+    changes.defaultValue = null;
+  }
+
   updateColumn(editor.table, editor.column, changes);
 
   // Handle key constraint changes
@@ -194,6 +204,7 @@ function _applyFKToggle(table, colName, body) {
     const refTable = body.querySelector('#editor-fk-table')?.value;
     const refCol = body.querySelector('#editor-fk-col')?.value;
     const onDelete = body.querySelector('#editor-fk-ondelete')?.value || 'NO ACTION';
+    const deferrable = body.querySelector('#editor-fk-deferrable')?.value || '';
 
     if (!refTable || !refCol) return;
 
@@ -206,6 +217,7 @@ function _applyFKToggle(table, colName, body) {
       refTable,
       refColumns: [refCol],
       onDelete,
+      deferrable,
       onUpdate: 'NO ACTION',
       name: `${table.name}_${colName}_fkey`,
     });
@@ -237,6 +249,7 @@ function _buildEditorForm(col, table) {
   const fkRefTable = fkConstraint ? fkConstraint.refTable : '';
   const fkRefCol = fkConstraint ? (fkConstraint.refColumns[0] || '') : '';
   const fkOnDelete = fkConstraint ? (fkConstraint.onDelete || 'NO ACTION') : 'NO ACTION';
+  const fkDeferrable = fkConstraint ? (fkConstraint.deferrable || '') : '';
 
   // Smart recommendations based on column name and current config
   const recs = _getRecommendations(col, table, baseType);
@@ -322,6 +335,16 @@ function _buildEditorForm(col, table) {
           ).join('')}
         </select>
       </div>
+      <div class="builder-field">
+        <label for="editor-fk-deferrable">Deferrable
+          <span class="builder-info" data-tooltip="Controls when the FK constraint is checked.\n\nNot deferrable: checked after each statement (default)\nInitially deferred: checked at COMMIT (useful for bulk inserts with circular FKs)\nInitially immediate: checked per-statement but can be deferred per-transaction with SET CONSTRAINTS">?</span>
+        </label>
+        <select id="editor-fk-deferrable" class="builder-field__select">
+          ${DEFERRABLE_OPTIONS.map(opt =>
+            `<option value="${opt.value}" ${fkDeferrable === opt.value ? 'selected' : ''}>${opt.label}</option>`
+          ).join('')}
+        </select>
+      </div>
     </div>
 
     <div class="builder-field builder-field--toggle">
@@ -349,6 +372,15 @@ function _buildEditorForm(col, table) {
       <input type="text" id="editor-default" class="builder-field__input"
              value="${escapeHtml(col.defaultValue || '')}" placeholder="e.g., NOW(), 0, 'pending'">
       <span class="builder-field__hint">Leave empty for no default</span>
+    </div>
+
+    <div class="builder-field">
+      <label for="editor-generated">Generated / Computed Column
+        <span class="builder-info" data-tooltip="A stored computed column (PG 12+). Value is calculated on INSERT/UPDATE and stored on disk.\n\nExamples:\nfirst_name || ' ' || last_name\nprice * quantity\nUPPER(email)\n\nCannot have a DEFAULT or IDENTITY when generated.">?</span>
+      </label>
+      <input type="text" id="editor-generated" class="builder-field__input"
+             value="${escapeHtml(col.generatedExpression || '')}" placeholder='e.g., first_name || &apos; &apos; || last_name'>
+      <span class="builder-field__hint">Leave empty for a regular column. Expression is STORED (computed on write).</span>
     </div>
 
     <div class="builder-field">
@@ -427,6 +459,22 @@ function _getRecommendations(col, table, baseType) {
   }
   if (name === 'status' && baseType === 'text') {
     tips.push('Status columns with limited values work well as a custom <strong>ENUM type</strong> or <strong>varchar</strong> with a CHECK constraint.');
+  }
+
+  // Generated column hints
+  if (name === 'full_name' || name === 'display_name') {
+    tips.push('Consider making this a <strong>Generated Column</strong>: <code>first_name || \' \' || last_name</code>');
+  }
+  if (name === 'total' || name === 'subtotal' || name === 'line_total') {
+    tips.push('If this is computed from other columns, consider a <strong>Generated Column</strong>: <code>price * quantity</code>');
+  }
+
+  // Generated + identity/default conflict
+  if (col.generatedExpression && col.identity) {
+    tips.push('A generated column cannot also have <strong>IDENTITY</strong>. Remove one.');
+  }
+  if (col.generatedExpression && col.defaultValue) {
+    tips.push('A generated column cannot also have a <strong>DEFAULT</strong>. Remove one.');
   }
 
   if (tips.length === 0) return '';

@@ -169,3 +169,70 @@ def test_timestamptz_to_timestamp_compatible():
     }
     issues = validate_fk_types(schema)
     assert not any(i["code"] == "FK_TYPE_MISMATCH" for i in issues)
+
+
+# ---- Additional validator tests ----
+
+def test_63_char_name_valid():
+    name = "a" * 63
+    issues = validate_identifier(name, "test")
+    assert not any(i["code"] == "NAME_TOO_LONG" for i in issues)
+
+
+def test_empty_enum_values():
+    from pg_validator import validate_enums
+    schema = {"enums": [{"name": "empty_enum", "values": []}]}
+    issues = validate_enums(schema)
+    assert any(i["code"] == "EMPTY_ENUM" for i in issues)
+
+
+def test_duplicate_enum_values():
+    from pg_validator import validate_enums
+    schema = {"enums": [{"name": "dupe", "values": ["a", "b", "a"]}]}
+    issues = validate_enums(schema)
+    assert any(i["code"] == "DUPLICATE_ENUM_VALUE" for i in issues)
+
+
+def test_multiple_pk_error():
+    from pg_validator import validate_constraint_conflicts
+    schema = {"tables": [{"name": "t", "columns": [{"name": "id", "type": "int"}], "constraints": [
+        {"type": "pk", "columns": ["id"], "name": "pk1"},
+        {"type": "pk", "columns": ["id"], "name": "pk2"},
+    ]}]}
+    issues = validate_constraint_conflicts(schema)
+    assert any(i["code"] == "MULTIPLE_PK" for i in issues)
+
+
+def test_fk_missing_source_column():
+    from pg_validator import validate_fk_targets
+    schema = {"tables": [
+        {"name": "a", "columns": [{"name": "id", "type": "int"}], "constraints": []},
+        {"name": "b", "columns": [{"name": "id", "type": "int"}], "constraints": [
+            {"type": "fk", "columns": ["nonexistent"], "refTable": "a", "refColumns": ["id"], "name": "fk"},
+        ]},
+    ]}
+    issues = validate_fk_targets(schema)
+    assert any(i["code"] == "FK_MISSING_SOURCE_COLUMN" for i in issues)
+
+
+def test_fk_missing_target_column():
+    from pg_validator import validate_fk_targets
+    schema = {"tables": [
+        {"name": "a", "columns": [{"name": "id", "type": "int"}], "constraints": []},
+        {"name": "b", "columns": [{"name": "a_id", "type": "int"}], "constraints": [
+            {"type": "fk", "columns": ["a_id"], "refTable": "a", "refColumns": ["nonexistent"], "name": "fk"},
+        ]},
+    ]}
+    issues = validate_fk_targets(schema)
+    assert any(i["code"] == "FK_MISSING_COLUMN" for i in issues)
+
+
+def test_check_expression_too_long():
+    expr = '"x" > ' + "0 AND " * 100 + "1"
+    issues = validate_check_expression(expr, "t", "c")
+    assert any(i["code"] == "CHECK_TOO_LONG" for i in issues)
+
+
+def test_default_unknown_expression_warns():
+    issues = validate_default_value("my_custom_func()", "text", "t", "c")
+    assert any(i["code"] == "DEFAULT_UNKNOWN_EXPR" for i in issues)

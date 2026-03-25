@@ -983,7 +983,7 @@ import os
 import sys
 
 # Directories and files to skip when bundling
-SKIP_DIRS = {".git", "__pycache__", ".venv", "venv", "node_modules", ".tox", ".mypy_cache", "tests", "test_data", "test_data_deep", "test_data_large"}
+SKIP_DIRS = {".git", "__pycache__", ".venv", "venv", "node_modules", ".tox", ".mypy_cache", ".pytest_cache", "tests", "test_data", "test_data_deep", "test_data_large"}
 SKIP_FILES = set()
 
 HEADER_FMT = "===== FILE: {} ====="
@@ -1205,11 +1205,20 @@ def generate_column_def(col: dict) -> str:
     """Generate a single column definition line."""
     parts = [quote_identifier(col["name"])]
 
+    # Generated/computed column
+    if col.get("generatedExpression"):
+        parts.append(_format_type(col["type"]))
+        parts.append(f"GENERATED ALWAYS AS ({col['generatedExpression']}) STORED")
+        return " ".join(parts)
+
     if col.get("identity"):
         base_type = col["type"].upper()
         parts.append(f"{base_type} GENERATED {col['identity']} AS IDENTITY")
     else:
         parts.append(_format_type(col["type"]))
+
+    if col.get("collation"):
+        parts.append(f'COLLATE "{col["collation"]}"')
 
     if not col.get("nullable", True):
         parts.append("NOT NULL")
@@ -1245,10 +1254,16 @@ def generate_constraint_def(constraint: dict) -> str:
             parts.append(f'ON DELETE {on_delete}')
         if on_update != "NO ACTION":
             parts.append(f'ON UPDATE {on_update}')
+        deferrable = constraint.get("deferrable")
+        if deferrable == "DEFERRED":
+            parts.append("DEFERRABLE INITIALLY DEFERRED")
+        elif deferrable == "IMMEDIATE":
+            parts.append("DEFERRABLE INITIALLY IMMEDIATE")
         return " ".join(parts)
 
     if constraint["type"] == "unique":
-        return f'CONSTRAINT {quote_identifier(constraint["name"])} UNIQUE ({cols})'
+        nulls = " NULLS NOT DISTINCT" if constraint.get("nullsNotDistinct") else ""
+        return f'CONSTRAINT {quote_identifier(constraint["name"])} UNIQUE{nulls} ({cols})'
 
     if constraint["type"] == "check":
         from pg_validator import validate_check_expression
@@ -1280,7 +1295,21 @@ def generate_create_table(table: dict) -> str:
         col_defs.append("  " + generate_constraint_def(constraint))
 
     body = ",\n".join(col_defs)
-    sql = f"{header}\n{body}\n);"
+
+    # Closing paren + partitioning + ON COMMIT
+    close = ")"
+    partition = table.get("partitionBy")
+    if partition:
+        p_type = partition.get("type", "RANGE").upper()
+        p_cols = ", ".join(quote_identifier(c) for c in partition.get("columns", []))
+        if p_cols:
+            close += f" PARTITION BY {p_type} ({p_cols})"
+
+    on_commit = table.get("onCommit")
+    if on_commit and table.get("tableType") == "temp":
+        close += f" ON COMMIT {on_commit}"
+
+    sql = f"{header}\n{body}\n{close};"
 
     if table.get("comment"):
         comment = table["comment"].replace("'", "''")
@@ -1291,12 +1320,25 @@ def generate_create_table(table: dict) -> str:
 
 def generate_index(table_name: str, idx: dict) -> str:
     """Generate CREATE INDEX statement."""
-    cols = ", ".join(quote_identifier(c) for c in idx["columns"])
+    # Support expression indexes: if column starts with ( it's an expression
+    col_parts = []
+    for c in idx.get("columns", []):
+        if c.startswith("(") or c.startswith("LOWER") or c.startswith("UPPER"):
+            col_parts.append(c)  # expression — don't quote
+        else:
+            col_parts.append(quote_identifier(c))
+    cols = ", ".join(col_parts)
+
     unique = "UNIQUE " if idx.get("unique") else ""
     using = f" USING {idx['type'].upper()}" if idx.get("type", "btree") != "btree" else ""
     name = quote_identifier(idx["name"])
     table = quote_identifier(table_name)
-    return f'CREATE {unique}INDEX {name} ON {table}{using} ({cols});'
+
+    where = ""
+    if idx.get("where"):
+        where = f" WHERE {idx['where']}"
+
+    return f'CREATE {unique}INDEX {name} ON {table}{using} ({cols}){where};'
 
 
 def topological_sort_tables(tables: list[dict]) -> tuple[list[dict], list[dict]]:
@@ -13020,144 +13062,6 @@ def validate_schema(schema: dict) -> list[dict]:
 | `DUPLICATE_ENUM_VALUE` | error | Enum has duplicate values |
 | `ENUM_VALUE_INJECTION` | error | Dangerous characters in enum value |
 ===== END: .claude\skills\pg-validation.md =====
-===== FILE: .pytest_cache\.gitignore =====
-# Created by pytest automatically.
-*
-===== END: .pytest_cache\.gitignore =====
-===== FILE: .pytest_cache\CACHEDIR.TAG =====
-Signature: 8a477f597d28d172789f06886806bc55
-# This file is a cache directory tag created by pytest.
-# For information about cache directory tags, see:
-#	https://bford.info/cachedir/spec.html
-===== END: .pytest_cache\CACHEDIR.TAG =====
-===== FILE: .pytest_cache\README.md =====
-# pytest cache directory #
-
-This directory contains data from the pytest's cache plugin,
-which provides the `--lf` and `--ff` options, as well as the `cache` fixture.
-
-**Do not** commit this to version control.
-
-See [the docs](https://docs.pytest.org/en/stable/how-to/cache.html) for more information.
-===== END: .pytest_cache\README.md =====
-===== FILE: .pytest_cache\v\cache\nodeids =====
-[
-  "tests/test_ddl_generator.py::test_check_expression_injection_blocked",
-  "tests/test_ddl_generator.py::test_check_expression_valid_passes",
-  "tests/test_ddl_generator.py::test_column_def_basic",
-  "tests/test_ddl_generator.py::test_column_def_default",
-  "tests/test_ddl_generator.py::test_column_def_identity",
-  "tests/test_ddl_generator.py::test_create_table",
-  "tests/test_ddl_generator.py::test_create_temp_table",
-  "tests/test_ddl_generator.py::test_default_comment_injection_blocked",
-  "tests/test_ddl_generator.py::test_default_injection_blocked",
-  "tests/test_ddl_generator.py::test_default_valid_passes",
-  "tests/test_ddl_generator.py::test_enum_value_empty_string",
-  "tests/test_ddl_generator.py::test_enum_value_with_multiple_quotes",
-  "tests/test_ddl_generator.py::test_enum_value_with_single_quote",
-  "tests/test_ddl_generator.py::test_escape_enum_value_function",
-  "tests/test_ddl_generator.py::test_fk_invalid_on_delete_blocked",
-  "tests/test_ddl_generator.py::test_fk_invalid_on_update_blocked",
-  "tests/test_ddl_generator.py::test_fk_valid_on_delete",
-  "tests/test_ddl_generator.py::test_full_ddl_quoted_identifiers",
-  "tests/test_ddl_generator.py::test_full_ddl_structure",
-  "tests/test_ddl_generator.py::test_quote_identifier",
-  "tests/test_ddl_generator.py::test_quote_identifier_rejects_double_quote",
-  "tests/test_ddl_generator.py::test_topological_sort_circular",
-  "tests/test_ddl_generator.py::test_topological_sort_simple",
-  "tests/test_ddl_parser.py::test_classify_alter_table",
-  "tests/test_ddl_parser.py::test_classify_create_table",
-  "tests/test_ddl_parser.py::test_classify_create_type",
-  "tests/test_ddl_parser.py::test_classify_set",
-  "tests/test_ddl_parser.py::test_full_parse_pipeline",
-  "tests/test_ddl_parser.py::test_normalize_pg_type",
-  "tests/test_ddl_parser.py::test_parse_column_with_escaped_default",
-  "tests/test_ddl_parser.py::test_parse_create_index",
-  "tests/test_ddl_parser.py::test_parse_create_table_basic",
-  "tests/test_ddl_parser.py::test_parse_create_table_with_constraints",
-  "tests/test_ddl_parser.py::test_parse_create_type_enum",
-  "tests/test_ddl_parser.py::test_parse_create_unique_index",
-  "tests/test_ddl_parser.py::test_pg_dump_format",
-  "tests/test_ddl_parser.py::test_split_respects_parens",
-  "tests/test_ddl_parser.py::test_split_statements",
-  "tests/test_ddl_parser.py::test_split_statements_escaped_quotes",
-  "tests/test_ddl_parser.py::test_split_statements_multiple_escaped_quotes",
-  "tests/test_ddl_parser.py::test_strip_multi_line_comment",
-  "tests/test_ddl_parser.py::test_strip_preserves_strings",
-  "tests/test_ddl_parser.py::test_strip_single_line_comment",
-  "tests/test_migration_generator.py::test_basic_migration",
-  "tests/test_migration_generator.py::test_cast_transform",
-  "tests/test_migration_generator.py::test_export_filename",
-  "tests/test_migration_generator.py::test_export_filename_json",
-  "tests/test_migration_generator.py::test_multi_source_generates_separate_inserts",
-  "tests/test_migration_generator.py::test_no_transform",
-  "tests/test_migration_generator.py::test_nullif_transform",
-  "tests/test_migration_generator.py::test_single_source_unchanged",
-  "tests/test_pg_validator.py::test_bigserial_to_bigint_compatible",
-  "tests/test_pg_validator.py::test_check_banned_keyword",
-  "tests/test_pg_validator.py::test_check_empty",
-  "tests/test_pg_validator.py::test_check_unbalanced_parens",
-  "tests/test_pg_validator.py::test_check_valid",
-  "tests/test_pg_validator.py::test_circular_fks",
-  "tests/test_pg_validator.py::test_default_numeric",
-  "tests/test_pg_validator.py::test_default_safe_function",
-  "tests/test_pg_validator.py::test_default_string",
-  "tests/test_pg_validator.py::test_duplicate_tables",
-  "tests/test_pg_validator.py::test_empty_name",
-  "tests/test_pg_validator.py::test_enum_table_name_collision_warning",
-  "tests/test_pg_validator.py::test_full_valid_schema",
-  "tests/test_pg_validator.py::test_injection_chars",
-  "tests/test_pg_validator.py::test_long_name",
-  "tests/test_pg_validator.py::test_reserved_word",
-  "tests/test_pg_validator.py::test_serial_to_integer_compatible",
-  "tests/test_pg_validator.py::test_timestamptz_to_timestamp_compatible",
-  "tests/test_pg_validator.py::test_valid_name",
-  "tests/test_schema_differ.py::test_add_column",
-  "tests/test_schema_differ.py::test_add_constraint",
-  "tests/test_schema_differ.py::test_add_enum",
-  "tests/test_schema_differ.py::test_add_enum_value",
-  "tests/test_schema_differ.py::test_add_enum_value_uses_if_not_exists",
-  "tests/test_schema_differ.py::test_add_not_null_column_with_default_no_warning",
-  "tests/test_schema_differ.py::test_add_not_null_column_without_default_warns",
-  "tests/test_schema_differ.py::test_add_table",
-  "tests/test_schema_differ.py::test_alter_column_type",
-  "tests/test_schema_differ.py::test_compatible_type_change_no_using",
-  "tests/test_schema_differ.py::test_diff_add_enum_value_with_quote",
-  "tests/test_schema_differ.py::test_diff_add_enum_with_quotes",
-  "tests/test_schema_differ.py::test_diff_index_columns_changed",
-  "tests/test_schema_differ.py::test_diff_index_type_changed",
-  "tests/test_schema_differ.py::test_diff_index_unchanged",
-  "tests/test_schema_differ.py::test_drop_column",
-  "tests/test_schema_differ.py::test_drop_table",
-  "tests/test_schema_differ.py::test_enum_drop_warns_if_dependent_columns",
-  "tests/test_schema_differ.py::test_identity_added",
-  "tests/test_schema_differ.py::test_identity_dropped",
-  "tests/test_schema_differ.py::test_migration_ddl_output",
-  "tests/test_schema_differ.py::test_migration_enum_only_no_transaction",
-  "tests/test_schema_differ.py::test_migration_enum_value_outside_transaction",
-  "tests/test_schema_differ.py::test_migration_mixed_ops_correct_order",
-  "tests/test_schema_differ.py::test_migration_new_tables_fk_ordered",
-  "tests/test_schema_differ.py::test_no_changes",
-  "tests/test_schema_differ.py::test_no_changes_message",
-  "tests/test_schema_differ.py::test_type_change_adds_using_clause",
-  "tests/test_schema_differ.py::test_type_change_text_to_integer",
-  "tests/test_type_mapper.py::test_boolean",
-  "tests/test_type_mapper.py::test_float_currency",
-  "tests/test_type_mapper.py::test_float_default",
-  "tests/test_type_mapper.py::test_int_bigint_for_large_values",
-  "tests/test_type_mapper.py::test_int_default",
-  "tests/test_type_mapper.py::test_int_identity_pk",
-  "tests/test_type_mapper.py::test_int_smallint_for_small_values",
-  "tests/test_type_mapper.py::test_text",
-  "tests/test_type_mapper.py::test_timestamp",
-  "tests/test_type_mapper.py::test_varchar_email",
-  "tests/test_type_mapper.py::test_varchar_enum_suggestion",
-  "tests/test_type_mapper.py::test_varchar_ip",
-  "tests/test_type_mapper.py::test_varchar_json",
-  "tests/test_type_mapper.py::test_varchar_short",
-  "tests/test_type_mapper.py::test_varchar_uuid"
-]
-===== END: .pytest_cache\v\cache\nodeids =====
 ===== FILE: static\css\builder.css =====
 /* ============================================
    PostgreSQL Schema Builder Styles
@@ -13754,6 +13658,59 @@ body {
 .builder-constraint-badge__delete:hover,
 .builder-index-badge__delete:hover {
   color: var(--builder-error);
+}
+
+/* ---- Table card options (partitioning, IF NOT EXISTS) ---- */
+.builder-table-card__options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 6px 12px 8px;
+  border-top: 1px solid var(--builder-card-border);
+  align-items: center;
+}
+
+.builder-table-card__option {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.builder-table-card__option--toggle {
+  cursor: pointer;
+}
+
+.builder-table-card__option--toggle span {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+}
+
+.builder-table-card__partition {
+  font-size: 10px;
+  padding: 2px 4px;
+  border: 1px solid var(--builder-input-border);
+  border-radius: var(--radius-sm);
+  background: var(--builder-input-bg);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.builder-table-card__partition-cols {
+  font-size: 11px;
+  padding: 2px 6px;
+  border: 1px solid var(--builder-input-border);
+  border-radius: var(--radius-sm);
+  background: var(--builder-input-bg);
+  color: var(--text-primary);
+  width: 120px;
+  font-family: 'JetBrains Mono', monospace;
+  outline: none;
+}
+
+.builder-table-card__partition-cols:focus {
+  border-color: var(--accent);
 }
 
 .builder-table-card__add-constraint,
@@ -19494,6 +19451,25 @@ export const IDENTITY_OPTIONS = [
   { value: 'BY DEFAULT', label: 'Auto-increment with override (GENERATED BY DEFAULT)' },
 ];
 
+export const PARTITION_TYPES = [
+  { value: '', label: 'None' },
+  { value: 'RANGE', label: 'RANGE (date ranges, numeric ranges)' },
+  { value: 'LIST', label: 'LIST (discrete values like status, region)' },
+  { value: 'HASH', label: 'HASH (even distribution across partitions)' },
+];
+
+export const DEFERRABLE_OPTIONS = [
+  { value: '', label: 'Not deferrable (checked immediately)' },
+  { value: 'DEFERRED', label: 'Deferrable, initially deferred (checked at COMMIT)' },
+  { value: 'IMMEDIATE', label: 'Deferrable, initially immediate (can defer per-transaction)' },
+];
+
+export const ON_COMMIT_OPTIONS = [
+  { value: '', label: 'Preserve rows (default)' },
+  { value: 'DELETE ROWS', label: 'Delete rows on commit' },
+  { value: 'DROP', label: 'Drop table on commit' },
+];
+
 /** Default column template for new columns */
 export const DEFAULT_COLUMN = {
   name: '',
@@ -19504,6 +19480,7 @@ export const DEFAULT_COLUMN = {
   isPrimaryKey: false,
   isUnique: false,
   checkExpression: null,
+  generatedExpression: null,
   comment: null,
 };
 
@@ -19583,6 +19560,7 @@ import {
 } from './builder-state.js';
 import {
   PG_TYPE_CATEGORIES, PG_TYPE_DESCRIPTIONS, PG_TYPE_PARAMS, IDENTITY_OPTIONS,
+  DEFERRABLE_OPTIONS,
 } from './builder-constants.js';
 
 // ---- Column Editor ----
@@ -19718,6 +19696,15 @@ function applyColumnEditor() {
   const commentInput = body.querySelector('#editor-comment');
   if (commentInput) changes.comment = commentInput.value.trim() || null;
 
+  const generatedInput = body.querySelector('#editor-generated');
+  if (generatedInput) changes.generatedExpression = generatedInput.value.trim() || null;
+
+  // If generated, clear identity and default (mutually exclusive)
+  if (changes.generatedExpression) {
+    changes.identity = null;
+    changes.defaultValue = null;
+  }
+
   updateColumn(editor.table, editor.column, changes);
 
   // Handle key constraint changes
@@ -19767,6 +19754,7 @@ function _applyFKToggle(table, colName, body) {
     const refTable = body.querySelector('#editor-fk-table')?.value;
     const refCol = body.querySelector('#editor-fk-col')?.value;
     const onDelete = body.querySelector('#editor-fk-ondelete')?.value || 'NO ACTION';
+    const deferrable = body.querySelector('#editor-fk-deferrable')?.value || '';
 
     if (!refTable || !refCol) return;
 
@@ -19779,6 +19767,7 @@ function _applyFKToggle(table, colName, body) {
       refTable,
       refColumns: [refCol],
       onDelete,
+      deferrable,
       onUpdate: 'NO ACTION',
       name: `${table.name}_${colName}_fkey`,
     });
@@ -19810,6 +19799,7 @@ function _buildEditorForm(col, table) {
   const fkRefTable = fkConstraint ? fkConstraint.refTable : '';
   const fkRefCol = fkConstraint ? (fkConstraint.refColumns[0] || '') : '';
   const fkOnDelete = fkConstraint ? (fkConstraint.onDelete || 'NO ACTION') : 'NO ACTION';
+  const fkDeferrable = fkConstraint ? (fkConstraint.deferrable || '') : '';
 
   // Smart recommendations based on column name and current config
   const recs = _getRecommendations(col, table, baseType);
@@ -19895,6 +19885,16 @@ function _buildEditorForm(col, table) {
           ).join('')}
         </select>
       </div>
+      <div class="builder-field">
+        <label for="editor-fk-deferrable">Deferrable
+          <span class="builder-info" data-tooltip="Controls when the FK constraint is checked.\n\nNot deferrable: checked after each statement (default)\nInitially deferred: checked at COMMIT (useful for bulk inserts with circular FKs)\nInitially immediate: checked per-statement but can be deferred per-transaction with SET CONSTRAINTS">?</span>
+        </label>
+        <select id="editor-fk-deferrable" class="builder-field__select">
+          ${DEFERRABLE_OPTIONS.map(opt =>
+            `<option value="${opt.value}" ${fkDeferrable === opt.value ? 'selected' : ''}>${opt.label}</option>`
+          ).join('')}
+        </select>
+      </div>
     </div>
 
     <div class="builder-field builder-field--toggle">
@@ -19922,6 +19922,15 @@ function _buildEditorForm(col, table) {
       <input type="text" id="editor-default" class="builder-field__input"
              value="${escapeHtml(col.defaultValue || '')}" placeholder="e.g., NOW(), 0, 'pending'">
       <span class="builder-field__hint">Leave empty for no default</span>
+    </div>
+
+    <div class="builder-field">
+      <label for="editor-generated">Generated / Computed Column
+        <span class="builder-info" data-tooltip="A stored computed column (PG 12+). Value is calculated on INSERT/UPDATE and stored on disk.\n\nExamples:\nfirst_name || ' ' || last_name\nprice * quantity\nUPPER(email)\n\nCannot have a DEFAULT or IDENTITY when generated.">?</span>
+      </label>
+      <input type="text" id="editor-generated" class="builder-field__input"
+             value="${escapeHtml(col.generatedExpression || '')}" placeholder='e.g., first_name || &apos; &apos; || last_name'>
+      <span class="builder-field__hint">Leave empty for a regular column. Expression is STORED (computed on write).</span>
     </div>
 
     <div class="builder-field">
@@ -20000,6 +20009,22 @@ function _getRecommendations(col, table, baseType) {
   }
   if (name === 'status' && baseType === 'text') {
     tips.push('Status columns with limited values work well as a custom <strong>ENUM type</strong> or <strong>varchar</strong> with a CHECK constraint.');
+  }
+
+  // Generated column hints
+  if (name === 'full_name' || name === 'display_name') {
+    tips.push('Consider making this a <strong>Generated Column</strong>: <code>first_name || \' \' || last_name</code>');
+  }
+  if (name === 'total' || name === 'subtotal' || name === 'line_total') {
+    tips.push('If this is computed from other columns, consider a <strong>Generated Column</strong>: <code>price * quantity</code>');
+  }
+
+  // Generated + identity/default conflict
+  if (col.generatedExpression && col.identity) {
+    tips.push('A generated column cannot also have <strong>IDENTITY</strong>. Remove one.');
+  }
+  if (col.generatedExpression && col.defaultValue) {
+    tips.push('A generated column cannot also have a <strong>DEFAULT</strong>. Remove one.');
   }
 
   if (tips.length === 0) return '';
@@ -21306,6 +21331,21 @@ function createTableCard(table) {
       </span>`).join('')}
       <button class="builder-table-card__add-index">+ Index</button>
     </div>
+    <div class="builder-table-card__options">
+      <label class="builder-table-card__option" title="Partition this table by range, list, or hash">
+        <select class="builder-table-card__partition" data-table="${escapeHtml(table.name)}">
+          <option value="">No partition</option>
+          <option value="RANGE" ${table.partitionBy?.type === 'RANGE' ? 'selected' : ''}>PARTITION BY RANGE</option>
+          <option value="LIST" ${table.partitionBy?.type === 'LIST' ? 'selected' : ''}>PARTITION BY LIST</option>
+          <option value="HASH" ${table.partitionBy?.type === 'HASH' ? 'selected' : ''}>PARTITION BY HASH</option>
+        </select>
+      </label>
+      ${table.partitionBy ? `<input class="builder-table-card__partition-cols" placeholder="Partition column(s)" value="${escapeHtml((table.partitionBy.columns || []).join(', '))}" data-table="${escapeHtml(table.name)}">` : ''}
+      <label class="builder-table-card__option builder-table-card__option--toggle">
+        <input type="checkbox" class="builder-table-card__if-not-exists" ${table.ifNotExists ? 'checked' : ''} data-table="${escapeHtml(table.name)}">
+        <span>IF NOT EXISTS</span>
+      </label>
+    </div>
   `;
 
   // Wire events
@@ -21322,6 +21362,29 @@ function createTableCard(table) {
 
   card.querySelector('.builder-table-card__type').addEventListener('change', (e) => {
     updateTable(table.name, { tableType: e.target.value });
+  });
+
+  // Partition select
+  card.querySelector('.builder-table-card__partition')?.addEventListener('change', (e) => {
+    const pType = e.target.value;
+    if (pType) {
+      updateTable(table.name, { partitionBy: { type: pType, columns: table.partitionBy?.columns || [] } });
+    } else {
+      updateTable(table.name, { partitionBy: null });
+    }
+  });
+
+  // Partition columns input
+  card.querySelector('.builder-table-card__partition-cols')?.addEventListener('blur', (e) => {
+    const cols = e.target.value.split(',').map(c => c.trim()).filter(Boolean);
+    if (table.partitionBy) {
+      updateTable(table.name, { partitionBy: { ...table.partitionBy, columns: cols } });
+    }
+  });
+
+  // IF NOT EXISTS toggle
+  card.querySelector('.builder-table-card__if-not-exists')?.addEventListener('change', (e) => {
+    updateTable(table.name, { ifNotExists: e.target.checked });
   });
 
   card.querySelector('.builder-table-card__delete').addEventListener('click', () => {
