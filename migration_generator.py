@@ -34,10 +34,14 @@ def generate_migration_sql(
         if len(parts) != 2:
             continue
         table_name, col_name = parts
+        source_table = source.get("sourceTable")
+        source_column = source.get("sourceColumn")
+        if not source_table or not source_column:
+            continue
         table_mappings.setdefault(table_name, []).append({
             "target_column": col_name,
-            "source_table": source["sourceTable"],
-            "source_column": source["sourceColumn"],
+            "source_table": source_table,
+            "source_column": source_column,
             "transform": source.get("transform"),
         })
 

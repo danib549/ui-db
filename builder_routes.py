@@ -5,6 +5,50 @@ from flask import Blueprint, request, jsonify, current_app
 builder_bp = Blueprint('builder', __name__, url_prefix='/api/builder')
 
 
+def _validate_schema_structure(schema: dict) -> list[str]:
+    """Check required fields exist before passing to generators.
+
+    Returns list of error messages. Empty list means valid structure.
+    """
+    errors: list[str] = []
+
+    for i, table in enumerate(schema.get("tables", [])):
+        if not table.get("name"):
+            errors.append(f"Table at index {i} is missing 'name'")
+            continue
+        tname = table["name"]
+
+        for j, col in enumerate(table.get("columns", [])):
+            if not col.get("name"):
+                errors.append(f"Column at index {j} in table '{tname}' is missing 'name'")
+            if "type" not in col:
+                errors.append(f"Column '{col.get('name', f'at index {j}')}' in table '{tname}' is missing 'type'")
+
+        for c in table.get("constraints", []):
+            if not c.get("name"):
+                errors.append(f"Constraint in table '{tname}' is missing 'name'")
+            if c.get("type") == "fk":
+                if not c.get("refTable"):
+                    errors.append(f"FK constraint '{c.get('name', '?')}' in table '{tname}' is missing 'refTable'")
+                if not c.get("refColumns"):
+                    errors.append(f"FK constraint '{c.get('name', '?')}' in table '{tname}' is missing 'refColumns'")
+            if c.get("type") == "check":
+                if not c.get("expression"):
+                    errors.append(f"CHECK constraint '{c.get('name', '?')}' in table '{tname}' is missing 'expression'")
+
+        for idx in table.get("indexes", []):
+            if not idx.get("name"):
+                errors.append(f"Index in table '{tname}' is missing 'name'")
+
+    for i, enum in enumerate(schema.get("enums", [])):
+        if not enum.get("name"):
+            errors.append(f"Enum at index {i} is missing 'name'")
+        if "values" not in enum:
+            errors.append(f"Enum '{enum.get('name', f'at index {i}')}' is missing 'values'")
+
+    return errors
+
+
 @builder_bp.route('/validate', methods=['POST'])
 def validate():
     """Validate schema, return errors."""
@@ -15,6 +59,10 @@ def validate():
 
     if not schema:
         return jsonify({"error": "schema is required"}), 400
+
+    structure_errors = _validate_schema_structure(schema)
+    if structure_errors:
+        return jsonify({"error": "Invalid schema structure", "details": structure_errors}), 400
 
     issues = validate_schema(schema)
     return jsonify({"issues": issues})
@@ -30,6 +78,10 @@ def generate_ddl():
 
     if not schema:
         return jsonify({"error": "schema is required"}), 400
+
+    structure_errors = _validate_schema_structure(schema)
+    if structure_errors:
+        return jsonify({"error": "Invalid schema structure", "details": structure_errors}), 400
 
     sql = generate_full_ddl(schema)
     return jsonify({"sql": sql})
@@ -49,6 +101,10 @@ def generate_migration():
 
     if not modified:
         return jsonify({"error": "modified schema is required"}), 400
+
+    structure_errors = _validate_schema_structure(modified)
+    if structure_errors:
+        return jsonify({"error": "Invalid schema structure", "details": structure_errors}), 400
 
     result: dict = {"mode": "create", "schemaSql": "", "dataSql": ""}
 
@@ -138,6 +194,11 @@ def preview_table():
 
     if not table:
         return jsonify({"error": "table is required"}), 400
+
+    # Wrap single table in a schema for structural validation
+    structure_errors = _validate_schema_structure({"tables": [table], "enums": []})
+    if structure_errors:
+        return jsonify({"error": "Invalid table structure", "details": structure_errors}), 400
 
     sql = generate_table_preview(table)
     return jsonify({"sql": sql})
