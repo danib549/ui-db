@@ -550,12 +550,49 @@ body {
 
 .builder-constraint-badge,
 .builder-index-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   font-size: 10px;
   padding: 2px 6px;
   border-radius: 3px;
   background: rgba(59, 130, 246, 0.1);
   color: var(--text-secondary);
   font-family: 'JetBrains Mono', monospace;
+}
+
+.builder-constraint-badge--warn {
+  background: rgba(245, 158, 11, 0.12);
+  border: 1px solid rgba(245, 158, 11, 0.3);
+}
+
+.builder-constraint-badge__warn {
+  color: var(--builder-warning);
+  font-size: 11px;
+  cursor: help;
+}
+
+.builder-constraint-badge__delete,
+.builder-index-badge__delete {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 0 1px;
+  line-height: 1;
+  opacity: 0;
+  transition: all 0.1s;
+}
+
+.builder-constraint-badge:hover .builder-constraint-badge__delete,
+.builder-index-badge:hover .builder-index-badge__delete {
+  opacity: 1;
+}
+
+.builder-constraint-badge__delete:hover,
+.builder-index-badge__delete:hover {
+  color: var(--builder-error);
 }
 
 .builder-table-card__add-constraint,
@@ -686,7 +723,8 @@ body {
 /* ---- Output Panel ---- */
 .builder-output {
   width: 360px;
-  min-width: 360px;
+  min-width: 260px;
+  max-width: 70vw;
   background: var(--builder-panel-bg);
   border-left: 1px solid var(--builder-card-border);
   display: flex;
@@ -1433,4 +1471,39 @@ body {
   color: var(--text-secondary);
   margin-left: auto;
   font-weight: 400;
+}
+
+/* ---- Relationship Map Canvas ---- */
+#builder-map-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  cursor: grab;
+}
+
+#tab-map {
+  overflow: hidden;
+}
+
+/* ---- Resize Handle ---- */
+.builder-resize-handle {
+  width: 5px;
+  cursor: col-resize;
+  background: transparent;
+  position: relative;
+  flex-shrink: 0;
+  z-index: 10;
+  transition: background 0.15s ease;
+}
+
+.builder-resize-handle:hover,
+.builder-resize-handle--active {
+  background: var(--accent);
+  opacity: 0.4;
+}
+
+.builder-table-card--fk-highlight {
+  box-shadow: 0 0 0 2px var(--builder-badge-fk), 0 2px 8px rgba(59, 130, 246, 0.2);
+  border-color: var(--builder-badge-fk);
+  transition: box-shadow 0.3s ease, border-color 0.3s ease;
 }

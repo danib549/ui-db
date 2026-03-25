@@ -1,8 +1,9 @@
 """Tests for ddl_generator.py"""
 import pytest
 from ddl_generator import (
-    quote_identifier, generate_column_def, generate_create_table,
-    generate_full_ddl, topological_sort_tables,
+    quote_identifier, generate_column_def, generate_constraint_def,
+    generate_create_table, generate_full_ddl, topological_sort_tables,
+    escape_enum_value,
 )
 
 
@@ -112,3 +113,103 @@ def test_full_ddl_quoted_identifiers():
     ddl = generate_full_ddl(schema)
     assert '"order"' in ddl
     assert '"user"' in ddl
+
+
+# ---- Issue 1: Enum value escaping ----
+
+def test_enum_value_with_single_quote():
+    schema = {
+        "name": "public", "tables": [],
+        "enums": [{"name": "label", "values": ["don't", "won't"]}],
+    }
+    ddl = generate_full_ddl(schema)
+    assert "'don''t'" in ddl
+    assert "'won''t'" in ddl
+
+
+def test_enum_value_with_multiple_quotes():
+    schema = {
+        "name": "public", "tables": [],
+        "enums": [{"name": "x", "values": ["it's a 'test'"]}],
+    }
+    ddl = generate_full_ddl(schema)
+    assert "'it''s a ''test'''" in ddl
+
+
+def test_enum_value_empty_string():
+    schema = {
+        "name": "public", "tables": [],
+        "enums": [{"name": "x", "values": [""]}],
+    }
+    ddl = generate_full_ddl(schema)
+    assert "ENUM ('')" in ddl
+
+
+def test_escape_enum_value_function():
+    assert escape_enum_value("hello") == "hello"
+    assert escape_enum_value("don't") == "don''t"
+    assert escape_enum_value("''") == "''''"
+
+
+# ---- Issue 3: CHECK expression safety ----
+
+def test_check_expression_injection_blocked():
+    constraint = {"type": "check", "expression": "1=1; DROP TABLE users", "name": "bad_check", "columns": []}
+    with pytest.raises(ValueError, match="Unsafe CHECK"):
+        generate_constraint_def(constraint)
+
+
+def test_check_expression_valid_passes():
+    constraint = {"type": "check", "expression": '"age" >= 0', "name": "age_check", "columns": []}
+    result = generate_constraint_def(constraint)
+    assert "CHECK" in result
+    assert '"age" >= 0' in result
+
+
+# ---- Issue 4: DEFAULT value safety ----
+
+def test_default_injection_blocked():
+    col = {"name": "x", "type": "text", "defaultValue": "1; DROP TABLE users"}
+    with pytest.raises(ValueError, match="Unsafe DEFAULT"):
+        generate_column_def(col)
+
+
+def test_default_comment_injection_blocked():
+    col = {"name": "x", "type": "text", "defaultValue": "'ok' -- drop"}
+    with pytest.raises(ValueError, match="Unsafe DEFAULT"):
+        generate_column_def(col)
+
+
+def test_default_valid_passes():
+    col = {"name": "x", "type": "timestamptz", "defaultValue": "NOW()"}
+    result = generate_column_def(col)
+    assert "DEFAULT NOW()" in result
+
+
+# ---- FK action validation ----
+
+def test_fk_valid_on_delete():
+    constraint = {
+        "type": "fk", "columns": ["user_id"], "refTable": "users", "refColumns": ["id"],
+        "onDelete": "CASCADE", "onUpdate": "NO ACTION", "name": "fk_test",
+    }
+    result = generate_constraint_def(constraint)
+    assert "ON DELETE CASCADE" in result
+
+
+def test_fk_invalid_on_delete_blocked():
+    constraint = {
+        "type": "fk", "columns": ["user_id"], "refTable": "users", "refColumns": ["id"],
+        "onDelete": "CASCADE; DROP TABLE users", "onUpdate": "NO ACTION", "name": "fk_test",
+    }
+    with pytest.raises(ValueError, match="Invalid ON DELETE"):
+        generate_constraint_def(constraint)
+
+
+def test_fk_invalid_on_update_blocked():
+    constraint = {
+        "type": "fk", "columns": ["user_id"], "refTable": "users", "refColumns": ["id"],
+        "onDelete": "NO ACTION", "onUpdate": "INVALID", "name": "fk_test",
+    }
+    with pytest.raises(ValueError, match="Invalid ON UPDATE"):
+        generate_constraint_def(constraint)

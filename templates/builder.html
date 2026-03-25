@@ -88,12 +88,16 @@
       <div class="builder-target__enums" id="target-enums"></div>
     </main>
 
+    <!-- Resize Handle -->
+    <div class="builder-resize-handle" id="output-resize-handle"></div>
+
     <!-- Output Panel (Right) -->
     <aside class="builder-output" id="output-panel">
       <div class="builder-output__tabs">
         <button class="builder-output__tab builder-output__tab--active" data-tab="ddl">DDL <span class="builder-info builder-info--sm" data-tooltip="Live SQL preview. Regenerates automatically as you edit. Shows CREATE TABLE, CREATE TYPE, CREATE INDEX with correct FK ordering and transaction wrapping.">?</span></button>
         <button class="builder-output__tab" data-tab="validation">Errors <span class="builder-info builder-info--sm" data-tooltip="Real-time schema validation. Red = must fix before export. Yellow = warnings (reserved words, missing PKs). Green = all good.">?</span></button>
         <button class="builder-output__tab" data-tab="migration">Migration <span class="builder-info builder-info--sm" data-tooltip="Context-aware migration SQL:\n\nFrom scratch: full CREATE DDL\nFrom CSV: INSERT INTO...SELECT data migration\nFrom imported SQL: ALTER-based schema diff (only changes)">?</span></button>
+        <button class="builder-output__tab" data-tab="map">Map</button>
       </div>
 
       <!-- DDL Tab -->
@@ -123,6 +127,11 @@
           <button class="builder-btn" id="copy-migration">Copy Migration</button>
           <button class="builder-btn" id="export-migration">Export .sql</button>
         </div>
+      </div>
+
+      <!-- Map Tab -->
+      <div class="builder-output__content" id="tab-map">
+        <canvas id="builder-map-canvas"></canvas>
       </div>
     </aside>
   </div>

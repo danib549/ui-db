@@ -50,3 +50,27 @@ def test_export_filename():
 def test_export_filename_json():
     name = generate_export_filename("my_schema", "schema")
     assert name.endswith(".json")
+
+
+# ---- Issue 6: Multi-source migration ----
+
+def test_multi_source_generates_separate_inserts():
+    mapping = {
+        "users.id": {"sourceTable": "src_users", "sourceColumn": "UserID", "transform": None},
+        "users.email": {"sourceTable": "src_users", "sourceColumn": "Email", "transform": None},
+        "users.phone": {"sourceTable": "src_phones", "sourceColumn": "Phone", "transform": None},
+    }
+    sql = generate_migration_sql(mapping, {"tables": []})
+    assert sql.count("INSERT INTO") == 2
+    assert 'FROM "src_users"' in sql
+    assert 'FROM "src_phones"' in sql
+
+
+def test_single_source_unchanged():
+    mapping = {
+        "users.id": {"sourceTable": "src_users", "sourceColumn": "UserID", "transform": None},
+        "users.email": {"sourceTable": "src_users", "sourceColumn": "Email", "transform": None},
+    }
+    sql = generate_migration_sql(mapping, {"tables": []})
+    assert sql.count("INSERT INTO") == 1
+    assert 'FROM "src_users"' in sql

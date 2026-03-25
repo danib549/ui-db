@@ -2,7 +2,10 @@
 
 import re
 
-from ddl_generator import quote_identifier, generate_create_table, generate_index
+from ddl_generator import (
+    quote_identifier, generate_create_table, generate_index,
+    escape_enum_value, topological_sort_tables,
+)
 
 
 OPERATION_ORDER = {
@@ -39,6 +42,9 @@ def generate_migration_ddl(original: dict, modified: dict) -> str:
     if not ops:
         return "-- No changes detected"
 
+    # ALTER TYPE ADD VALUE cannot run inside a transaction (PG < 12)
+    pre_tx_ops = [o for o in ops if o["type"] == "add_enum_value"]
+    in_tx_ops = [o for o in ops if o["type"] != "add_enum_value"]
     non_warning_count = len([o for o in ops if o["type"] != "warning"])
 
     lines = [
@@ -49,24 +55,32 @@ def generate_migration_ddl(original: dict, modified: dict) -> str:
         f"-- Operations: {non_warning_count}",
         "-- ============================================================",
         "",
-        "BEGIN;",
-        "",
     ]
 
-    current_category = None
-    for op in ops:
-        category = op["type"].split("_")[0]
-        if category != current_category:
-            current_category = category
-            lines.append(f"-- {current_category.upper()} operations")
+    if pre_tx_ops:
+        lines.append("-- ALTER TYPE ... ADD VALUE cannot run inside a transaction (PG < 12)")
+        for op in pre_tx_ops:
+            lines.append(f"{op['sql']};")
+        lines.append("")
 
-        if op["type"] == "drop_table" or op["type"] == "drop_column":
-            lines.append(f"-- WARNING: Destructive operation — data will be lost")
+    if in_tx_ops:
+        lines.append("BEGIN;")
+        lines.append("")
 
-        lines.append(f"{op['sql']};")
+        current_category = None
+        for op in in_tx_ops:
+            category = op["type"].split("_")[0]
+            if category != current_category:
+                current_category = category
+                lines.append(f"-- {current_category.upper()} operations")
 
-    lines.append("")
-    lines.append("COMMIT;")
+            if op["type"] in ("drop_table", "drop_column"):
+                lines.append("-- WARNING: Destructive operation — data will be lost")
+
+            lines.append(f"{op['sql']};")
+
+        lines.append("")
+        lines.append("COMMIT;")
 
     return "\n".join(lines)
 
@@ -82,11 +96,32 @@ def diff_tables(original: dict, modified: dict) -> list[dict]:
     orig_names = {t["name"] for t in original.get("tables", [])}
     mod_names = {t["name"] for t in modified.get("tables", [])}
 
-    for name in mod_names - orig_names:
-        table = _find_table(modified, name)
+    # Sort new tables by FK dependencies so referenced tables are created first
+    new_tables = [_find_table(modified, n) for n in mod_names - orig_names]
+    if len(new_tables) > 1:
+        new_tables, circular = topological_sort_tables(new_tables)
+        # Circular FKs in new tables: create tables first, add FK via ALTER later
+        for item in circular:
+            tbl = item["table"]
+            fk = item["constraint"]
+            cols = ", ".join(quote_identifier(c) for c in fk["columns"])
+            ref_cols = ", ".join(quote_identifier(c) for c in fk["refColumns"])
+            ops.append({
+                "type": "add_constraint",
+                "table": tbl,
+                "details": {"constraint": fk},
+                "sql": (
+                    f'ALTER TABLE {quote_identifier(tbl)} '
+                    f'ADD CONSTRAINT {quote_identifier(fk["name"])} '
+                    f'FOREIGN KEY ({cols}) '
+                    f'REFERENCES {quote_identifier(fk["refTable"])} ({ref_cols})'
+                ),
+            })
+
+    for table in new_tables:
         ops.append({
             "type": "add_table",
-            "table": name,
+            "table": table["name"],
             "details": {"table": table},
             "sql": generate_create_table(table).rstrip(';'),
         })
@@ -117,6 +152,16 @@ def diff_columns(table_name: str, original: dict, modified: dict) -> list[dict]:
 
     for name in mod_cols.keys() - orig_cols.keys():
         col = mod_cols[name]
+        is_not_null = not col.get("nullable", True)
+        has_default = col.get("defaultValue") is not None
+        has_identity = col.get("identity") is not None
+        if is_not_null and not has_default and not has_identity:
+            ops.append({
+                "type": "warning",
+                "table": table_name,
+                "details": {"message": f"Adding NOT NULL column '{name}' without DEFAULT will fail if table has existing rows"},
+                "sql": f"-- WARNING: Adding NOT NULL column '{name}' to '{table_name}' without DEFAULT — will fail if table has rows",
+            })
         col_def = _build_column_def(col)
         ops.append({
             "type": "add_column",
@@ -210,6 +255,26 @@ def diff_indexes(table_name: str, original: dict, modified: dict) -> list[dict]:
             "sql": f'CREATE {unique}INDEX {quote_identifier(name)} ON {quote_identifier(table_name)}{using} ({cols})',
         })
 
+    # Modified indexes (same name, different definition)
+    for name in orig_indexes.keys() & mod_indexes.keys():
+        if _index_changed(orig_indexes[name], mod_indexes[name]):
+            ops.append({
+                "type": "drop_index",
+                "table": table_name,
+                "details": {"index_name": name},
+                "sql": f'DROP INDEX IF EXISTS {quote_identifier(name)}',
+            })
+            idx = mod_indexes[name]
+            cols = ", ".join(quote_identifier(c) for c in idx["columns"])
+            using = f" USING {idx['type'].upper()}" if idx.get("type", "btree") != "btree" else ""
+            unique = "UNIQUE " if idx.get("unique") else ""
+            ops.append({
+                "type": "add_index",
+                "table": table_name,
+                "details": {"index": idx},
+                "sql": f'CREATE {unique}INDEX {quote_identifier(name)} ON {quote_identifier(table_name)}{using} ({cols})',
+            })
+
     return ops
 
 
@@ -221,7 +286,7 @@ def diff_enums(original: dict, modified: dict) -> list[dict]:
 
     for name in mod_enums.keys() - orig_enums.keys():
         enum = mod_enums[name]
-        values = ", ".join(f"'{v}'" for v in enum["values"])
+        values = ", ".join(f"'{escape_enum_value(v)}'" for v in enum["values"])
         ops.append({
             "type": "add_enum",
             "details": {"enum": enum},
@@ -229,6 +294,18 @@ def diff_enums(original: dict, modified: dict) -> list[dict]:
         })
 
     for name in orig_enums.keys() - mod_enums.keys():
+        # Warn if any column in modified schema still uses this enum type
+        dependents = []
+        for table in modified.get("tables", []):
+            for col in table.get("columns", []):
+                if col.get("type", "").lower() == name.lower():
+                    dependents.append(f'{table["name"]}.{col["name"]}')
+        if dependents:
+            ops.append({
+                "type": "warning",
+                "details": {"message": f"Dropping enum '{name}' affects columns: {', '.join(dependents)}"},
+                "sql": f"-- WARNING: Dropping enum '{name}' affects columns: {', '.join(dependents)}",
+            })
         ops.append({
             "type": "drop_enum",
             "details": {"enum_name": name},
@@ -245,7 +322,7 @@ def diff_enums(original: dict, modified: dict) -> list[dict]:
             ops.append({
                 "type": "add_enum_value",
                 "details": {"enum_name": name, "value": val},
-                "sql": f"ALTER TYPE {quote_identifier(name)} ADD VALUE '{val}'",
+                "sql": f"ALTER TYPE {quote_identifier(name)} ADD VALUE IF NOT EXISTS '{escape_enum_value(val)}'",
             })
 
         if removed_values:
@@ -270,18 +347,73 @@ def _find_table(schema: dict, name: str) -> dict:
     return {}
 
 
+def _get_using_clause(col_name: str, old_type: str, new_type: str) -> str:
+    """Return a USING clause for ALTER COLUMN TYPE, or empty string if not needed."""
+    old_norm = old_type.lower().split("(")[0].strip()
+    new_norm = new_type.lower().split("(")[0].strip()
+
+    if old_norm == new_norm:
+        return ""
+
+    safe_implicit = {
+        ("integer", "bigint"), ("smallint", "integer"), ("smallint", "bigint"),
+        ("varchar", "text"), ("char", "text"), ("char", "varchar"),
+        ("real", "double precision"),
+    }
+    if (old_norm, new_norm) in safe_implicit:
+        return ""
+
+    return f" USING {quote_identifier(col_name)}::{new_type}"
+
+
 def _diff_single_column(table_name: str, orig: dict, mod: dict) -> list[dict]:
     """Compare a single column between original and modified versions."""
     ops: list[dict] = []
     col_name = orig["name"]
+    tbl = quote_identifier(table_name)
+    col = quote_identifier(col_name)
+
+    # Identity change must happen before type change
+    orig_identity = orig.get("identity")
+    mod_identity = mod.get("identity")
+    if orig_identity != mod_identity:
+        if orig_identity and not mod_identity:
+            ops.append({
+                "type": "alter_column_default",
+                "table": table_name,
+                "details": {"column": col_name, "drop_identity": True},
+                "sql": f'ALTER TABLE {tbl} ALTER COLUMN {col} DROP IDENTITY IF EXISTS',
+            })
+        elif not orig_identity and mod_identity:
+            ops.append({
+                "type": "alter_column_default",
+                "table": table_name,
+                "details": {"column": col_name, "add_identity": mod_identity},
+                "sql": f'ALTER TABLE {tbl} ALTER COLUMN {col} ADD GENERATED {mod_identity} AS IDENTITY',
+            })
+        else:
+            # Change identity type (ALWAYS <-> BY DEFAULT): drop then add
+            ops.append({
+                "type": "alter_column_default",
+                "table": table_name,
+                "details": {"column": col_name, "drop_identity": True},
+                "sql": f'ALTER TABLE {tbl} ALTER COLUMN {col} DROP IDENTITY IF EXISTS',
+            })
+            ops.append({
+                "type": "alter_column_default",
+                "table": table_name,
+                "details": {"column": col_name, "add_identity": mod_identity},
+                "sql": f'ALTER TABLE {tbl} ALTER COLUMN {col} ADD GENERATED {mod_identity} AS IDENTITY',
+            })
 
     if _normalize_type(orig.get("type", "")) != _normalize_type(mod.get("type", "")):
         new_type = mod["type"]
+        using = _get_using_clause(col_name, orig.get("type", ""), new_type)
         ops.append({
             "type": "alter_column_type",
             "table": table_name,
             "details": {"column": col_name, "old_type": orig["type"], "new_type": new_type},
-            "sql": f'ALTER TABLE {quote_identifier(table_name)} ALTER COLUMN {quote_identifier(col_name)} TYPE {new_type}',
+            "sql": f'ALTER TABLE {tbl} ALTER COLUMN {col} TYPE {new_type}{using}',
         })
 
     if orig.get("nullable") != mod.get("nullable"):
@@ -290,14 +422,14 @@ def _diff_single_column(table_name: str, orig: dict, mod: dict) -> list[dict]:
                 "type": "alter_column_nullable",
                 "table": table_name,
                 "details": {"column": col_name, "nullable": True},
-                "sql": f'ALTER TABLE {quote_identifier(table_name)} ALTER COLUMN {quote_identifier(col_name)} DROP NOT NULL',
+                "sql": f'ALTER TABLE {tbl} ALTER COLUMN {col} DROP NOT NULL',
             })
         else:
             ops.append({
                 "type": "alter_column_nullable",
                 "table": table_name,
                 "details": {"column": col_name, "nullable": False},
-                "sql": f'ALTER TABLE {quote_identifier(table_name)} ALTER COLUMN {quote_identifier(col_name)} SET NOT NULL',
+                "sql": f'ALTER TABLE {tbl} ALTER COLUMN {col} SET NOT NULL',
             })
 
     orig_default = orig.get("defaultValue")
@@ -308,14 +440,14 @@ def _diff_single_column(table_name: str, orig: dict, mod: dict) -> list[dict]:
                 "type": "alter_column_default",
                 "table": table_name,
                 "details": {"column": col_name, "default": None},
-                "sql": f'ALTER TABLE {quote_identifier(table_name)} ALTER COLUMN {quote_identifier(col_name)} DROP DEFAULT',
+                "sql": f'ALTER TABLE {tbl} ALTER COLUMN {col} DROP DEFAULT',
             })
         else:
             ops.append({
                 "type": "alter_column_default",
                 "table": table_name,
                 "details": {"column": col_name, "default": mod_default},
-                "sql": f'ALTER TABLE {quote_identifier(table_name)} ALTER COLUMN {quote_identifier(col_name)} SET DEFAULT {mod_default}',
+                "sql": f'ALTER TABLE {tbl} ALTER COLUMN {col} SET DEFAULT {mod_default}',
             })
 
     return ops
@@ -337,6 +469,17 @@ def _build_constraint_sql(table_name: str, constraint: dict) -> str:
     from ddl_generator import generate_constraint_def
     constraint_def = generate_constraint_def(constraint)
     return f'ALTER TABLE {quote_identifier(table_name)} ADD {constraint_def}'
+
+
+def _index_changed(orig: dict, mod: dict) -> bool:
+    """Check if an index definition has been modified."""
+    if orig.get("columns") != mod.get("columns"):
+        return True
+    if orig.get("type", "btree") != mod.get("type", "btree"):
+        return True
+    if orig.get("unique", False) != mod.get("unique", False):
+        return True
+    return False
 
 
 def _constraint_changed(orig: dict, mod: dict) -> bool:

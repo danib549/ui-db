@@ -105,3 +105,67 @@ def test_full_valid_schema():
     issues = validate_schema(schema)
     errors = [i for i in issues if i["severity"] == "error"]
     assert len(errors) == 0
+
+
+# ---- Issue 10: Enum/table name collision ----
+
+def test_enum_table_name_collision_warning():
+    schema = {
+        "tables": [{
+            "name": "status",
+            "tableType": "permanent",
+            "columns": [{"name": "id", "type": "integer", "nullable": False, "isPrimaryKey": True}],
+            "constraints": [{"type": "pk", "columns": ["id"], "name": "status_pkey"}],
+            "indexes": [],
+        }],
+        "enums": [{"name": "status", "values": ["active", "inactive"]}],
+    }
+    issues = validate_schema(schema)
+    assert any(i.get("code") == "ENUM_TABLE_NAME_COLLISION" for i in issues)
+
+
+# ---- Issue 11: FK type compatibility ----
+
+def test_serial_to_integer_compatible():
+    from pg_validator import validate_fk_types
+    schema = {
+        "tables": [
+            {"name": "a", "columns": [{"name": "id", "type": "serial"}], "constraints": []},
+            {"name": "b", "columns": [{"name": "a_id", "type": "integer"}], "constraints": [
+                {"type": "fk", "columns": ["a_id"], "refTable": "a", "refColumns": ["id"], "name": "b_fk"},
+            ]},
+        ],
+        "enums": [],
+    }
+    issues = validate_fk_types(schema)
+    assert not any(i["code"] == "FK_TYPE_MISMATCH" for i in issues)
+
+
+def test_bigserial_to_bigint_compatible():
+    from pg_validator import validate_fk_types
+    schema = {
+        "tables": [
+            {"name": "a", "columns": [{"name": "id", "type": "bigserial"}], "constraints": []},
+            {"name": "b", "columns": [{"name": "a_id", "type": "bigint"}], "constraints": [
+                {"type": "fk", "columns": ["a_id"], "refTable": "a", "refColumns": ["id"], "name": "b_fk"},
+            ]},
+        ],
+        "enums": [],
+    }
+    issues = validate_fk_types(schema)
+    assert not any(i["code"] == "FK_TYPE_MISMATCH" for i in issues)
+
+
+def test_timestamptz_to_timestamp_compatible():
+    from pg_validator import validate_fk_types
+    schema = {
+        "tables": [
+            {"name": "a", "columns": [{"name": "ts", "type": "timestamptz"}], "constraints": []},
+            {"name": "b", "columns": [{"name": "ts", "type": "timestamp"}], "constraints": [
+                {"type": "fk", "columns": ["ts"], "refTable": "a", "refColumns": ["ts"], "name": "b_fk"},
+            ]},
+        ],
+        "enums": [],
+    }
+    issues = validate_fk_types(schema)
+    assert not any(i["code"] == "FK_TYPE_MISMATCH" for i in issues)

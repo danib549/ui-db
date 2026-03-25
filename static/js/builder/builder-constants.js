@@ -134,6 +134,58 @@ export const DEFAULT_COLUMN = {
   comment: null,
 };
 
+/** Relationship map canvas constants */
+export const MAP_BOX = {
+  width: 160,
+  headerHeight: 28,
+  bodyPadding: 6,
+  lineHeight: 16,
+  cornerRadius: 6,
+  gapX: 80,
+  gapY: 60,
+};
+
+export const MAP_COLORS = {
+  bg: '#F9FAFB',
+  dot: '#E5E7EB',
+  boxBg: '#FFFFFF',
+  boxHeader: '#F3F4F6',
+  boxBorder: '#D1D5DB',
+  boxBorderHover: '#3B82F6',
+  boxText: '#111827',
+  boxSubtext: '#6B7280',
+  pkDot: '#F59E0B',
+  shadow: 'rgba(0,0,0,0.08)',
+  shadowHover: 'rgba(59,130,246,0.2)',
+  lineFk: '#3B82F6',
+  lineSelf: '#A78BFA',
+};
+
+export const MAP_COLORS_DARK = {
+  bg: '#1a1b23',
+  dot: '#2d2e3a',
+  boxBg: '#1F2028',
+  boxHeader: '#252630',
+  boxBorder: '#374151',
+  boxBorderHover: '#60A5FA',
+  boxText: '#E5E7EB',
+  boxSubtext: '#9CA3AF',
+  pkDot: '#FBBF24',
+  shadow: 'rgba(0,0,0,0.3)',
+  shadowHover: 'rgba(96,165,250,0.3)',
+  lineFk: '#60A5FA',
+  lineSelf: '#C4B5FD',
+};
+
+export const MAP_LINE = {
+  strokeWidth: 1.5,
+  strokeWidthHover: 2.5,
+  controlPointOffset: 80,
+  selfRefLoopOffset: 50,
+  tickLength: 8,
+  crowFootSpread: 8,
+};
+
 /** Default table template for new tables */
 export const DEFAULT_TABLE = {
   name: '',

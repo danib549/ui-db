@@ -45,16 +45,21 @@ def generate_migration_sql(
         if not mappings:
             continue
 
-        target_cols = ", ".join(quote_identifier(m["target_column"]) for m in mappings)
-        source_exprs = [_build_select_expr(m) for m in mappings]
-        source_table = mappings[0]["source_table"]
-        select_cols = ", ".join(source_exprs)
+        # Group by source table to handle multi-source mappings
+        by_source: dict[str, list[dict]] = {}
+        for m in mappings:
+            by_source.setdefault(m["source_table"], []).append(m)
 
-        lines.append(f"-- Migrate: {source_table} → {table_name}")
-        lines.append(f'INSERT INTO {quote_identifier(table_name)} ({target_cols})')
-        lines.append(f'SELECT {select_cols}')
-        lines.append(f'FROM {quote_identifier(source_table)};')
-        lines.append("")
+        for source_table, source_mappings in by_source.items():
+            target_cols = ", ".join(quote_identifier(m["target_column"]) for m in source_mappings)
+            source_exprs = [_build_select_expr(m) for m in source_mappings]
+            select_cols = ", ".join(source_exprs)
+
+            lines.append(f"-- Migrate: {source_table} → {table_name}")
+            lines.append(f'INSERT INTO {quote_identifier(table_name)} ({target_cols})')
+            lines.append(f'SELECT {select_cols}')
+            lines.append(f'FROM {quote_identifier(source_table)};')
+            lines.append("")
 
     lines.append("COMMIT;")
     return "\n".join(lines)

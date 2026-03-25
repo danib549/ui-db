@@ -120,29 +120,42 @@ def split_statements(sql: str) -> list[str]:
     current: list[str] = []
     paren_depth = 0
     in_string = False
+    i = 0
 
-    for char in sql:
+    while i < len(sql):
+        char = sql[i]
         if char == "'" and not in_string:
             in_string = True
             current.append(char)
+            i += 1
         elif char == "'" and in_string:
-            in_string = False
-            current.append(char)
+            if i + 1 < len(sql) and sql[i + 1] == "'":
+                current.append("''")
+                i += 2
+            else:
+                in_string = False
+                current.append(char)
+                i += 1
         elif in_string:
             current.append(char)
+            i += 1
         elif char == '(':
             paren_depth += 1
             current.append(char)
+            i += 1
         elif char == ')':
             paren_depth -= 1
             current.append(char)
+            i += 1
         elif char == ';' and paren_depth == 0:
             stmt = ''.join(current).strip()
             if stmt:
                 statements.append(stmt)
             current = []
+            i += 1
         else:
             current.append(char)
+            i += 1
 
     remaining = ''.join(current).strip()
     if remaining:
@@ -399,27 +412,40 @@ def _split_definitions(body: str) -> list[str]:
     current: list[str] = []
     depth = 0
     in_string = False
+    i = 0
 
-    for char in body:
+    while i < len(body):
+        char = body[i]
         if char == "'" and not in_string:
             in_string = True
             current.append(char)
+            i += 1
         elif char == "'" and in_string:
-            in_string = False
-            current.append(char)
+            if i + 1 < len(body) and body[i + 1] == "'":
+                current.append("''")
+                i += 2
+            else:
+                in_string = False
+                current.append(char)
+                i += 1
         elif in_string:
             current.append(char)
+            i += 1
         elif char == '(':
             depth += 1
             current.append(char)
+            i += 1
         elif char == ')':
             depth -= 1
             current.append(char)
+            i += 1
         elif char == ',' and depth == 0:
             definitions.append(''.join(current).strip())
             current = []
+            i += 1
         else:
             current.append(char)
+            i += 1
 
     remaining = ''.join(current).strip()
     if remaining:

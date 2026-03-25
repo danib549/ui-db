@@ -10,6 +10,7 @@ import {
   addEnum, removeEnum, updateEnum,
   setTargetSchema, setOriginalSchema, clearOriginalSchema,
   setActiveEditor, getSourceMapping,
+  removeConstraint, removeIndex,
 } from './builder-state.js';
 import { DEFAULT_TABLE, DEFAULT_COLUMN } from './builder-constants.js';
 import { showConfirm, showToast } from './builder-editors.js';
@@ -270,11 +271,21 @@ function createTableCard(table) {
     </div>
     <button class="builder-table-card__add-column">+ Add Column</button>
     <div class="builder-table-card__constraints">
-      ${table.constraints.map(c => `<span class="builder-constraint-badge">${escapeHtml(_constraintLabel(c))}</span>`).join('')}
+      ${table.constraints.map(c => {
+        const warn = _constraintWarning(c, table);
+        const warnIcon = warn ? `<span class="builder-constraint-badge__warn" title="${escapeHtml(warn)}">&#9888;</span>` : '';
+        return `<span class="builder-constraint-badge ${warn ? 'builder-constraint-badge--warn' : ''}" data-constraint="${escapeHtml(c.name)}" title="${escapeHtml(c.name)}">
+          ${warnIcon}${escapeHtml(_constraintLabel(c))}
+          <button class="builder-constraint-badge__delete" data-constraint="${escapeHtml(c.name)}" title="Remove constraint">&times;</button>
+        </span>`;
+      }).join('')}
       <button class="builder-table-card__add-constraint">+ Constraint</button>
     </div>
     <div class="builder-table-card__indexes">
-      ${(table.indexes || []).map(idx => `<span class="builder-index-badge">idx: ${escapeHtml(idx.columns.join(', '))} (${idx.type})</span>`).join('')}
+      ${(table.indexes || []).map(idx => `<span class="builder-index-badge" data-index="${escapeHtml(idx.name)}">
+        idx: ${escapeHtml(idx.columns.join(', '))} (${idx.type})
+        <button class="builder-index-badge__delete" data-index="${escapeHtml(idx.name)}" title="Remove index">&times;</button>
+      </span>`).join('')}
       <button class="builder-table-card__add-index">+ Index</button>
     </div>
   `;
@@ -331,6 +342,28 @@ function createTableCard(table) {
 
     row.querySelector('.builder-column-row__delete')?.addEventListener('click', () => {
       removeColumn(table.name, colName);
+    });
+  });
+
+  // Constraint delete buttons
+  card.querySelectorAll('.builder-constraint-badge__delete').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const name = btn.dataset.constraint;
+      showConfirm(`Remove constraint "${name}"?`, () => {
+        removeConstraint(table.name, name);
+      });
+    });
+  });
+
+  // Index delete buttons
+  card.querySelectorAll('.builder-index-badge__delete').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const name = btn.dataset.index;
+      showConfirm(`Remove index "${name}"?`, () => {
+        removeIndex(table.name, name);
+      });
     });
   });
 
@@ -412,6 +445,41 @@ function _constraintLabel(c) {
   if (c.type === 'unique') return `UQ: ${c.columns.join(', ')}`;
   if (c.type === 'check') return `CHK: ${c.expression}`;
   return c.name;
+}
+
+function _constraintWarning(c, table) {
+  const schema = getTargetSchema();
+
+  // FK: check target table and column exist
+  if (c.type === 'fk') {
+    const refTable = schema.tables.find(t => t.name === c.refTable);
+    if (!refTable) return `Referenced table "${c.refTable}" does not exist`;
+    const refColNames = new Set(refTable.columns.map(col => col.name));
+    for (const rc of c.refColumns) {
+      if (!refColNames.has(rc)) return `Referenced column "${c.refTable}.${rc}" does not exist`;
+    }
+    // Check source columns exist in this table
+    const srcColNames = new Set(table.columns.map(col => col.name));
+    for (const sc of c.columns) {
+      if (!srcColNames.has(sc)) return `Source column "${sc}" does not exist in this table`;
+    }
+  }
+
+  // PK/Unique: check columns exist
+  if (c.type === 'pk' || c.type === 'unique') {
+    const colNames = new Set(table.columns.map(col => col.name));
+    for (const col of c.columns) {
+      if (!colNames.has(col)) return `Column "${col}" does not exist in this table`;
+    }
+  }
+
+  // Duplicate PK
+  if (c.type === 'pk') {
+    const pkCount = table.constraints.filter(x => x.type === 'pk').length;
+    if (pkCount > 1) return 'Multiple PRIMARY KEY constraints — only one allowed per table';
+  }
+
+  return '';
 }
 
 let editingEnumName = null;

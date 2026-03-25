@@ -167,6 +167,7 @@ const builderState = {
 | `builderConstraintAdded` | `{ tableName, constraint }` | Constraint added |
 | `builderConstraintRemoved` | `{ tableName, constraintName }` | Constraint removed |
 | `builderEnumAdded` | `{ enum }` | Enum type created |
+| `builderEnumUpdated` | `{ enumName, changes }` | Enum name or values edited |
 | `builderEnumRemoved` | `{ enumName }` | Enum type deleted |
 | `builderValidationRan` | `{ errors }` | Validation completed |
 | `builderDDLGenerated` | `{ sql }` | DDL preview updated |

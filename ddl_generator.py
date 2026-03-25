@@ -8,7 +8,11 @@ SQL style conventions:
 - One definition per line, blank line between tables
 """
 
+import re
 from datetime import datetime, timezone
+
+_DANGEROUS_DEFAULT = re.compile(r';\s*|--|/\*')
+_VALID_FK_ACTIONS = {"NO ACTION", "CASCADE", "SET NULL", "SET DEFAULT", "RESTRICT"}
 
 
 def quote_identifier(name: str) -> str:
@@ -16,6 +20,17 @@ def quote_identifier(name: str) -> str:
     if '"' in name:
         raise ValueError(f"Cannot quote identifier containing double quote: {name}")
     return f'"{name}"'
+
+
+def escape_enum_value(value: str) -> str:
+    """Escape a single quote inside an enum value for safe SQL interpolation."""
+    return value.replace("'", "''")
+
+
+def _validate_default_safe(value: str) -> None:
+    """Reject DEFAULT values containing injection patterns."""
+    if _DANGEROUS_DEFAULT.search(value):
+        raise ValueError(f"Unsafe DEFAULT value: {value}")
 
 
 def generate_column_def(col: dict) -> str:
@@ -32,6 +47,7 @@ def generate_column_def(col: dict) -> str:
         parts.append("NOT NULL")
 
     if col.get("defaultValue") is not None:
+        _validate_default_safe(col["defaultValue"])
         parts.append(f"DEFAULT {col['defaultValue']}")
 
     return " ".join(parts)
@@ -51,16 +67,27 @@ def generate_constraint_def(constraint: dict) -> str:
             f'FOREIGN KEY ({cols})',
             f'REFERENCES {quote_identifier(constraint["refTable"])} ({ref_cols})',
         ]
-        if constraint.get("onDelete", "NO ACTION") != "NO ACTION":
-            parts.append(f'ON DELETE {constraint["onDelete"]}')
-        if constraint.get("onUpdate", "NO ACTION") != "NO ACTION":
-            parts.append(f'ON UPDATE {constraint["onUpdate"]}')
+        on_delete = constraint.get("onDelete", "NO ACTION")
+        on_update = constraint.get("onUpdate", "NO ACTION")
+        if on_delete not in _VALID_FK_ACTIONS:
+            raise ValueError(f"Invalid ON DELETE action: {on_delete}")
+        if on_update not in _VALID_FK_ACTIONS:
+            raise ValueError(f"Invalid ON UPDATE action: {on_update}")
+        if on_delete != "NO ACTION":
+            parts.append(f'ON DELETE {on_delete}')
+        if on_update != "NO ACTION":
+            parts.append(f'ON UPDATE {on_update}')
         return " ".join(parts)
 
     if constraint["type"] == "unique":
         return f'CONSTRAINT {quote_identifier(constraint["name"])} UNIQUE ({cols})'
 
     if constraint["type"] == "check":
+        from pg_validator import validate_check_expression
+        issues = validate_check_expression(constraint["expression"], "unknown", constraint["name"])
+        errors = [i for i in issues if i["severity"] == "error"]
+        if errors:
+            raise ValueError(f"Unsafe CHECK expression: {errors[0]['message']}")
         return f'CONSTRAINT {quote_identifier(constraint["name"])} CHECK ({constraint["expression"]})'
 
     return ""
@@ -181,7 +208,7 @@ def generate_full_ddl(schema: dict) -> str:
         lines.append("-- ============================================================")
         lines.append("")
         for enum in enums:
-            values = ", ".join(f"'{v}'" for v in enum["values"])
+            values = ", ".join(f"'{escape_enum_value(v)}'" for v in enum["values"])
             lines.append(f'CREATE TYPE {quote_identifier(enum["name"])} AS ENUM ({values});')
         lines.append("")
 
@@ -224,10 +251,16 @@ def generate_full_ddl(schema: dict) -> str:
                 f'FOREIGN KEY ({cols}) '
                 f'REFERENCES {quote_identifier(fk["refTable"])} ({ref_cols})'
             )
-            if fk.get("onDelete", "NO ACTION") != "NO ACTION":
-                line += f' ON DELETE {fk["onDelete"]}'
-            if fk.get("onUpdate", "NO ACTION") != "NO ACTION":
-                line += f' ON UPDATE {fk["onUpdate"]}'
+            on_del = fk.get("onDelete", "NO ACTION")
+            on_upd = fk.get("onUpdate", "NO ACTION")
+            if on_del not in _VALID_FK_ACTIONS:
+                raise ValueError(f"Invalid ON DELETE action: {on_del}")
+            if on_upd not in _VALID_FK_ACTIONS:
+                raise ValueError(f"Invalid ON UPDATE action: {on_upd}")
+            if on_del != "NO ACTION":
+                line += f' ON DELETE {on_del}'
+            if on_upd != "NO ACTION":
+                line += f' ON UPDATE {on_upd}'
             lines.append(line + ";")
         lines.append("")
 
@@ -274,9 +307,31 @@ def generate_table_preview(table: dict) -> str:
 
 # ---- Internal helpers ----
 
+# Built-in PG types (base names without params). Custom types (enums) get quoted.
+_PG_BUILTIN_TYPES = {
+    'smallint', 'integer', 'bigint', 'numeric', 'decimal', 'real', 'double precision',
+    'money', 'smallserial', 'serial', 'bigserial',
+    'varchar', 'char', 'character varying', 'character', 'text',
+    'date', 'time', 'timetz', 'timestamp', 'timestamptz', 'interval',
+    'boolean', 'uuid', 'json', 'jsonb', 'xml', 'bytea',
+    'inet', 'cidr', 'macaddr', 'macaddr8',
+    'point', 'line', 'lseg', 'box', 'path', 'polygon', 'circle',
+    'tsvector', 'tsquery',
+    'int4range', 'int8range', 'numrange', 'tsrange', 'tstzrange', 'daterange',
+    'bit', 'varbit', 'bit varying',
+    'hstore', 'oid',
+}
+
+
 def _format_type(type_str: str) -> str:
-    """Format a type string for DDL output."""
-    return type_str
+    """Format a column type for DDL. Quotes custom types (enums)."""
+    base = type_str.lower().split('(')[0].strip().rstrip('[]')
+    if base in _PG_BUILTIN_TYPES:
+        return type_str
+    if type_str.endswith('[]'):
+        inner = type_str[:-2]
+        return f'"{inner}"[]'
+    return f'"{type_str}"'
 
 
 def _get_table_deps(table: dict) -> list[str]:

@@ -198,12 +198,18 @@ def validate_fk_types(schema: dict) -> list[dict]:
 
     compatible_types = {
         "smallint": {"smallint", "integer", "bigint"},
-        "integer": {"integer", "bigint"},
-        "bigint": {"bigint"},
+        "integer": {"integer", "bigint", "serial"},
+        "bigint": {"bigint", "bigserial"},
+        "serial": {"integer", "bigint", "serial"},
+        "bigserial": {"bigint", "bigserial"},
+        "numeric": {"numeric", "decimal"},
+        "decimal": {"numeric", "decimal"},
         "text": {"text", "varchar"},
         "varchar": {"varchar", "text"},
         "uuid": {"uuid"},
         "boolean": {"boolean"},
+        "timestamp": {"timestamp", "timestamptz"},
+        "timestamptz": {"timestamp", "timestamptz"},
     }
 
     for table in schema.get("tables", []):
@@ -529,6 +535,16 @@ def validate_schema(schema: dict) -> list[dict]:
     issues.extend(detect_circular_fks(schema))
     issues.extend(validate_constraint_conflicts(schema))
     issues.extend(validate_enums(schema))
+
+    # Enum/table name collision
+    table_names_lower = {t["name"].lower() for t in schema.get("tables", [])}
+    enum_names_lower = {e["name"].lower() for e in schema.get("enums", [])}
+    for name in table_names_lower & enum_names_lower:
+        issues.append({
+            "severity": SEVERITY_WARNING,
+            "message": f"Enum type '{name}' has the same name as a table",
+            "code": "ENUM_TABLE_NAME_COLLISION",
+        })
 
     for table in schema.get("tables", []):
         issues.extend(validate_table(table))

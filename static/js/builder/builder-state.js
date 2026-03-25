@@ -188,6 +188,7 @@ export function updateEnum(enumName, changes) {
   if (!enumDef) return;
   Object.assign(enumDef, changes);
   emit('enums');
+  EventBus.emit('builderEnumUpdated', { enumName, changes });
 }
 
 // ---- Source mapping mutations ----

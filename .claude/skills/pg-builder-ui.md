@@ -145,6 +145,37 @@ Each target table is a card with inline editing:
     <button class="builder-target__add-enum">+ Add Enum</button>
   </div>
 
+  <!-- Enum cards (inline editable) -->
+  <div class="builder-target__enums">
+    <!-- View mode: shows name, values, edit/delete buttons -->
+    <div class="builder-enum-card">
+      <span class="builder-enum-card__name">user_status</span>
+      <span class="builder-enum-card__values">(active, inactive, banned)</span>
+      <button class="builder-enum-card__edit" title="Edit enum">&#9998;</button>
+      <button class="builder-enum-card__delete" title="Remove enum">&times;</button>
+    </div>
+
+    <!-- Edit mode: expands inline with name input + values textarea -->
+    <div class="builder-enum-card builder-enum-card--editing">
+      <div class="builder-enum-editor">
+        <div class="builder-enum-editor__row">
+          <label>Name</label>
+          <input type="text" class="builder-enum-editor__name" value="user_status" spellcheck="false">
+        </div>
+        <div class="builder-enum-editor__row">
+          <label>Values <span class="builder-enum-editor__hint">(one per line)</span></label>
+          <textarea class="builder-enum-editor__values" rows="3" spellcheck="false">active
+inactive
+banned</textarea>
+        </div>
+        <div class="builder-enum-editor__actions">
+          <button class="builder-btn builder-btn--small builder-btn--primary builder-enum-editor__save">Save</button>
+          <button class="builder-btn builder-btn--small builder-btn--secondary builder-enum-editor__cancel">Cancel</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <div class="builder-target__tables">
     <!-- Table card -->
     <div class="builder-table-card" data-table="users">
@@ -201,6 +232,16 @@ Each target table is a card with inline editing:
 - **Delete table**: confirmation prompt before removal
 - **Column reorder**: drag grip handle to reorder columns within table
 - **Add column**: appends new column row with defaults (`text`, nullable, no constraints)
+
+### Enum Card Interactions
+
+- **Add enum**: "+ Add Enum" button creates a new enum with default name and placeholder values
+- **Edit enum**: click pencil icon (&#9998;) to expand inline editor with name input + values textarea (one value per line)
+- **Save**: validates name (non-empty, unique among enums), values (at least one), calls `updateEnum()` in builder-state.js
+- **Cancel**: collapses editor without saving changes
+- **Delete enum**: click × button, shows confirmation dialog before calling `removeEnum()`
+- Enum values are always strings (PostgreSQL constraint) — the textarea is plain text, one value per line
+- Editing state (`editingEnumName`) is tracked as module-local in builder-panels.js (not in builder-state.js — it's UI state, not schema state)
 
 ---
 

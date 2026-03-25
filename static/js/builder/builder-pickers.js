@@ -8,6 +8,7 @@ import {
   findTable, addConstraint, addIndex,
   getTargetSchema,
 } from './builder-state.js';
+import { showToast } from './builder-editors.js';
 import { FK_ACTIONS, INDEX_TYPES } from './builder-constants.js';
 
 let activeConstraintTable = null;
@@ -99,6 +100,48 @@ function applyConstraint() {
   }
 
   if (constraint) {
+    // Duplicate detection
+    const existingNames = table.constraints.map(c => c.name);
+    if (existingNames.includes(constraint.name)) {
+      showToast(`Constraint "${constraint.name}" already exists`);
+      return;
+    }
+
+    // Multiple PK warning
+    if (constraint.type === 'pk' && table.constraints.some(c => c.type === 'pk')) {
+      showToast('Table already has a PRIMARY KEY — remove the existing one first');
+      return;
+    }
+
+    // FK: validate target exists
+    if (constraint.type === 'fk') {
+      const schema = getTargetSchema();
+      const refTable = schema.tables.find(t => t.name === constraint.refTable);
+      if (!refTable) {
+        showToast(`Referenced table "${constraint.refTable}" does not exist`);
+        return;
+      }
+      const refColNames = new Set(refTable.columns.map(c => c.name));
+      for (const rc of constraint.refColumns) {
+        if (!refColNames.has(rc)) {
+          showToast(`Referenced column "${constraint.refTable}.${rc}" does not exist`);
+          return;
+        }
+      }
+    }
+
+    // Duplicate unique on same columns
+    if (constraint.type === 'unique') {
+      const colKey = constraint.columns.sort().join(',');
+      const dup = table.constraints.find(c =>
+        c.type === 'unique' && c.columns.slice().sort().join(',') === colKey
+      );
+      if (dup) {
+        showToast(`UNIQUE constraint on (${constraint.columns.join(', ')}) already exists`);
+        return;
+      }
+    }
+
     addConstraint(activeConstraintTable, constraint);
     closeConstraintPicker();
   }

@@ -143,3 +143,27 @@ def test_pg_dump_format():
     assert len(result["tables"]) == 1
     assert result["tables"][0]["name"] == "users"
     assert len(result["tables"][0]["constraints"]) == 1
+
+
+# ---- Issue 7: Escaped single quotes ----
+
+def test_split_statements_escaped_quotes():
+    sql = "INSERT INTO t VALUES ('it''s'); INSERT INTO t VALUES ('ok')"
+    stmts = split_statements(sql)
+    assert len(stmts) == 2
+    assert "it''s" in stmts[0]
+
+
+def test_split_statements_multiple_escaped_quotes():
+    sql = "INSERT INTO t VALUES ('it''s a ''test'''); SELECT 1"
+    stmts = split_statements(sql)
+    assert len(stmts) == 2
+    assert "it''s a ''test'''" in stmts[0]
+
+
+def test_parse_column_with_escaped_default():
+    sql = '''CREATE TABLE "t" ("name" VARCHAR(100) DEFAULT 'it''s a test' NOT NULL)'''
+    table = parse_create_table(sql)
+    assert table["name"] == "t"
+    assert len(table["columns"]) == 1
+    assert "it''s" in table["columns"][0].get("defaultValue", "")
