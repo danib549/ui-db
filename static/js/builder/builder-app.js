@@ -30,8 +30,9 @@ function render() {
 }
 
 function initTheme() {
-  const saved = localStorage.getItem('builder-theme');
-  if (saved === 'dark' || (!saved && document.body.classList.contains('dark'))) {
+  const THEME_KEY = 'db-diagram-theme';
+  const saved = localStorage.getItem(THEME_KEY);
+  if (saved === 'dark') {
     document.body.classList.add('dark');
   }
 
@@ -39,7 +40,7 @@ function initTheme() {
   if (btn) {
     btn.addEventListener('click', () => {
       document.body.classList.toggle('dark');
-      localStorage.setItem('builder-theme', document.body.classList.contains('dark') ? 'dark' : 'light');
+      localStorage.setItem(THEME_KEY, document.body.classList.contains('dark') ? 'dark' : 'light');
     });
   }
 }

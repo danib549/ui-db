@@ -8,6 +8,12 @@
   <link rel="stylesheet" href="{{ url_for('static', filename='css/dark-mode.css') }}">
 </head>
 <body>
+  <script>
+    // Apply dark mode immediately to prevent flash of light theme
+    if (localStorage.getItem('db-diagram-theme') === 'dark') {
+      document.body.classList.add('dark');
+    }
+  </script>
   <div class="app">
     <!-- Sidebar -->
     <aside class="sidebar">

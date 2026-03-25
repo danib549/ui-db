@@ -7,8 +7,15 @@
   <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
   <link rel="stylesheet" href="{{ url_for('static', filename='css/dark-mode.css') }}">
   <link rel="stylesheet" href="{{ url_for('static', filename='css/builder.css') }}">
+
 </head>
 <body>
+  <script>
+    // Apply dark mode immediately to prevent flash of light theme
+    if (localStorage.getItem('db-diagram-theme') === 'dark') {
+      document.body.classList.add('dark');
+    }
+  </script>
   <!-- Top Navigation -->
   <nav class="builder-nav">
     <a href="/" class="builder-nav__back" title="Back to Diagram">

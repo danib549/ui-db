@@ -19049,8 +19049,9 @@ function render() {
 }
 
 function initTheme() {
-  const saved = localStorage.getItem('builder-theme');
-  if (saved === 'dark' || (!saved && document.body.classList.contains('dark'))) {
+  const THEME_KEY = 'db-diagram-theme';
+  const saved = localStorage.getItem(THEME_KEY);
+  if (saved === 'dark') {
     document.body.classList.add('dark');
   }
 
@@ -19058,7 +19059,7 @@ function initTheme() {
   if (btn) {
     btn.addEventListener('click', () => {
       document.body.classList.toggle('dark');
-      localStorage.setItem('builder-theme', document.body.classList.contains('dark') ? 'dark' : 'light');
+      localStorage.setItem(THEME_KEY, document.body.classList.contains('dark') ? 'dark' : 'light');
     });
   }
 }
@@ -22291,8 +22292,15 @@ export function clearActiveEditor() {
   <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
   <link rel="stylesheet" href="{{ url_for('static', filename='css/dark-mode.css') }}">
   <link rel="stylesheet" href="{{ url_for('static', filename='css/builder.css') }}">
+
 </head>
 <body>
+  <script>
+    // Apply dark mode immediately to prevent flash of light theme
+    if (localStorage.getItem('db-diagram-theme') === 'dark') {
+      document.body.classList.add('dark');
+    }
+  </script>
   <!-- Top Navigation -->
   <nav class="builder-nav">
     <a href="/" class="builder-nav__back" title="Back to Diagram">
@@ -22494,6 +22502,12 @@ export function clearActiveEditor() {
   <link rel="stylesheet" href="{{ url_for('static', filename='css/dark-mode.css') }}">
 </head>
 <body>
+  <script>
+    // Apply dark mode immediately to prevent flash of light theme
+    if (localStorage.getItem('db-diagram-theme') === 'dark') {
+      document.body.classList.add('dark');
+    }
+  </script>
   <div class="app">
     <!-- Sidebar -->
     <aside class="sidebar">
