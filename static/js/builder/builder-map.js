@@ -192,7 +192,7 @@ function computeLayout(schema) {
 
 function boxHeight(table) {
   return MAP_BOX.headerHeight + MAP_BOX.bodyPadding * 2 +
-    Math.min(table.columns.length, 6) * MAP_BOX.lineHeight;
+    table.columns.length * MAP_BOX.lineHeight;
 }
 
 function autoFit() {
@@ -308,7 +308,7 @@ function drawTableBox(table, pos, colors, isHovered) {
   // Column summary
   ctx.font = '10px sans-serif';
   ctx.fillStyle = colors.boxSubtext;
-  const cols = table.columns.slice(0, 6);
+  const cols = table.columns;
   let cy = y + MAP_BOX.headerHeight + MAP_BOX.bodyPadding;
 
   for (const col of cols) {
@@ -328,19 +328,13 @@ function drawTableBox(table, pos, colors, isHovered) {
     ctx.fillText(colText, x + 14, cy + MAP_BOX.lineHeight / 2 + 1);
     cy += MAP_BOX.lineHeight;
   }
-
-  if (table.columns.length > 6) {
-    ctx.fillStyle = colors.boxSubtext;
-    ctx.fillText(`+${table.columns.length - 6} more`, x + 14, cy + MAP_BOX.lineHeight / 2 + 1);
-  }
 }
 
 /** Get the Y offset from box top to the center of a column row. */
 function columnYOffset(table, columnName) {
   const idx = table.columns.findIndex(c => c.name === columnName);
-  if (idx < 0 || idx >= 6) {
-    // Column not visible in map box — anchor to bottom of visible area
-    return MAP_BOX.headerHeight + MAP_BOX.bodyPadding + Math.min(table.columns.length, 6) * MAP_BOX.lineHeight - MAP_BOX.lineHeight / 2;
+  if (idx < 0) {
+    return MAP_BOX.headerHeight + MAP_BOX.bodyPadding + table.columns.length * MAP_BOX.lineHeight - MAP_BOX.lineHeight / 2;
   }
   return MAP_BOX.headerHeight + MAP_BOX.bodyPadding + idx * MAP_BOX.lineHeight + MAP_BOX.lineHeight / 2;
 }
