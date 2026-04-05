@@ -14,6 +14,51 @@ const OPEN_CLASS = 'rebuilder-modal--open';
 let currentResult = null;
 let activeTab = 'ddl';
 
+// Option catalog — mirrors DEFAULT_OPTIONS in schema_optimizer.py
+const OPTION_CATALOG = [
+  {
+    group: 'Data-Driven Structure',
+    options: [
+      { key: 'mn_to_1n_downgrade',   label: 'Downgrade M:N → 1:N',          enabled: true,  mode: 'apply', flagOnly: false },
+      { key: 'inline_lookup_tables', label: 'Inline thin lookup tables',    enabled: false, mode: 'apply', flagOnly: false },
+      { key: 'merge_1_1_pairs',      label: 'Merge 1:1 pairs',              enabled: false, mode: 'flag',  flagOnly: false },
+      { key: 'drop_orphan_tables',   label: 'Flag orphan tables',           enabled: true,  mode: 'flag',  flagOnly: true },
+    ],
+  },
+  {
+    group: 'Column Optimization',
+    options: [
+      { key: 'type_downsizing',       label: 'Type downsizing',              enabled: true,  mode: 'apply', flagOnly: false },
+      { key: 'strict_nullability',    label: 'Strict NOT NULL',              enabled: true,  mode: 'apply', flagOnly: false },
+      { key: 'enum_discovery',        label: 'ENUM discovery',               enabled: true,  mode: 'apply', flagOnly: false },
+      { key: 'dead_column_detection', label: 'Dead column detection',        enabled: false, mode: 'flag',  flagOnly: true },
+    ],
+  },
+  {
+    group: 'Indexes & Foreign Keys',
+    options: [
+      { key: 'collapse_redundant_indexes', label: 'Collapse redundant indexes', enabled: true,  mode: 'apply', flagOnly: false },
+      { key: 'missing_fk_indexes',         label: 'Add missing FK indexes',     enabled: true,  mode: 'apply', flagOnly: false },
+      { key: 'implicit_fk_discovery',      label: 'Discover implicit FKs',      enabled: false, mode: 'apply', flagOnly: false },
+    ],
+  },
+  {
+    group: 'Advanced (Flag Only)',
+    options: [
+      { key: 'eav_to_jsonb',                   label: 'EAV → JSONB',                enabled: false, mode: 'flag', flagOnly: true },
+      { key: 'vertical_split_fat_tables',      label: 'Vertical split candidates',  enabled: false, mode: 'flag', flagOnly: true },
+      { key: 'time_series_partition_candidates', label: 'Time-series partitioning', enabled: false, mode: 'flag', flagOnly: true },
+    ],
+  },
+  {
+    group: 'Data Integrity (Flag Only)',
+    options: [
+      { key: 'dangling_reference_detect', label: 'Dangling FK references', enabled: false, mode: 'flag', flagOnly: true },
+      { key: 'soft_delete_ghosting',      label: 'Soft-delete ghosting',    enabled: false, mode: 'flag', flagOnly: true },
+    ],
+  },
+];
+
 export function initRebuilder() {
   const btn = document.getElementById('btn-rebuilder');
   if (btn) btn.addEventListener('click', openModal);
@@ -48,7 +93,11 @@ async function runRebuild() {
   content.innerHTML = '<div class="rebuilder-empty">Rebuilding schema…</div>';
 
   try {
-    const resp = await fetch('/api/rebuild-schema', { method: 'POST' });
+    const resp = await fetch('/api/rebuild-schema', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ options: collectOptions() }),
+    });
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
     currentResult = await resp.json();
     renderResult();
@@ -57,12 +106,28 @@ async function runRebuild() {
   }
 }
 
+function collectOptions() {
+  const out = {};
+  for (const group of OPTION_CATALOG) {
+    for (const opt of group.options) {
+      const enabledEl = document.getElementById(`ropt-en-${opt.key}`);
+      const modeEl = document.getElementById(`ropt-mode-${opt.key}`);
+      out[opt.key] = {
+        enabled: enabledEl ? enabledEl.checked : opt.enabled,
+        mode: opt.flagOnly ? 'flag' : (modeEl ? modeEl.value : opt.mode),
+      };
+    }
+  }
+  return out;
+}
+
 function renderResult() {
   const content = document.getElementById('rebuilder-content');
   if (!content || !currentResult) return;
 
   const schema = currentResult.schema || { tables: [], enums: [] };
   const decisions = currentResult.decisions || [];
+  const flags = currentResult.flags || [];
   const tableCount = (schema.tables || []).length;
   const enumCount = (schema.enums || []).length;
   const fkCount = decisions.filter(d => d.kind === 'foreign_key').length;
@@ -77,7 +142,14 @@ function renderResult() {
       <span class="rebuilder-stat">${fkCount} FKs</span>
       <span class="rebuilder-stat">${surrogateCount} surrogate PKs</span>
       <span class="rebuilder-stat">${renameCount} renames</span>
+      <span class="rebuilder-stat rebuilder-stat--flags">${flags.length} flags</span>
     `;
+  }
+
+  // Update flag tab badge
+  const flagsTab = document.querySelector('.rebuilder-tab[data-tab="flags"]');
+  if (flagsTab) {
+    flagsTab.textContent = flags.length > 0 ? `Flags (${flags.length})` : 'Flags';
   }
 
   renderActiveTab();
@@ -99,6 +171,8 @@ function renderActiveTab() {
     content.innerHTML = `<pre class="rebuilder-code rebuilder-code--markdown"><code>${escapeHtml(report)}</code></pre>`;
   } else if (activeTab === 'decisions') {
     content.innerHTML = renderDecisionsTable(currentResult.decisions || []);
+  } else if (activeTab === 'flags') {
+    content.innerHTML = renderFlagsTable(currentResult.flags || []);
   }
 }
 
@@ -125,6 +199,31 @@ function renderDecisionsTable(decisions) {
   `;
 }
 
+function renderFlagsTable(flags) {
+  if (flags.length === 0) {
+    return '<div class="rebuilder-empty">No flags raised. Enable flag-mode options to see advisories.</div>';
+  }
+  const sev = { error: 0, warning: 1, info: 2 };
+  const sorted = [...flags].sort((a, b) => (sev[a.severity] ?? 3) - (sev[b.severity] ?? 3));
+  const rows = sorted.map(f => {
+    const where = f.table
+      ? (f.column ? `${f.table}.${f.column}` : f.table)
+      : '—';
+    return `<tr class="rebuilder-flag-row rebuilder-flag-row--${escapeHtml(f.severity || 'info')}">
+      <td><span class="rebuilder-sev rebuilder-sev--${escapeHtml(f.severity || 'info')}">${escapeHtml(f.severity || 'info')}</span></td>
+      <td><code>${escapeHtml(f.rule || '')}</code></td>
+      <td><code>${escapeHtml(where)}</code></td>
+      <td>${escapeHtml(f.title || '')}<br><span class="rebuilder-flag-reason">${escapeHtml(f.reason || '')}</span></td>
+    </tr>`;
+  }).join('');
+  return `
+    <table class="rebuilder-table rebuilder-flags-table">
+      <thead><tr><th>Severity</th><th>Rule</th><th>Location</th><th>Detail</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+  `;
+}
+
 function buildDecisionDetail(d) {
   switch (d.kind) {
     case 'rename_table':
@@ -133,11 +232,28 @@ function buildDecisionDetail(d) {
     case 'column_type':
       return `${d.source_type} → ${d.target_type}${d.not_null ? ' NOT NULL' : ''} — ${d.reason}`;
     case 'create_enum':
+    case 'enum_discover':
       return `${d.enum_name} (${(d.values || []).length} values) — ${d.reason}`;
     case 'surrogate_pk':
       return `${d.column} — ${d.reason}`;
     case 'foreign_key':
       return `${d.from_table}.${d.from_column} → ${d.to_table}.${d.to_column} (${d.relationship}, ${d.confidence})`;
+    case 'mn_downgrade':
+      return `junction '${d.table}' removed — FK on '${d.keep_table}.${d.new_column}' → '${d.drop_table_ref}'`;
+    case 'inline_lookup':
+      return `'${d.table}' inlined into '${d.inlined_into}' as '${d.column}'`;
+    case 'merge_1_1':
+      return `'${d.table}' merged into '${d.merged_into}' — ${d.reason}`;
+    case 'type_downsize':
+      return `${d.from_type} → ${d.to_type} — ${d.reason}`;
+    case 'strict_not_null':
+      return d.reason;
+    case 'drop_redundant_index':
+      return `'${d.index}' dropped (covered by '${d.covered_by}')`;
+    case 'add_fk_index':
+      return `index '${d.index}' on (${(d.columns || []).join(', ')})`;
+    case 'implicit_fk':
+      return `'${d.table}.${d.column}' → '${d.target_table}.${d.target_column}' (overlap ${d.overlap})`;
     default:
       return d.reason || '';
   }
@@ -211,6 +327,32 @@ function flashToast(msg) {
   }, 2200);
 }
 
+function renderOptionsPanel() {
+  const groups = OPTION_CATALOG.map(group => {
+    const rows = group.options.map(opt => {
+      const checked = opt.enabled ? 'checked' : '';
+      const modeControl = opt.flagOnly
+        ? '<span class="rebuilder-option-pill">flag only</span>'
+        : `<select class="rebuilder-option-mode" id="ropt-mode-${opt.key}">
+             <option value="apply"${opt.mode === 'apply' ? ' selected' : ''}>apply</option>
+             <option value="flag"${opt.mode === 'flag' ? ' selected' : ''}>flag</option>
+           </select>`;
+      return `
+        <label class="rebuilder-option-row${opt.flagOnly ? ' rebuilder-option-row--flag-only' : ''}">
+          <input type="checkbox" id="ropt-en-${opt.key}" ${checked}>
+          <span class="rebuilder-option-label">${escapeHtml(opt.label)}</span>
+          ${modeControl}
+        </label>`;
+    }).join('');
+    return `
+      <details class="rebuilder-option-group" open>
+        <summary class="rebuilder-option-group__summary">${escapeHtml(group.group)}</summary>
+        <div class="rebuilder-option-group__body">${rows}</div>
+      </details>`;
+  }).join('');
+  return `<section class="rebuilder-options" aria-label="Optimization options">${groups}</section>`;
+}
+
 function ensureModal() {
   let modal = document.getElementById(MODAL_ID);
   if (modal) return modal;
@@ -230,10 +372,12 @@ function ensureModal() {
         </div>
         <button class="rebuilder-modal__close" data-action="close" aria-label="Close">&times;</button>
       </header>
+      ${renderOptionsPanel()}
       <nav class="rebuilder-tabs">
         <button class="rebuilder-tab rebuilder-tab--active" data-tab="ddl">DDL</button>
         <button class="rebuilder-tab" data-tab="report">Report</button>
         <button class="rebuilder-tab" data-tab="decisions">Decisions</button>
+        <button class="rebuilder-tab" data-tab="flags">Flags</button>
       </nav>
       <main class="rebuilder-modal__content" id="rebuilder-content">
         <div class="rebuilder-empty">Click Rebuild to generate a schema.</div>

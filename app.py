@@ -379,12 +379,17 @@ def rebuild_schema_route():
             "ddl": "-- No tables loaded. Upload CSVs first.\n",
             "report": "# Schema Rebuild Report\n\nNo tables loaded.\n",
             "decisions": [],
+            "flags": [],
         })
+
+    payload = request.get_json(silent=True) or {}
+    options = payload.get("options") if isinstance(payload, dict) else None
 
     result = rebuild_schema(
         list(loaded_tables.values()),
         loaded_dataframes,
         detected_relationships,
+        options=options,
     )
     return jsonify(result)
 
