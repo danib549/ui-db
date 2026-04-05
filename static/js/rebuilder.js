@@ -13,6 +13,9 @@ const OPEN_CLASS = 'rebuilder-modal--open';
 
 let currentResult = null;
 let activeTab = 'ddl';
+let vizLayout = 'grid';
+let vizTransform = { x: 0, y: 0, scale: 1 };
+let vizDrag = null;
 
 // Option catalog — mirrors DEFAULT_OPTIONS in schema_optimizer.py
 const OPTION_CATALOG = [
@@ -175,6 +178,7 @@ function renderActiveTab() {
     content.innerHTML = renderFlagsTable(currentResult.flags || []);
   } else if (activeTab === 'viz') {
     content.innerHTML = renderVisualization(currentResult.schema || { tables: [], enums: [] });
+    attachVizHandlers();
   }
 }
 
@@ -193,30 +197,64 @@ function renderVisualization(schema) {
   if (tables.length === 0) {
     return '<div class="rebuilder-empty">No tables to visualize.</div>';
   }
-  const positions = computeVizLayout(tables);
+  const positions = computeVizPositions(tables, vizLayout);
   const anchors = computeVizAnchors(tables, positions);
   const fks = collectVizFKs(tables);
-  const canvasW = VIZ_COLS * VIZ_CARD_WIDTH + (VIZ_COLS - 1) * VIZ_GAP_X + VIZ_MARGIN * 2;
-  const lastRow = Math.floor((tables.length - 1) / VIZ_COLS);
-  const canvasH = (lastRow + 1) * (maxRowHeight(tables, positions, lastRow) + VIZ_GAP_Y) + VIZ_MARGIN;
+  const bounds = computeVizBounds(positions);
+  const canvasW = bounds.maxX + VIZ_MARGIN;
+  const canvasH = bounds.maxY + VIZ_MARGIN;
 
   const linesSvg = fks.map(fk => renderVizLine(fk, anchors)).filter(Boolean).join('');
   const cards = tables.map(t => renderVizCard(t, positions.get(t.name))).join('');
+  const t = vizTransform;
 
   return `
-    <div class="rebuilder-viz" style="width:${canvasW}px;height:${canvasH}px;">
-      <svg class="rebuilder-viz__lines" width="${canvasW}" height="${canvasH}">
-        <defs>
-          <marker id="viz-arrow" viewBox="0 0 10 10" refX="9" refY="5"
-                  markerWidth="6" markerHeight="6" orient="auto">
-            <path d="M0,0 L10,5 L0,10 z" fill="#6366f1"/>
-          </marker>
-        </defs>
-        ${linesSvg}
-      </svg>
-      ${cards}
+    <div class="rebuilder-viz-wrap">
+      <div class="rebuilder-viz-toolbar">
+        <label class="rebuilder-viz-label">Layout
+          <select id="rebuilder-viz-layout" class="rebuilder-viz-select">
+            <option value="grid"${vizLayout === 'grid' ? ' selected' : ''}>Grid</option>
+            <option value="layered"${vizLayout === 'layered' ? ' selected' : ''}>Layered (by FK depth)</option>
+            <option value="packed"${vizLayout === 'packed' ? ' selected' : ''}>Packed</option>
+          </select>
+        </label>
+        <button class="rebuilder-viz-btn" data-action="viz-zoom-out">−</button>
+        <span class="rebuilder-viz-zoom">${Math.round(t.scale * 100)}%</span>
+        <button class="rebuilder-viz-btn" data-action="viz-zoom-in">+</button>
+        <button class="rebuilder-viz-btn" data-action="viz-reset">Reset</button>
+        <span class="rebuilder-viz-hint">Drag to pan · Scroll to zoom</span>
+      </div>
+      <div class="rebuilder-viz-viewport" id="rebuilder-viz-viewport">
+        <div class="rebuilder-viz" style="width:${canvasW}px;height:${canvasH}px;transform:translate(${t.x}px,${t.y}px) scale(${t.scale});">
+          <svg class="rebuilder-viz__lines" width="${canvasW}" height="${canvasH}">
+            <defs>
+              <marker id="viz-arrow" viewBox="0 0 10 10" refX="9" refY="5"
+                      markerWidth="6" markerHeight="6" orient="auto">
+                <path d="M0,0 L10,5 L0,10 z" fill="#6366f1"/>
+              </marker>
+            </defs>
+            ${linesSvg}
+          </svg>
+          ${cards}
+        </div>
+      </div>
     </div>
   `;
+}
+
+function computeVizPositions(tables, layout) {
+  if (layout === 'layered') return computeLayeredLayout(tables);
+  if (layout === 'packed') return computePackedLayout(tables);
+  return computeVizLayout(tables);
+}
+
+function computeVizBounds(positions) {
+  let maxX = 0, maxY = 0;
+  for (const p of positions.values()) {
+    if (p.x + p.w > maxX) maxX = p.x + p.w;
+    if (p.y + p.h > maxY) maxY = p.y + p.h;
+  }
+  return { maxX, maxY };
 }
 
 function computeVizLayout(tables) {
@@ -236,6 +274,75 @@ function computeVizLayout(tables) {
     const y = rowTops[row];
     positions.set(t.name, { x, y, w: VIZ_CARD_WIDTH, h: height });
   });
+  return positions;
+}
+
+function computeLayeredLayout(tables) {
+  const positions = new Map();
+  const byName = Object.fromEntries(tables.map(t => [t.name, t]));
+  // Depth = longest FK chain from this table (downstream distance)
+  const depths = new Map();
+  const visiting = new Set();
+  function depthOf(name) {
+    if (depths.has(name)) return depths.get(name);
+    if (visiting.has(name)) return 0; // cycle break
+    visiting.add(name);
+    const t = byName[name];
+    if (!t) { visiting.delete(name); return 0; }
+    let max = 0;
+    for (const c of t.constraints || []) {
+      if (c.type === 'fk' && c.refTable && c.refTable !== name) {
+        max = Math.max(max, depthOf(c.refTable) + 1);
+      }
+    }
+    visiting.delete(name);
+    depths.set(name, max);
+    return max;
+  }
+  tables.forEach(t => depthOf(t.name));
+  // Group by depth
+  const layers = new Map();
+  for (const t of tables) {
+    const d = depths.get(t.name) || 0;
+    if (!layers.has(d)) layers.set(d, []);
+    layers.get(d).push(t);
+  }
+  const sortedDepths = [...layers.keys()].sort((a, b) => a - b);
+  let y = VIZ_MARGIN;
+  for (const d of sortedDepths) {
+    const layer = layers.get(d);
+    let x = VIZ_MARGIN;
+    let rowMax = 0;
+    for (const t of layer) {
+      const h = cardHeight(t);
+      positions.set(t.name, { x, y, w: VIZ_CARD_WIDTH, h });
+      x += VIZ_CARD_WIDTH + VIZ_GAP_X;
+      if (h > rowMax) rowMax = h;
+    }
+    y += rowMax + VIZ_GAP_Y;
+  }
+  return positions;
+}
+
+function computePackedLayout(tables) {
+  // Sort by column count desc, then pack into rows targeting ~1200px width
+  const positions = new Map();
+  const sorted = [...tables].sort((a, b) => (b.columns || []).length - (a.columns || []).length);
+  const targetWidth = 1200;
+  let x = VIZ_MARGIN;
+  let y = VIZ_MARGIN;
+  let rowMax = 0;
+  for (const t of sorted) {
+    if (x > VIZ_MARGIN && x + VIZ_CARD_WIDTH > targetWidth) {
+      y += rowMax + VIZ_GAP_Y;
+      x = VIZ_MARGIN;
+      rowMax = 0;
+    }
+    const h = cardHeight(t);
+    positions.set(t.name, { x, y, w: VIZ_CARD_WIDTH, h });
+    x += VIZ_CARD_WIDTH + VIZ_GAP_X;
+    if (h > rowMax) rowMax = h;
+  }
   return positions;
 }
 
@@ -438,6 +545,77 @@ function onModalClick(e) {
     runRebuild();
     return;
   }
+  if (target.dataset.action === 'viz-zoom-in') {
+    vizZoom(1.2);
+    return;
+  }
+  if (target.dataset.action === 'viz-zoom-out') {
+    vizZoom(1 / 1.2);
+    return;
+  }
+  if (target.dataset.action === 'viz-reset') {
+    vizTransform = { x: 0, y: 0, scale: 1 };
+    renderActiveTab();
+    attachVizHandlers();
+    return;
+  }
+}
+
+function vizZoom(factor) {
+  const next = Math.max(0.25, Math.min(3, vizTransform.scale * factor));
+  vizTransform.scale = next;
+  applyVizTransform();
+  // Update zoom label without full re-render
+  const label = document.querySelector('.rebuilder-viz-zoom');
+  if (label) label.textContent = Math.round(next * 100) + '%';
+}
+
+function applyVizTransform() {
+  const el = document.querySelector('.rebuilder-viz');
+  if (!el) return;
+  const t = vizTransform;
+  el.style.transform = `translate(${t.x}px,${t.y}px) scale(${t.scale})`;
+}
+
+function attachVizHandlers() {
+  const viewport = document.getElementById('rebuilder-viz-viewport');
+  if (!viewport) return;
+  const layoutSel = document.getElementById('rebuilder-viz-layout');
+  if (layoutSel) {
+    layoutSel.addEventListener('change', (e) => {
+      vizLayout = e.target.value;
+      vizTransform = { x: 0, y: 0, scale: 1 };
+      renderActiveTab();
+      attachVizHandlers();
+    });
+  }
+  viewport.addEventListener('mousedown', (e) => {
+    if (e.target.closest('.rebuilder-viz-toolbar')) return;
+    vizDrag = { startX: e.clientX, startY: e.clientY, origX: vizTransform.x, origY: vizTransform.y };
+    viewport.classList.add('rebuilder-viz-viewport--dragging');
+    e.preventDefault();
+  });
+  window.addEventListener('mousemove', onVizDragMove);
+  window.addEventListener('mouseup', onVizDragEnd);
+  viewport.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+    vizZoom(factor);
+  }, { passive: false });
+}
+
+function onVizDragMove(e) {
+  if (!vizDrag) return;
+  vizTransform.x = vizDrag.origX + (e.clientX - vizDrag.startX);
+  vizTransform.y = vizDrag.origY + (e.clientY - vizDrag.startY);
+  applyVizTransform();
+}
+
+function onVizDragEnd() {
+  if (!vizDrag) return;
+  vizDrag = null;
+  const viewport = document.getElementById('rebuilder-viz-viewport');
+  if (viewport) viewport.classList.remove('rebuilder-viz-viewport--dragging');
 }
 
 async function writeClipboard(text, msg) {
