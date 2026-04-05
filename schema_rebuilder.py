@@ -38,6 +38,7 @@ from schema_builder import (
 )
 from type_mapper import suggest_pg_type
 from ddl_generator import generate_full_ddl
+from schema_optimizer import apply_optimizations, merge_options
 
 ENUM_MAX_UNIQUE = 15
 ENUM_MIN_TOTAL = 10
@@ -149,6 +150,7 @@ def rebuild_schema(
     tables: list[dict],
     dataframes: dict,
     relationships: list[dict],
+    options: dict | None = None,
 ) -> dict:
     """Rebuild a PostgreSQL schema from designer state.
 
@@ -359,6 +361,18 @@ def rebuild_schema(
             "reason": f"Detected {rel.get('type', '?')} relationship",
         })
 
+    # Run user-gated optimizations (post-baseline pipeline)
+    merged_opts = merge_options(options)
+    opt_decisions, flags, _ = apply_optimizations(
+        schema=schema,
+        dataframes=dataframes,
+        name_map=name_map,
+        col_map=col_map,
+        relationships=relationships,
+        options=merged_opts,
+    )
+    decisions.extend(opt_decisions)
+
     ddl = generate_full_ddl(schema)
     report = _build_report(schema, decisions, tables, relationships)
     return {
@@ -366,6 +380,7 @@ def rebuild_schema(
         "ddl": ddl,
         "report": report,
         "decisions": decisions,
+        "flags": flags,
     }
 
 
