@@ -443,6 +443,7 @@ from metadata_parser import (
     build_metadata_relationships,
 )
 from relationship_analyzer import detect_relationships
+from schema_advisor import analyze_designer_schema, report_to_markdown, advisory_to_markdown
 from search import search_all_tables
 from trace import trace_value
 from builder_routes import builder_bp
@@ -730,6 +731,61 @@ def column_values():
     values = df[column].dropna().unique()
     values_list = [str(v) for v in values[:100]]
     return jsonify({"table": table, "column": column, "values": values_list})
+
+
+@app.route("/api/analyze-schema", methods=["POST"])
+def analyze_schema():
+    """Run the schema advisor over loaded CSV tables and detected relationships.
+
+    Returns:
+        advisories — list of improvement suggestions with fix SQL
+        counts — {error, warning, info} tallies
+        scores — {structure, type_precision, relationships} 0.0-1.0
+        stats  — {tables, columns, relationships}
+        markdown — full LLM-friendly copy-paste report
+    """
+    if not loaded_tables:
+        return jsonify({
+            "advisories": [],
+            "counts": {"error": 0, "warning": 0, "info": 0},
+            "scores": {"structure": 1.0, "type_precision": 1.0, "relationships": 1.0},
+            "stats": {"tables": 0, "columns": 0, "relationships": 0},
+            "markdown": "",
+        })
+
+    tables = list(loaded_tables.values())
+    report = analyze_designer_schema(
+        tables,
+        loaded_dataframes,
+        detected_relationships,
+    )
+    report["markdown"] = report_to_markdown(report, tables, detected_relationships)
+    return jsonify(report)
+
+
+@app.route("/api/advisory-markdown", methods=["POST"])
+def advisory_markdown():
+    """Render a single advisory as standalone Markdown for copy-paste.
+
+    Expects JSON body: {advisory: {...}}. Uses current loaded state to
+    attach table context.
+    """
+    data = request.get_json(silent=True) or {}
+    advisory = data.get("advisory")
+    if not advisory:
+        return jsonify({"error": "advisory is required"}), 400
+
+    tables_by_name = dict(loaded_tables)
+    rels_by_table: dict[str, list[dict]] = {}
+    for r in detected_relationships:
+        rels_by_table.setdefault(r["source_table"], []).append(r)
+        rels_by_table.setdefault(r["target_table"], []).append(r)
+
+    md = advisory_to_markdown(advisory, {
+        "tables_by_name": tables_by_name,
+        "rels_by_table": rels_by_table,
+    })
+    return jsonify({"markdown": md})
 
 
 @app.route("/api/debug-table")
@@ -2813,71 +2869,6 @@ def generate_export_filename(schema_name: str, export_type: str) -> str:
     }
     return suffixes.get(export_type, f"{safe_name}_{timestamp}.sql")
 ===== END: migration_generator.py =====
-===== FILE: package-lock.json =====
-{
-  "name": "ui-db",
-  "lockfileVersion": 3,
-  "requires": true,
-  "packages": {
-    "": {
-      "dependencies": {
-        "playwright": "^1.58.2"
-      }
-    },
-    "node_modules/fsevents": {
-      "version": "2.3.2",
-      "resolved": "https://registry.npmjs.org/fsevents/-/fsevents-2.3.2.tgz",
-      "integrity": "sha512-xiqMQR4xAeHTuB9uWm+fFRcIOgKBMiOBP+eXiyT7jsgVCq1bkVygt00oASowB7EdtpOHaaPgKt812P9ab+DDKA==",
-      "hasInstallScript": true,
-      "license": "MIT",
-      "optional": true,
-      "os": [
-        "darwin"
-      ],
-      "engines": {
-        "node": "^8.16.0 || ^10.6.0 || >=11.0.0"
-      }
-    },
-    "node_modules/playwright": {
-      "version": "1.58.2",
-      "resolved": "https://registry.npmjs.org/playwright/-/playwright-1.58.2.tgz",
-      "integrity": "sha512-vA30H8Nvkq/cPBnNw4Q8TWz1EJyqgpuinBcHET0YVJVFldr8JDNiU9LaWAE1KqSkRYazuaBhTpB5ZzShOezQ6A==",
-      "license": "Apache-2.0",
-      "dependencies": {
-        "playwright-core": "1.58.2"
-      },
-      "bin": {
-        "playwright": "cli.js"
-      },
-      "engines": {
-        "node": ">=18"
-      },
-      "optionalDependencies": {
-        "fsevents": "2.3.2"
-      }
-    },
-    "node_modules/playwright-core": {
-      "version": "1.58.2",
-      "resolved": "https://registry.npmjs.org/playwright-core/-/playwright-core-1.58.2.tgz",
-      "integrity": "sha512-yZkEtftgwS8CsfYo7nm0KE8jsvm6i/PTgVtB8DL726wNf6H2IMsDuxCpJj59KDaxCtSnrWan2AeDqM7JBaultg==",
-      "license": "Apache-2.0",
-      "bin": {
-        "playwright-core": "cli.js"
-      },
-      "engines": {
-        "node": ">=18"
-      }
-    }
-  }
-}
-===== END: package-lock.json =====
-===== FILE: package.json =====
-{
-  "dependencies": {
-    "playwright": "^1.58.2"
-  }
-}
-===== END: package.json =====
 ===== FILE: pg_validator.py =====
 """PostgreSQL schema validator — naming, constraints, FK targets, safety checks."""
 
@@ -3812,6 +3803,741 @@ def _get_column_type(
 flask
 pandas
 ===== END: requirements.txt =====
+===== FILE: schema_advisor.py =====
+"""Schema advisor — deterministic rules over CSVs loaded in the designer.
+
+Pure functions that read already-detected designer state (loaded_tables,
+loaded_dataframes, detected_relationships) and emit improvement advisories.
+No HTTP, no side effects.
+
+Inputs:
+    tables: list[dict] — shape of loaded_tables.values() from app.py
+        each table = {
+            "name": str,
+            "columns": [{name, type, nullable, unique_count, total_count,
+                          key_type: "PK"|"FK"|"UQ"|None}, ...],
+            "group": str,
+        }
+    dataframes: dict[str, pd.DataFrame]
+    relationships: list[dict] — from relationship_analyzer
+        each rel = {
+            "source_table", "source_column",
+            "target_table", "target_column",
+            "type": "one-to-one"|"one-to-many"|"many-to-many",
+            "confidence": "high"|"medium"|"low",
+        }
+
+Advisory shape:
+    {
+        "rule":     str,
+        "severity": "error"|"warning"|"info",
+        "title":    str,
+        "table":    str | None,
+        "column":   str | None,
+        "reason":   str,
+        "fix_sql":  str | None,  # suggested PG DDL (quoted identifiers)
+        "evidence": dict | None,
+    }
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import pandas as pd
+
+SEVERITY_ERROR = "error"
+SEVERITY_WARNING = "warning"
+SEVERITY_INFO = "info"
+
+ENUM_MAX_UNIQUE = 15
+ENUM_MIN_TOTAL = 10
+HIGH_NULL_RATIO = 0.5
+WIDE_AVG_LEN = 500
+AUDIT_NAMES = {"created_at", "updated_at", "createdat", "updatedat"}
+
+
+def _quote(name: str) -> str:
+    """Safe PG identifier quoting — rejects embedded double quotes."""
+    safe = name.replace('"', "")
+    return f'"{safe}"'
+
+
+def _advisory(
+    rule: str,
+    severity: str,
+    title: str,
+    reason: str,
+    table: str | None = None,
+    column: str | None = None,
+    fix_sql: str | None = None,
+    evidence: dict | None = None,
+) -> dict:
+    return {
+        "rule": rule,
+        "severity": severity,
+        "title": title,
+        "table": table,
+        "column": column,
+        "reason": reason,
+        "fix_sql": fix_sql,
+        "evidence": evidence,
+    }
+
+
+def _find_column(table: dict, col_name: str) -> dict | None:
+    for c in table.get("columns", []):
+        if c.get("name") == col_name:
+            return c
+    return None
+
+
+def _pk_columns(table: dict) -> list[str]:
+    return [c["name"] for c in table.get("columns", []) if c.get("key_type") == "PK"]
+
+
+def _fk_columns(table: dict) -> list[str]:
+    return [c["name"] for c in table.get("columns", []) if c.get("key_type") == "FK"]
+
+
+def _null_ratio(df: pd.DataFrame | None, col_name: str) -> float | None:
+    if df is None or col_name not in df.columns:
+        return None
+    total = len(df)
+    if total == 0:
+        return None
+    non_null = int(df[col_name].count())
+    return round((total - non_null) / total, 3)
+
+
+def _avg_string_len(df: pd.DataFrame | None, col_name: str) -> float | None:
+    if df is None or col_name not in df.columns:
+        return None
+    series = df[col_name].dropna()
+    if series.empty:
+        return None
+    try:
+        return float(series.astype(str).str.len().mean())
+    except Exception:
+        return None
+
+
+def _sample_values(df: pd.DataFrame | None, col_name: str, n: int = 10) -> list[str]:
+    if df is None or col_name not in df.columns:
+        return []
+    vals = df[col_name].dropna().unique()
+    return [str(v) for v in vals[:n]]
+
+
+# ---------- Rules ----------
+
+
+def rule_missing_primary_key(tables: list[dict], *_args) -> list[dict]:
+    out: list[dict] = []
+    for table in tables:
+        tname = table.get("name", "")
+        if _pk_columns(table):
+            continue
+        out.append(_advisory(
+            rule="missing_primary_key",
+            severity=SEVERITY_WARNING,
+            title="Table has no detected primary key",
+            reason=(
+                "No column in this table has a unique non-null value set with "
+                "an identifier-like name. Without a PK, rows cannot be "
+                "referenced, replicated, or safely updated by identity."
+            ),
+            table=tname,
+            fix_sql=(
+                f'-- Add surrogate PK to {tname}\n'
+                f'ALTER TABLE {_quote(tname)} '
+                f'ADD COLUMN "id" bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY;'
+            ),
+            evidence={"columns": [c.get("name") for c in table.get("columns", [])]},
+        ))
+    return out
+
+
+def rule_unmarked_unique(tables: list[dict], *_args) -> list[dict]:
+    """Columns with 100% unique non-null values that aren't marked PK/UQ."""
+    out: list[dict] = []
+    for table in tables:
+        tname = table.get("name", "")
+        for col in table.get("columns", []):
+            key_type = col.get("key_type")
+            if key_type in ("PK", "UQ"):
+                continue
+            unique = col.get("unique_count", 0)
+            total = col.get("total_count", 0)
+            if unique != total or total < 10 or unique < 10:
+                continue
+            if col.get("nullable", True):
+                continue
+            out.append(_advisory(
+                rule="unmarked_unique",
+                severity=SEVERITY_INFO,
+                title="Column is unique but not marked",
+                reason=(
+                    f"All {total} values in '{col['name']}' are distinct and "
+                    "non-null. Consider adding a UNIQUE constraint."
+                ),
+                table=tname,
+                column=col["name"],
+                fix_sql=(
+                    f'ALTER TABLE {_quote(tname)} '
+                    f'ADD CONSTRAINT {_quote(tname + "_" + col["name"] + "_key")} '
+                    f'UNIQUE ({_quote(col["name"])});'
+                ),
+                evidence={"unique_count": unique, "total_count": total},
+            ))
+    return out
+
+
+def rule_high_null_ratio(tables: list[dict], dataframes: dict, *_args) -> list[dict]:
+    out: list[dict] = []
+    for table in tables:
+        tname = table.get("name", "")
+        df = dataframes.get(tname)
+        if df is None:
+            continue
+        for col in table.get("columns", []):
+            cname = col.get("name", "")
+            ratio = _null_ratio(df, cname)
+            if ratio is None or ratio < HIGH_NULL_RATIO:
+                continue
+            pct = int(ratio * 100)
+            out.append(_advisory(
+                rule="high_null_ratio",
+                severity=SEVERITY_INFO,
+                title=f"{pct}% of values are NULL",
+                reason=(
+                    f"Column '{cname}' is null in {pct}% of {len(df)} rows. "
+                    "Consider extracting it to a sparse side-table, adding a "
+                    "DEFAULT, or reviewing whether it belongs here."
+                ),
+                table=tname,
+                column=cname,
+                evidence={"null_ratio": ratio, "total_rows": len(df)},
+            ))
+    return out
+
+
+def rule_enum_candidate(tables: list[dict], dataframes: dict, *_args) -> list[dict]:
+    out: list[dict] = []
+    for table in tables:
+        tname = table.get("name", "")
+        df = dataframes.get(tname)
+        for col in table.get("columns", []):
+            cname = col.get("name", "")
+            ctype = col.get("type", "")
+            if ctype not in ("VARCHAR", "TEXT"):
+                continue
+            unique = col.get("unique_count", 0)
+            total = col.get("total_count", 0)
+            if unique <= 0 or unique > ENUM_MAX_UNIQUE or total < ENUM_MIN_TOTAL:
+                continue
+            if col.get("key_type") in ("PK", "UQ"):
+                continue
+            samples = _sample_values(df, cname, n=unique)
+            enum_name = f"{tname}_{cname}_enum"
+            values_sql = ", ".join(f"'{v.replace(chr(39), chr(39)*2)}'" for v in samples)
+            out.append(_advisory(
+                rule="enum_candidate",
+                severity=SEVERITY_INFO,
+                title="Column is an enum candidate",
+                reason=(
+                    f"Only {unique} distinct values across {total} rows. "
+                    "A PostgreSQL ENUM type enforces valid values and uses "
+                    "4 bytes regardless of label length."
+                ),
+                table=tname,
+                column=cname,
+                fix_sql=(
+                    f'CREATE TYPE {_quote(enum_name)} AS ENUM ({values_sql});\n'
+                    f'ALTER TABLE {_quote(tname)} '
+                    f'ALTER COLUMN {_quote(cname)} TYPE {_quote(enum_name)} '
+                    f'USING {_quote(cname)}::{_quote(enum_name)};'
+                ),
+                evidence={
+                    "unique_count": unique,
+                    "total_count": total,
+                    "sample_values": samples,
+                },
+            ))
+    return out
+
+
+def rule_wide_varchar(tables: list[dict], dataframes: dict, *_args) -> list[dict]:
+    out: list[dict] = []
+    for table in tables:
+        tname = table.get("name", "")
+        df = dataframes.get(tname)
+        if df is None:
+            continue
+        for col in table.get("columns", []):
+            cname = col.get("name", "")
+            ctype = col.get("type", "")
+            if ctype not in ("VARCHAR", "TEXT"):
+                continue
+            avg_len = _avg_string_len(df, cname)
+            if avg_len is None or avg_len < WIDE_AVG_LEN:
+                continue
+            out.append(_advisory(
+                rule="wide_varchar",
+                severity=SEVERITY_INFO,
+                title="Column holds long text values",
+                reason=(
+                    f"Average length is {int(avg_len)} characters. Use TEXT "
+                    "for unbounded long strings, or consider splitting this "
+                    "field into a separate table if it is rarely queried."
+                ),
+                table=tname,
+                column=cname,
+                fix_sql=(
+                    f'ALTER TABLE {_quote(tname)} '
+                    f'ALTER COLUMN {_quote(cname)} TYPE text;'
+                ),
+                evidence={"avg_length": int(avg_len)},
+            ))
+    return out
+
+
+def rule_boolean_masquerading(tables: list[dict], dataframes: dict, *_args) -> list[dict]:
+    """INT columns that only hold 0/1 values — suggest BOOLEAN."""
+    out: list[dict] = []
+    for table in tables:
+        tname = table.get("name", "")
+        df = dataframes.get(tname)
+        if df is None:
+            continue
+        for col in table.get("columns", []):
+            cname = col.get("name", "")
+            if col.get("type") not in ("INT", "FLOAT"):
+                continue
+            if col.get("key_type") in ("PK", "FK", "UQ"):
+                continue
+            if cname not in df.columns:
+                continue
+            vals = df[cname].dropna().unique()
+            if len(vals) == 0 or len(vals) > 2:
+                continue
+            try:
+                int_vals = {int(v) for v in vals}
+            except (TypeError, ValueError):
+                continue
+            if not int_vals.issubset({0, 1}):
+                continue
+            out.append(_advisory(
+                rule="boolean_masquerading",
+                severity=SEVERITY_INFO,
+                title="Numeric column holds only 0/1",
+                reason=(
+                    f"Column '{cname}' contains only {sorted(int_vals)}. "
+                    "Storing it as BOOLEAN is clearer and one byte smaller."
+                ),
+                table=tname,
+                column=cname,
+                fix_sql=(
+                    f'ALTER TABLE {_quote(tname)} '
+                    f'ALTER COLUMN {_quote(cname)} TYPE boolean '
+                    f'USING ({_quote(cname)} <> 0);'
+                ),
+                evidence={"distinct_values": sorted(int_vals)},
+            ))
+    return out
+
+
+def rule_orphan_fk(tables: list[dict], _dfs: dict, relationships: list[dict]) -> list[dict]:
+    """FK-named columns that have no detected target relationship."""
+    out: list[dict] = []
+    matched: set[tuple[str, str]] = {
+        (r["source_table"], r["source_column"]) for r in relationships
+    }
+    for table in tables:
+        tname = table.get("name", "")
+        for col in table.get("columns", []):
+            if col.get("key_type") != "FK":
+                continue
+            if (tname, col["name"]) in matched:
+                continue
+            out.append(_advisory(
+                rule="orphan_fk",
+                severity=SEVERITY_WARNING,
+                title="Foreign-key-named column has no detected target",
+                reason=(
+                    f"Column '{col['name']}' looks like a foreign key but no "
+                    "matching PK/UQ column was found in any loaded table. "
+                    "Either the target table isn't loaded, the column is "
+                    "misnamed, or values don't match an existing key."
+                ),
+                table=tname,
+                column=col["name"],
+                evidence={"detected_fk_name": col["name"]},
+            ))
+    return out
+
+
+def rule_low_confidence_fk(_tables: list[dict], _dfs: dict, relationships: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    for rel in relationships:
+        if rel.get("confidence") not in ("low", "medium"):
+            continue
+        out.append(_advisory(
+            rule="low_confidence_fk",
+            severity=SEVERITY_INFO,
+            title="Low-confidence relationship",
+            reason=(
+                f"Detected {rel['source_table']}.{rel['source_column']} → "
+                f"{rel['target_table']}.{rel['target_column']} "
+                f"with {rel.get('confidence', '?')} confidence. Some source "
+                "values may not exist in the target key — data cleanup may "
+                "be needed before enforcing a FK constraint."
+            ),
+            table=rel["source_table"],
+            column=rel["source_column"],
+            evidence={
+                "target": f"{rel['target_table']}.{rel['target_column']}",
+                "confidence": rel.get("confidence"),
+                "cardinality": rel.get("type"),
+            },
+        ))
+    return out
+
+
+def rule_missing_fk_index(_tables: list[dict], _dfs: dict, relationships: list[dict]) -> list[dict]:
+    """Every detected FK should be indexed in the target PG schema."""
+    out: list[dict] = []
+    for rel in relationships:
+        src_table = rel["source_table"]
+        src_col = rel["source_column"]
+        idx_name = f"{src_table}_{src_col}_idx"[:63]
+        out.append(_advisory(
+            rule="missing_fk_index",
+            severity=SEVERITY_WARNING,
+            title="Foreign key needs an index",
+            reason=(
+                f"Joins from {src_table}.{src_col} to "
+                f"{rel['target_table']}.{rel['target_column']} will scan the "
+                "full child table without an index. Add this CREATE INDEX "
+                "when you build the PostgreSQL schema."
+            ),
+            table=src_table,
+            column=src_col,
+            fix_sql=(
+                f'CREATE INDEX {_quote(idx_name)} ON {_quote(src_table)} '
+                f'({_quote(src_col)});'
+            ),
+            evidence={"references": f"{rel['target_table']}.{rel['target_column']}"},
+        ))
+    return out
+
+
+def rule_missing_audit_columns(tables: list[dict], *_args) -> list[dict]:
+    out: list[dict] = []
+    for table in tables:
+        tname = table.get("name", "")
+        col_names = {c.get("name", "").lower().replace("_", "") for c in table.get("columns", [])}
+        if col_names & {n.replace("_", "") for n in AUDIT_NAMES}:
+            continue
+        out.append(_advisory(
+            rule="missing_audit_columns",
+            severity=SEVERITY_INFO,
+            title="No audit timestamp columns",
+            reason=(
+                "Table has no created_at/updated_at columns. Audit timestamps "
+                "are useful for debugging, sync, and ordering."
+            ),
+            table=tname,
+            fix_sql=(
+                f'ALTER TABLE {_quote(tname)} '
+                f'ADD COLUMN "created_at" timestamptz NOT NULL DEFAULT NOW(), '
+                f'ADD COLUMN "updated_at" timestamptz;'
+            ),
+        ))
+    return out
+
+
+def rule_naming_consistency(tables: list[dict], *_args) -> list[dict]:
+    names = [t.get("name", "") for t in tables if t.get("name")]
+    if len(names) < 3:
+        return []
+    plural = [n for n in names if n.lower().endswith("s")]
+    singular = [n for n in names if not n.lower().endswith("s")]
+    if len(plural) >= 2 and len(singular) >= 2:
+        return [_advisory(
+            rule="naming_consistency",
+            severity=SEVERITY_INFO,
+            title="Mixed singular/plural table names",
+            reason=(
+                f"{len(plural)} plural tables ({', '.join(sorted(plural)[:3])}) "
+                f"and {len(singular)} singular "
+                f"({', '.join(sorted(singular)[:3])}). Pick one convention."
+            ),
+            evidence={"plural": plural, "singular": singular},
+        )]
+    return []
+
+
+# ---------- Orchestration ----------
+
+
+ALL_RULES = (
+    rule_missing_primary_key,
+    rule_unmarked_unique,
+    rule_orphan_fk,
+    rule_missing_fk_index,
+    rule_low_confidence_fk,
+    rule_enum_candidate,
+    rule_boolean_masquerading,
+    rule_high_null_ratio,
+    rule_wide_varchar,
+    rule_missing_audit_columns,
+    rule_naming_consistency,
+)
+
+
+def analyze_designer_schema(
+    tables: list[dict],
+    dataframes: dict,
+    relationships: list[dict],
+) -> dict:
+    """Run all rules against designer CSV state. Returns a report."""
+    advisories: list[dict] = []
+    for rule in ALL_RULES:
+        advisories.extend(rule(tables, dataframes, relationships))
+
+    counts = {"error": 0, "warning": 0, "info": 0}
+    for a in advisories:
+        counts[a["severity"]] = counts.get(a["severity"], 0) + 1
+
+    return {
+        "advisories": advisories,
+        "counts": counts,
+        "scores": _compute_scores(tables, relationships, advisories),
+        "stats": {
+            "tables": len(tables),
+            "relationships": len(relationships),
+            "columns": sum(len(t.get("columns", [])) for t in tables),
+        },
+    }
+
+
+def _compute_scores(
+    tables: list[dict],
+    relationships: list[dict],
+    advisories: list[dict],
+) -> dict:
+    if not tables:
+        return {"structure": 1.0, "type_precision": 1.0, "relationships": 1.0}
+
+    total_cols = sum(len(t.get("columns", [])) for t in tables) or 1
+    no_pk = sum(1 for a in advisories if a["rule"] == "missing_primary_key")
+    structure = max(0.0, 1.0 - no_pk / len(tables))
+
+    type_issues = sum(
+        1 for a in advisories
+        if a["rule"] in ("wide_varchar", "enum_candidate", "boolean_masquerading")
+    )
+    type_precision = max(0.0, 1.0 - type_issues / total_cols)
+
+    rel_issues = sum(
+        1 for a in advisories
+        if a["rule"] in ("orphan_fk", "low_confidence_fk")
+    )
+    rel_total = len(relationships) + rel_issues or 1
+    rel_score = max(0.0, 1.0 - rel_issues / rel_total)
+
+    return {
+        "structure": round(structure, 2),
+        "type_precision": round(type_precision, 2),
+        "relationships": round(rel_score, 2),
+    }
+
+
+# ---------- LLM-friendly Markdown ----------
+
+
+def advisory_to_markdown(advisory: dict, schema_context: dict | None = None) -> str:
+    """Render a single advisory as a self-contained Markdown block.
+
+    An LLM with no prior context can understand this block — it includes
+    the rule, evidence, affected table/column, and proposed fix SQL.
+    """
+    severity_symbol = {
+        "error": "[ERROR]",
+        "warning": "[WARNING]",
+        "info": "[INFO]",
+    }.get(advisory["severity"], "[INFO]")
+
+    lines: list[str] = []
+    lines.append(f"## Advisory: {advisory['title']}")
+    lines.append(f"**Severity:** {severity_symbol} {advisory['severity']}")
+    lines.append(f"**Rule ID:** `{advisory['rule']}`")
+    if advisory.get("table"):
+        loc = advisory["table"]
+        if advisory.get("column"):
+            loc += f".{advisory['column']}"
+        lines.append(f"**Location:** `{loc}`")
+    lines.append("")
+    lines.append("### Why")
+    lines.append(advisory["reason"])
+    lines.append("")
+
+    if advisory.get("evidence"):
+        lines.append("### Evidence")
+        for k, v in advisory["evidence"].items():
+            lines.append(f"- **{k}**: {v}")
+        lines.append("")
+
+    if schema_context:
+        ctx_lines = _render_table_context(schema_context, advisory)
+        if ctx_lines:
+            lines.append("### Table context")
+            lines.extend(ctx_lines)
+            lines.append("")
+
+    if advisory.get("fix_sql"):
+        lines.append("### Suggested change")
+        lines.append("```sql")
+        lines.append(advisory["fix_sql"])
+        lines.append("```")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def _render_table_context(schema_context: dict, advisory: dict) -> list[str]:
+    """Render a small context block about the affected table."""
+    tname = advisory.get("table")
+    if not tname:
+        return []
+    tables_by_name = schema_context.get("tables_by_name", {})
+    t = tables_by_name.get(tname)
+    if not t:
+        return []
+
+    lines: list[str] = []
+    lines.append(f"- Table `{tname}` has {len(t.get('columns', []))} columns")
+    pks = [c["name"] for c in t.get("columns", []) if c.get("key_type") == "PK"]
+    fks = [c["name"] for c in t.get("columns", []) if c.get("key_type") == "FK"]
+    if pks:
+        lines.append(f"- Primary key: {', '.join(pks)}")
+    if fks:
+        lines.append(f"- Foreign keys: {', '.join(fks)}")
+
+    # Include related relationships
+    rels = schema_context.get("rels_by_table", {}).get(tname, [])
+    if rels:
+        lines.append("- Relationships:")
+        for r in rels[:5]:
+            lines.append(
+                f"  - `{r['source_table']}.{r['source_column']}` → "
+                f"`{r['target_table']}.{r['target_column']}` "
+                f"({r.get('type', 'n/a')}, {r.get('confidence', 'n/a')})"
+            )
+    return lines
+
+
+def report_to_markdown(
+    report: dict,
+    tables: list[dict],
+    relationships: list[dict],
+) -> str:
+    """Render the full report as a single copy-paste Markdown document.
+
+    Includes summary, scores, schema snapshot, relationship table, and all
+    advisories. Designed for pasting into an external LLM for triage.
+    """
+    counts = report.get("counts", {})
+    scores = report.get("scores", {})
+    stats = report.get("stats", {})
+
+    tables_by_name = {t["name"]: t for t in tables}
+    rels_by_table: dict[str, list[dict]] = {}
+    for r in relationships:
+        rels_by_table.setdefault(r["source_table"], []).append(r)
+        rels_by_table.setdefault(r["target_table"], []).append(r)
+
+    schema_context = {
+        "tables_by_name": tables_by_name,
+        "rels_by_table": rels_by_table,
+    }
+
+    lines: list[str] = []
+    lines.append("# Schema Advisory Report")
+    lines.append("")
+    lines.append(
+        f"Tables: {stats.get('tables', 0)} · "
+        f"Columns: {stats.get('columns', 0)} · "
+        f"Relationships: {stats.get('relationships', 0)}"
+    )
+    lines.append(
+        f"Issues: {counts.get('error', 0)} error, "
+        f"{counts.get('warning', 0)} warning, "
+        f"{counts.get('info', 0)} info"
+    )
+    lines.append("")
+
+    lines.append("## Project context")
+    lines.append(
+        "This schema was inferred from CSV files loaded in the DB Diagram "
+        "Visualizer. Primary keys, foreign keys, and relationships were "
+        "auto-detected from column names, uniqueness, null ratios, and "
+        "value overlap between columns. The user is planning to build a "
+        "production PostgreSQL schema from these CSVs and wants targeted, "
+        "evidence-backed improvement suggestions."
+    )
+    lines.append("")
+
+    lines.append("## Scores (0.0 – 1.0)")
+    lines.append(f"- **Structure**: {scores.get('structure', 'n/a')} (PK coverage)")
+    lines.append(f"- **Type precision**: {scores.get('type_precision', 'n/a')} (enum/bool/text fit)")
+    lines.append(f"- **Relationships**: {scores.get('relationships', 'n/a')} (FK confidence)")
+    lines.append("")
+
+    lines.append("## Detected tables")
+    lines.append("| Table | Cols | PK | FK cols |")
+    lines.append("|-------|------|----|---------|")
+    for t in tables:
+        pks = [c["name"] for c in t.get("columns", []) if c.get("key_type") == "PK"]
+        fks = [c["name"] for c in t.get("columns", []) if c.get("key_type") == "FK"]
+        lines.append(
+            f"| {t['name']} | {len(t.get('columns', []))} | "
+            f"{', '.join(pks) or '—'} | {', '.join(fks) or '—'} |"
+        )
+    lines.append("")
+
+    if relationships:
+        lines.append("## Detected relationships")
+        lines.append("| Source | Target | Type | Confidence |")
+        lines.append("|--------|--------|------|------------|")
+        for r in relationships:
+            lines.append(
+                f"| {r['source_table']}.{r['source_column']} "
+                f"| {r['target_table']}.{r['target_column']} "
+                f"| {r.get('type', 'n/a')} "
+                f"| {r.get('confidence', 'n/a')} |"
+            )
+        lines.append("")
+
+    lines.append("## Advisories")
+    lines.append("")
+    for a in report.get("advisories", []):
+        lines.append(advisory_to_markdown(a, schema_context))
+        lines.append("---")
+        lines.append("")
+
+    lines.append("## How to use this report")
+    lines.append(
+        "Paste this whole document into your LLM chat and ask: "
+        "\"Which 3 advisories should I apply first for the biggest impact?\" "
+        "or \"Rewrite my PostgreSQL DDL applying all warning-level fixes.\" "
+        "Each advisory is self-contained with evidence and suggested SQL."
+    )
+
+    return "\n".join(lines)
+===== END: schema_advisor.py =====
 ===== FILE: schema_builder.py =====
 """Schema builder — data structures and manipulation helpers."""
 
@@ -4966,7 +5692,7 @@ def _suggest_string(
 
     return result
 ===== END: type_mapper.py =====
-===== FILE: .claude\settings.local.json =====
+===== FILE: .claude/settings.local.json =====
 {
   "permissions": {
     "allow": [
@@ -4974,8 +5700,8 @@ def _suggest_string(
     ]
   }
 }
-===== END: .claude\settings.local.json =====
-===== FILE: .claude\rules\canvas-redraw-guarantee.md =====
+===== END: .claude/settings.local.json =====
+===== FILE: .claude/rules/canvas-redraw-guarantee.md =====
 ---
 description: Guarantee that connection lines always redraw when canvas state changes
 globs: ["static/js/**/*.js"]
@@ -5021,8 +5747,8 @@ globs: ["static/js/**/*.js"]
 - Never assume previous line positions are still valid
 - Never draw lines in a module other than connections.js
 - Never store computed line paths in state — they are derived data
-===== END: .claude\rules\canvas-redraw-guarantee.md =====
-===== FILE: .claude\rules\code-style.md =====
+===== END: .claude/rules/canvas-redraw-guarantee.md =====
+===== FILE: .claude/rules/code-style.md =====
 ---
 description: Code style and conventions for the DB Diagram Visualizer
 globs: ["**/*.py", "**/*.js", "**/*.html", "**/*.css"]
@@ -5056,8 +5782,8 @@ globs: ["**/*.py", "**/*.js", "**/*.html", "**/*.css"]
 - Python files: snake_case everywhere
 - CSS: kebab-case for classes
 - Events: camelCase strings (`tableMoved`, `filterChanged`)
-===== END: .claude\rules\code-style.md =====
-===== FILE: .claude\rules\ddl-safety.md =====
+===== END: .claude/rules/code-style.md =====
+===== FILE: .claude/rules/ddl-safety.md =====
 # DDL Safety Guarantee
 
 ## The Safety Rules
@@ -5188,8 +5914,8 @@ DEFAULT values must be validated against the column type:
 - Never trust CHECK or DEFAULT expressions without validation
 - Never generate DDL with unresolved FK targets (referencing tables that don't exist in the schema)
 - Never output partial transactions (BEGIN without COMMIT)
-===== END: .claude\rules\ddl-safety.md =====
-===== FILE: .claude\rules\local-only.md =====
+===== END: .claude/rules/ddl-safety.md =====
+===== FILE: .claude/rules/local-only.md =====
 ---
 description: All files, data, and processing must stay local — no external connections, CDNs, or remote services
 globs: ["**/*.py", "**/*.js", "**/*.html", "**/*.css"]
@@ -5219,8 +5945,8 @@ Before adding any dependency or asset:
 - Does it require a network connection to load? → **Reject it. Find a local alternative.**
 - Does it phone home or send data externally? → **Reject it.**
 - Can it work fully offline? → **Good. Use it.**
-===== END: .claude\rules\local-only.md =====
-===== FILE: .claude\rules\modular-architecture.md =====
+===== END: .claude/rules/local-only.md =====
+===== FILE: .claude/rules/modular-architecture.md =====
 ---
 description: Enforce modular architecture for the DB Diagram Visualizer project
 globs: ["**/*.py", "**/*.js", "**/*.html", "**/*.css"]
@@ -5284,8 +6010,8 @@ globs: ["**/*.py", "**/*.js", "**/*.html", "**/*.css"]
 1. Each module should be testable in isolation.
 2. State changes should be verifiable without rendering.
 3. Backend functions should have unit tests.
-===== END: .claude\rules\modular-architecture.md =====
-===== FILE: .claude\rules\schema-builder-architecture.md =====
+===== END: .claude/rules/modular-architecture.md =====
+===== FILE: .claude/rules/schema-builder-architecture.md =====
 # Schema Builder Architecture
 
 ## Separation from Diagram Page
@@ -5491,8 +6217,8 @@ Same as diagram page:
 - Auto-generate index names: `{table}_{col}_idx`
 - Users can override any auto-generated name
 - All names enforced: snake_case, max 63 chars, no reserved words without warning
-===== END: .claude\rules\schema-builder-architecture.md =====
-===== FILE: .claude\skills\connection-line-manager.md =====
+===== END: .claude/rules/schema-builder-architecture.md =====
+===== FILE: .claude/skills/connection-line-manager.md =====
 # Skill: Connection Line Manager
 
 ## When to Use
@@ -6474,8 +7200,8 @@ function activateTracePath(startTable, endTable) {
 - Assume previous anchor points are still valid after any state change
 - Perform relationship detection in frontend code (backend only)
 - Hard-code column indices instead of looking them up from state
-===== END: .claude\skills\connection-line-manager.md =====
-===== FILE: .claude\skills\db-canvas-engine.md =====
+===== END: .claude/skills/connection-line-manager.md =====
+===== FILE: .claude/skills/db-canvas-engine.md =====
 # Skill: DB Canvas Rendering Engine
 
 ## When to Use
@@ -6922,8 +7648,8 @@ The engine is event-driven. Rendering happens in response to state changes, not 
 
 ### Never assume previous anchor points are still valid
 After ANY state change — even one that seems unrelated — anchor points may have shifted. A filter change can collapse a block; a layout change moves everything. Always recalculate.
-===== END: .claude\skills\db-canvas-engine.md =====
-===== FILE: .claude\skills\db-canvas-ui.md =====
+===== END: .claude/skills/db-canvas-engine.md =====
+===== FILE: .claude/skills/db-canvas-ui.md =====
 # DB Canvas UI & Interaction
 
 Skill for the UI and interaction layer of the database diagram canvas. Covers table block design, user interactions, visual states, typography, colors, layout, and toolbar controls.
@@ -7169,8 +7895,8 @@ Dropdown with options:
 - **PNG** — rasterize current view at 2x resolution.
 - **SVG** — vector export of all visible blocks and lines.
 - **SQL DDL** — generate CREATE TABLE statements from the loaded schema.
-===== END: .claude\skills\db-canvas-ui.md =====
-===== FILE: .claude\skills\db-diagram-designer.md =====
+===== END: .claude/skills/db-canvas-ui.md =====
+===== FILE: .claude/skills/db-diagram-designer.md =====
 # Skill: DB Diagram Designer — System Design and Lifecycle
 
 ## When to Use
@@ -7723,8 +8449,8 @@ The diagram page serves as a **data source** for the PostgreSQL Schema Builder (
 **Data flow**: Diagram page loads CSVs → backend stores in memory → builder page fetches via `/api/table-data` → user maps columns → builder generates DDL + migration SQL.
 
 See skills: `pg-ddl-engine.md`, `pg-builder-ui.md`, `pg-validation.md`, `pg-migration.md`.
-===== END: .claude\skills\db-diagram-designer.md =====
-===== FILE: .claude\skills\db-search-system.md =====
+===== END: .claude/skills/db-diagram-designer.md =====
+===== FILE: .claude/skills/db-search-system.md =====
 # DB Search & Value Trace System
 
 Skill for implementing cross-table value search and data flow tracing in the DB Diagram Visualizer.
@@ -8796,8 +9522,8 @@ Search results integrate with the existing filter system:
 - If both a search and a filter are active, apply both (intersection)
 - Clearing search does not clear user-set filters, and vice versa
 - The filter system reads `searchResults` from state alongside its own filter criteria
-===== END: .claude\skills\db-search-system.md =====
-===== FILE: .claude\skills\frontend-design.md =====
+===== END: .claude/skills/db-search-system.md =====
+===== FILE: .claude/skills/frontend-design.md =====
 # Skill: DB Diagram Frontend Design
 
 ## When to Use
@@ -9071,8 +9797,8 @@ Apply this skill when building or modifying the frontend UI for the DB Diagram V
 
 ### "Fit to View" Button
 - Separate button (magnifying glass with arrows or a "fit" icon) that adjusts zoom and pan so the entire diagram is visible within the viewport with 40px padding on all sides.
-===== END: .claude\skills\frontend-design.md =====
-===== FILE: .claude\skills\frontend-patterns.md =====
+===== END: .claude/skills/frontend-design.md =====
+===== FILE: .claude/skills/frontend-patterns.md =====
 ---
 skill: Frontend Development Patterns for DB Visualizer
 ---
@@ -9220,8 +9946,8 @@ def upload_csv():
         })
     return jsonify({"name": file.filename, "columns": columns})
 ```
-===== END: .claude\skills\frontend-patterns.md =====
-===== FILE: .claude\skills\interactive-filtering.md =====
+===== END: .claude/skills/frontend-patterns.md =====
+===== FILE: .claude/skills/interactive-filtering.md =====
 ---
 Skill name: Interactive Filtering and Connection Highlighting
 
@@ -9266,8 +9992,8 @@ Skill name: Interactive Filtering and Connection Highlighting
    - Canvas listens and triggers full line redraw
    - Block visibility/opacity managed by filter state
    - Selected filters persist in URL hash for sharing
-===== END: .claude\skills\interactive-filtering.md =====
-===== FILE: .claude\skills\pg-builder-ui.md =====
+===== END: .claude/skills/interactive-filtering.md =====
+===== FILE: .claude/skills/pg-builder-ui.md =====
 # Skill: PostgreSQL Schema Builder UI — Page Layout, Editors, and Interactions
 
 ## When to Use
@@ -10029,8 +10755,8 @@ Focus traps inside the dialog. Cancel button gets initial focus. Escape closes.
 ## Undo/Redo
 
 Out of scope for v1. The `isDirty` flag tracks unsaved changes. A full undo stack will be added in v2 once the builder UI is stable.
-===== END: .claude\skills\pg-builder-ui.md =====
-===== FILE: .claude\skills\pg-ddl-engine.md =====
+===== END: .claude/skills/pg-builder-ui.md =====
+===== FILE: .claude/skills/pg-ddl-engine.md =====
 # Skill: PostgreSQL DDL Engine — Types, Constraints, and DDL Generation
 
 ## When to Use
@@ -10739,8 +11465,8 @@ These are the PostgreSQL reserved words most likely to appear as table/column na
 | `values`, `from`, `where`, `having` | `time`, `timestamp`, `interval`, `boolean` |
 
 Full list (700+ words) is in `pg_validator.py` `PG_RESERVED_WORDS` set.
-===== END: .claude\skills\pg-ddl-engine.md =====
-===== FILE: .claude\skills\pg-migration.md =====
+===== END: .claude/skills/pg-ddl-engine.md =====
+===== FILE: .claude/skills/pg-migration.md =====
 # Skill: PostgreSQL Migration Generator — Export Ordering, Data Migration, and Type Conversion
 
 ## When to Use
@@ -11174,8 +11900,8 @@ For re-import and sharing:
   }
 }
 ```
-===== END: .claude\skills\pg-migration.md =====
-===== FILE: .claude\skills\pg-schema-diff.md =====
+===== END: .claude/skills/pg-migration.md =====
+===== FILE: .claude/skills/pg-schema-diff.md =====
 # Skill: PostgreSQL Schema Diff — ALTER Generation and Migration Workflow
 
 ## When to Use
@@ -11708,8 +12434,8 @@ Any DROP operation in the migration output gets flagged with a comment:
 -- WARNING: Destructive operation — data will be lost
 ALTER TABLE "users" DROP COLUMN "old_field";
 ```
-===== END: .claude\skills\pg-schema-diff.md =====
-===== FILE: .claude\skills\pg-sql-import.md =====
+===== END: .claude/skills/pg-schema-diff.md =====
+===== FILE: .claude/skills/pg-sql-import.md =====
 # Skill: PostgreSQL SQL Import — DDL Parsing and Schema Extraction
 
 ## When to Use
@@ -12474,8 +13200,8 @@ The parser handles the **common 90%** of PostgreSQL DDL. These are NOT supported
 | `EXCLUDE` constraints | Skipped | Deferred to v2 |
 
 When a statement is skipped, a warning is added to the result so the user knows what was not imported.
-===== END: .claude\skills\pg-sql-import.md =====
-===== FILE: .claude\skills\pg-validation.md =====
+===== END: .claude/skills/pg-sql-import.md =====
+===== FILE: .claude/skills/pg-validation.md =====
 # Skill: PostgreSQL Schema Validation — Safety, Naming, and Constraint Checks
 
 ## When to Use
@@ -13191,8 +13917,8 @@ def validate_schema(schema: dict) -> list[dict]:
 | `EMPTY_ENUM` | error | Enum has no values |
 | `DUPLICATE_ENUM_VALUE` | error | Enum has duplicate values |
 | `ENUM_VALUE_INJECTION` | error | Dangerous characters in enum value |
-===== END: .claude\skills\pg-validation.md =====
-===== FILE: static\css\builder.css =====
+===== END: .claude/skills/pg-validation.md =====
+===== FILE: static/css/builder.css =====
 /* ============================================
    PostgreSQL Schema Builder Styles
    BEM naming, CSS custom properties, dark mode
@@ -14755,8 +15481,8 @@ body {
   border-color: var(--builder-badge-fk);
   transition: box-shadow 0.3s ease, border-color 0.3s ease;
 }
-===== END: static\css\builder.css =====
-===== FILE: static\css\dark-mode.css =====
+===== END: static/css/builder.css =====
+===== FILE: static/css/dark-mode.css =====
 /* ============================================
    Dark Mode Theme Overrides
    Applied when body has the "dark" class.
@@ -14841,8 +15567,8 @@ body.dark #btn-theme {
   border-color: var(--accent);
   color: var(--accent);
 }
-===== END: static\css\dark-mode.css =====
-===== FILE: static\css\styles.css =====
+===== END: static/css/dark-mode.css =====
+===== FILE: static/css/styles.css =====
 /* ============================================
    CSS Custom Properties
    ============================================ */
@@ -15882,8 +16608,593 @@ ul {
 .table-viewer__badge--pk { background: var(--pk-color); }
 .table-viewer__badge--fk { background: var(--fk-color); }
 .table-viewer__badge--uq { background: var(--uq-color); }
-===== END: static\css\styles.css =====
-===== FILE: static\js\app.js =====
+
+/* ============================================================
+   Schema Advisor Panel
+   ============================================================ */
+
+.advisor-panel {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 480px;
+  max-width: 90vw;
+  background: var(--bg-white);
+  border-left: 1px solid var(--border-color);
+  box-shadow: -4px 0 16px rgba(0, 0, 0, 0.08);
+  z-index: 1000;
+  transform: translateX(100%);
+  transition: transform 0.22s ease-out;
+  display: flex;
+  flex-direction: column;
+  font-size: 13px;
+}
+
+.advisor-panel--open {
+  transform: translateX(0);
+}
+
+.advisor-panel__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-header);
+  flex-shrink: 0;
+}
+
+.advisor-panel__title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.advisor-panel__actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.advisor-panel__close {
+  background: transparent;
+  border: none;
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+  color: #6b7280;
+  padding: 0 6px;
+}
+
+.advisor-panel__close:hover { color: #111; }
+
+.advisor-panel__summary {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-header);
+  flex-shrink: 0;
+}
+
+.advisor-panel__body {
+  overflow-y: auto;
+  padding: 12px 16px;
+  flex: 1;
+}
+
+.advisor-counts {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 6px;
+  font-weight: 600;
+  font-size: 12px;
+}
+
+.advisor-count--error { color: #dc2626; }
+.advisor-count--warning { color: #d97706; }
+.advisor-count--info { color: #2563eb; }
+
+.advisor-stats {
+  font-size: 11px;
+  color: #6b7280;
+  margin-bottom: 10px;
+}
+
+.advisor-scores {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.advisor-score {
+  display: grid;
+  grid-template-columns: 110px 1fr 40px;
+  gap: 8px;
+  align-items: center;
+  font-size: 11px;
+}
+
+.advisor-score__label { color: #374151; }
+
+.advisor-score__bar {
+  height: 6px;
+  background: #e5e7eb;
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.advisor-score__fill {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.2s;
+}
+
+.advisor-score__fill--good { background: #10b981; }
+.advisor-score__fill--ok { background: #f59e0b; }
+.advisor-score__fill--bad { background: #ef4444; }
+
+.advisor-score__value {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  color: #6b7280;
+}
+
+.advisor-empty {
+  text-align: center;
+  color: #6b7280;
+  padding: 32px 16px;
+  font-size: 13px;
+}
+
+.advisor-empty--ok { color: #065f46; }
+.advisor-empty--error { color: #b91c1c; }
+
+.advisor-card {
+  border: 1px solid var(--border-color);
+  border-left-width: 4px;
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+  background: var(--bg-white);
+}
+
+.advisor-card--error { border-left-color: #dc2626; }
+.advisor-card--warning { border-left-color: #d97706; }
+.advisor-card--info { border-left-color: #2563eb; }
+
+.advisor-card__header {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  margin-bottom: 6px;
+}
+
+.advisor-card__icon {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: bold;
+  color: #fff;
+  background: #9ca3af;
+}
+
+.advisor-card--error .advisor-card__icon { background: #dc2626; }
+.advisor-card--warning .advisor-card__icon { background: #d97706; }
+.advisor-card--info .advisor-card__icon { background: #2563eb; }
+
+.advisor-card__title { flex: 1; min-width: 0; }
+
+.advisor-card__name {
+  font-weight: 600;
+  font-size: 13px;
+  color: #111827;
+}
+
+.advisor-card__location {
+  font-size: 11px;
+  color: #6b7280;
+  margin-top: 2px;
+}
+
+.advisor-card__location code {
+  background: transparent;
+  padding: 0;
+}
+
+.advisor-card__reason {
+  margin: 4px 0 8px;
+  color: #374151;
+  line-height: 1.4;
+  font-size: 12px;
+}
+
+.advisor-card__evidence {
+  margin: 6px 0;
+  font-size: 11px;
+  color: #4b5563;
+}
+
+.advisor-card__evidence summary {
+  cursor: pointer;
+  color: #6b7280;
+  user-select: none;
+}
+
+.advisor-card__evidence ul {
+  margin: 4px 0 0 0;
+  padding-left: 16px;
+}
+
+.advisor-card__sql {
+  background: #f9fafb;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  padding: 8px 10px;
+  font-size: 11px;
+  overflow-x: auto;
+  margin: 8px 0;
+  line-height: 1.4;
+  font-family: 'SF Mono', Monaco, Consolas, monospace;
+}
+
+.advisor-card__actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.advisor-btn {
+  padding: 5px 10px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-white);
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  color: #111827;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.advisor-btn:hover {
+  background: var(--bg-selected);
+  border-color: var(--accent);
+  color: var(--accent-dark);
+}
+
+.advisor-btn--secondary {
+  background: var(--bg-header);
+}
+
+/* Dark mode support */
+body.dark .advisor-panel {
+  background: #1f2937;
+  border-left-color: #374151;
+  color: #e5e7eb;
+}
+
+body.dark .advisor-panel__header,
+body.dark .advisor-panel__summary {
+  background: #111827;
+  border-bottom-color: #374151;
+}
+
+body.dark .advisor-panel__title { color: #f3f4f6; }
+body.dark .advisor-card { background: #111827; border-color: #374151; }
+body.dark .advisor-card__name { color: #f3f4f6; }
+body.dark .advisor-card__reason { color: #d1d5db; }
+body.dark .advisor-card__sql { background: #0f172a; border-color: #374151; color: #e5e7eb; }
+body.dark .advisor-btn { background: #1f2937; border-color: #374151; color: #e5e7eb; }
+body.dark .advisor-btn:hover { background: #374151; border-color: #60a5fa; color: #dbeafe; }
+body.dark .advisor-score__bar { background: #374151; }
+body.dark .advisor-score__label { color: #d1d5db; }
+body.dark .advisor-empty { color: #9ca3af; }
+===== END: static/css/styles.css =====
+===== FILE: static/js/advisor.js =====
+/**
+ * advisor.js — Schema advisor UI for the diagram page.
+ *
+ * Fetches deterministic advisories from /api/analyze-schema (computed from
+ * loaded CSV tables + detected relationships) and renders them in a
+ * slide-out panel with copy-to-clipboard buttons so users can paste
+ * suggestions into any external LLM.
+ */
+
+import { escapeHtml } from './utils.js';
+
+const PANEL_ID = 'advisor-panel';
+const OPEN_CLASS = 'advisor-panel--open';
+
+let currentReport = null;
+
+const SEVERITY_LABEL = {
+  error: 'error',
+  warning: 'warning',
+  info: 'info',
+};
+
+const SEVERITY_ICON = {
+  error: '\u2716',
+  warning: '\u26A0',
+  info: 'i',
+};
+
+// ---- Init ----
+
+export function initAdvisor() {
+  const btn = document.getElementById('btn-advisor');
+  if (btn) btn.addEventListener('click', openPanel);
+
+  const panel = ensurePanel();
+  panel.addEventListener('click', onPanelClick);
+
+  // Close on Escape
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && panel.classList.contains(OPEN_CLASS)) {
+      closePanel();
+    }
+  });
+}
+
+// ---- Panel open/close/refresh ----
+
+async function openPanel() {
+  const panel = ensurePanel();
+  panel.classList.add(OPEN_CLASS);
+  panel.setAttribute('aria-hidden', 'false');
+  await refresh();
+}
+
+function closePanel() {
+  const panel = document.getElementById(PANEL_ID);
+  if (!panel) return;
+  panel.classList.remove(OPEN_CLASS);
+  panel.setAttribute('aria-hidden', 'true');
+}
+
+async function refresh() {
+  const body = document.getElementById('advisor-panel-body');
+  if (!body) return;
+  body.innerHTML = '<div class="advisor-empty">Analyzing schema…</div>';
+
+  try {
+    const resp = await fetch('/api/analyze-schema', { method: 'POST' });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    currentReport = await resp.json();
+    renderReport(currentReport);
+  } catch (err) {
+    body.innerHTML = `<div class="advisor-empty advisor-empty--error">Failed to analyze: ${escapeHtml(String(err))}</div>`;
+  }
+}
+
+// ---- Rendering ----
+
+function renderReport(report) {
+  const body = document.getElementById('advisor-panel-body');
+  const summary = document.getElementById('advisor-summary');
+  if (!body || !summary) return;
+
+  const counts = report.counts || { error: 0, warning: 0, info: 0 };
+  const scores = report.scores || {};
+  const stats = report.stats || {};
+
+  summary.innerHTML = `
+    <div class="advisor-counts">
+      <span class="advisor-count advisor-count--error">${counts.error || 0} errors</span>
+      <span class="advisor-count advisor-count--warning">${counts.warning || 0} warnings</span>
+      <span class="advisor-count advisor-count--info">${counts.info || 0} info</span>
+    </div>
+    <div class="advisor-stats">
+      ${stats.tables || 0} tables · ${stats.columns || 0} columns · ${stats.relationships || 0} relationships
+    </div>
+    <div class="advisor-scores">
+      ${renderScoreBar('Structure', scores.structure)}
+      ${renderScoreBar('Type precision', scores.type_precision)}
+      ${renderScoreBar('Relationships', scores.relationships)}
+    </div>
+  `;
+
+  const advisories = report.advisories || [];
+  if (advisories.length === 0) {
+    body.innerHTML = `
+      <div class="advisor-empty advisor-empty--ok">
+        No improvements suggested. Load CSVs on the diagram page first, or
+        your schema already passes every rule.
+      </div>
+    `;
+    return;
+  }
+
+  const sorted = [...advisories].sort((a, b) => {
+    const order = { error: 0, warning: 1, info: 2 };
+    return (order[a.severity] ?? 3) - (order[b.severity] ?? 3);
+  });
+
+  body.innerHTML = sorted.map((a, idx) => renderCard(a, idx)).join('');
+}
+
+function renderScoreBar(label, value) {
+  const pct = typeof value === 'number' ? Math.round(value * 100) : 0;
+  const color = pct >= 80 ? 'good' : pct >= 50 ? 'ok' : 'bad';
+  return `
+    <div class="advisor-score">
+      <span class="advisor-score__label">${escapeHtml(label)}</span>
+      <div class="advisor-score__bar">
+        <div class="advisor-score__fill advisor-score__fill--${color}" style="width:${pct}%"></div>
+      </div>
+      <span class="advisor-score__value">${pct}%</span>
+    </div>
+  `;
+}
+
+function renderCard(a, idx) {
+  const sev = a.severity || 'info';
+  const icon = SEVERITY_ICON[sev] || SEVERITY_ICON.info;
+  const loc = buildLocation(a);
+
+  const evidenceHtml = a.evidence
+    ? `<details class="advisor-card__evidence">
+         <summary>Evidence</summary>
+         <ul>${Object.entries(a.evidence).map(
+           ([k, v]) => `<li><strong>${escapeHtml(k)}:</strong> ${escapeHtml(formatEvidenceValue(v))}</li>`,
+         ).join('')}</ul>
+       </details>`
+    : '';
+
+  const fixHtml = a.fix_sql
+    ? `<pre class="advisor-card__sql"><code>${escapeHtml(a.fix_sql)}</code></pre>`
+    : '';
+
+  return `
+    <article class="advisor-card advisor-card--${sev}" data-idx="${idx}">
+      <header class="advisor-card__header">
+        <span class="advisor-card__icon" aria-label="${escapeHtml(SEVERITY_LABEL[sev])}">${icon}</span>
+        <div class="advisor-card__title">
+          <div class="advisor-card__name">${escapeHtml(a.title || a.rule)}</div>
+          ${loc ? `<div class="advisor-card__location"><code>${escapeHtml(loc)}</code></div>` : ''}
+        </div>
+      </header>
+      <p class="advisor-card__reason">${escapeHtml(a.reason || '')}</p>
+      ${evidenceHtml}
+      ${fixHtml}
+      <div class="advisor-card__actions">
+        <button class="advisor-btn" data-action="copy-card" data-idx="${idx}">Copy for LLM</button>
+        ${a.fix_sql ? '<button class="advisor-btn advisor-btn--secondary" data-action="copy-sql" data-idx="' + idx + '">Copy SQL</button>' : ''}
+      </div>
+    </article>
+  `;
+}
+
+function buildLocation(a) {
+  if (a.table && a.column) return `${a.table}.${a.column}`;
+  return a.table || '';
+}
+
+function formatEvidenceValue(v) {
+  if (Array.isArray(v)) return v.join(', ');
+  if (v === null || v === undefined) return '—';
+  return String(v);
+}
+
+// ---- Click handlers ----
+
+function onPanelClick(e) {
+  const target = e.target;
+  if (!(target instanceof HTMLElement)) return;
+
+  if (target.dataset.action === 'close') {
+    closePanel();
+    return;
+  }
+  if (target.dataset.action === 'refresh') {
+    refresh();
+    return;
+  }
+  if (target.dataset.action === 'copy-report') {
+    copyFullReport();
+    return;
+  }
+  if (target.dataset.action === 'copy-card') {
+    const idx = parseInt(target.dataset.idx, 10);
+    copySingleAdvisory(idx);
+    return;
+  }
+  if (target.dataset.action === 'copy-sql') {
+    const idx = parseInt(target.dataset.idx, 10);
+    copyAdvisorySql(idx);
+    return;
+  }
+}
+
+// ---- Copy-to-clipboard flows ----
+
+async function copyFullReport() {
+  if (!currentReport || !currentReport.markdown) {
+    flashToast('Nothing to copy yet');
+    return;
+  }
+  await writeClipboard(currentReport.markdown, 'Report copied — paste into your LLM');
+}
+
+async function copySingleAdvisory(idx) {
+  const advisory = (currentReport?.advisories || [])[idx];
+  if (!advisory) return;
+  try {
+    const resp = await fetch('/api/advisory-markdown', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ advisory }),
+    });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const data = await resp.json();
+    await writeClipboard(data.markdown || '', 'Advisory copied — paste into your LLM');
+  } catch {
+    flashToast('Copy failed');
+  }
+}
+
+async function copyAdvisorySql(idx) {
+  const advisory = (currentReport?.advisories || [])[idx];
+  if (!advisory?.fix_sql) return;
+  await writeClipboard(advisory.fix_sql, 'SQL copied');
+}
+
+async function writeClipboard(text, successMsg) {
+  try {
+    await navigator.clipboard.writeText(text);
+    flashToast(successMsg);
+  } catch {
+    flashToast('Clipboard write failed');
+  }
+}
+
+function flashToast(msg) {
+  const toast = document.getElementById('toast');
+  const msgEl = document.getElementById('toast-message');
+  if (!toast || !msgEl) return;
+  msgEl.textContent = msg;
+  toast.hidden = false;
+  toast.classList.add('toast--visible');
+  setTimeout(() => {
+    toast.classList.remove('toast--visible');
+    toast.hidden = true;
+  }, 2200);
+}
+
+// ---- DOM scaffolding ----
+
+function ensurePanel() {
+  let panel = document.getElementById(PANEL_ID);
+  if (panel) return panel;
+
+  panel = document.createElement('aside');
+  panel.id = PANEL_ID;
+  panel.className = 'advisor-panel';
+  panel.setAttribute('aria-hidden', 'true');
+  panel.setAttribute('aria-label', 'Schema advisor');
+  panel.innerHTML = `
+    <header class="advisor-panel__header">
+      <h2 class="advisor-panel__title">Schema Advisor</h2>
+      <div class="advisor-panel__actions">
+        <button class="advisor-btn" data-action="copy-report" title="Copy full report for LLM">Copy full report</button>
+        <button class="advisor-btn advisor-btn--secondary" data-action="refresh" title="Re-run analysis">Refresh</button>
+        <button class="advisor-panel__close" data-action="close" aria-label="Close">&times;</button>
+      </div>
+    </header>
+    <section class="advisor-panel__summary" id="advisor-summary"></section>
+    <section class="advisor-panel__body" id="advisor-panel-body">
+      <div class="advisor-empty">Click "Advisor" in the toolbar to scan your loaded tables.</div>
+    </section>
+  `;
+  document.body.appendChild(panel);
+  return panel;
+}
+===== END: static/js/advisor.js =====
+===== FILE: static/js/app.js =====
 /**
  * app.js — Main orchestrator for the DB Diagram Visualizer.
  * Wires canvas interactions, toolbar, keyboard shortcuts, and event-driven rendering.
@@ -15902,6 +17213,7 @@ import { initFilters } from './filters.js';
 import { initExport } from './export.js';
 import { initTableViewer } from './table-viewer.js';
 import { initTheme } from './theme.js';
+import { initAdvisor } from './advisor.js';
 
 // ---- Interaction state (not application state) ----
 
@@ -16391,6 +17703,7 @@ function init() {
   initFilters();
   initExport();
   initTableViewer();
+  initAdvisor();
   wireEventSubscriptions();
   wireCanvasEvents();
   wireToolbar();
@@ -16446,8 +17759,8 @@ function wireSidebarCollapseToggles() {
     });
   });
 }
-===== END: static\js\app.js =====
-===== FILE: static\js\blocks.js =====
+===== END: static/js/app.js =====
+===== FILE: static/js/blocks.js =====
 /**
  * blocks.js — Table Block Rendering
  * Draws table blocks (header, columns, keys, badges) on the canvas.
@@ -16890,8 +18203,8 @@ export function getBlockAtPoint(canvasX, canvasY) {
 
   return null;
 }
-===== END: static\js\blocks.js =====
-===== FILE: static\js\canvas.js =====
+===== END: static/js/blocks.js =====
+===== FILE: static/js/canvas.js =====
 /**
  * canvas.js — Canvas Rendering Engine
  * Manages the HTML5 canvas element, viewport transforms, coordinate conversion,
@@ -17057,8 +18370,8 @@ function handleResize() {
   resizeToContainer();
   EventBus.emit('viewportChanged', getViewport());
 }
-===== END: static\js\canvas.js =====
-===== FILE: static\js\connections.js =====
+===== END: static/js/canvas.js =====
+===== FILE: static/js/connections.js =====
 /**
  * connections.js — THE IRON RULE Module
  * Connection lines MUST be fully recalculated and redrawn on every state change.
@@ -17526,8 +18839,8 @@ function isPointNearBezier(point, p0, p1, p2, p3) {
 
 // Event subscriptions removed — app.js render() pipeline calls redrawAll() directly.
 // This avoids double-rendering (connections drawn twice per event).
-===== END: static\js\connections.js =====
-===== FILE: static\js\constants.js =====
+===== END: static/js/connections.js =====
+===== FILE: static/js/constants.js =====
 /**
  * constants.js — Shared constants for the DB Diagram Visualizer.
  * Single source of truth for layout dimensions, colors, and theme values.
@@ -17634,8 +18947,8 @@ export function calculateBlockHeight(table, collapsed) {
   if (collapsed) return HEADER_HEIGHT;
   return HEADER_HEIGHT + table.columns.length * ROW_HEIGHT;
 }
-===== END: static\js\constants.js =====
-===== FILE: static\js\csv-import.js =====
+===== END: static/js/constants.js =====
+===== FILE: static/js/csv-import.js =====
 /**
  * csv-import.js — CSV file upload and drag-and-drop handling.
  * Sends files to backend, processes response, adds tables to state.
@@ -17924,8 +19237,8 @@ function showMetadataToggle() {
 
 // Re-render sidebar when tables change
 EventBus.on('tableRemoved', updateSidebarTableList);
-===== END: static\js\csv-import.js =====
-===== FILE: static\js\events.js =====
+===== END: static/js/csv-import.js =====
+===== FILE: static/js/events.js =====
 /**
  * EventBus — Simple pub/sub system for inter-module communication.
  * All module communication flows through this bus.
@@ -17979,8 +19292,8 @@ export const EventBus = {
  * traceStarted, traceResultsReady,
  * panToTable, stateChanged
  */
-===== END: static\js\events.js =====
-===== FILE: static\js\export.js =====
+===== END: static/js/events.js =====
+===== FILE: static/js/export.js =====
 /**
  * export.js — Diagram export (PNG, JSON).
  */
@@ -18068,8 +19381,8 @@ function downloadBlob(blob, filename) {
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
 }
-===== END: static\js\export.js =====
-===== FILE: static\js\filters.js =====
+===== END: static/js/export.js =====
+===== FILE: static/js/filters.js =====
 /**
  * filters.js — Interactive filter panel for key types, relationship types, and tables.
  * Filters update state.activeFilters, triggering connection/block re-rendering.
@@ -18216,8 +19529,8 @@ function applyCurrentFilters(panel) {
 
   State.setActiveFilters(filters);
 }
-===== END: static\js\filters.js =====
-===== FILE: static\js\layout.js =====
+===== END: static/js/filters.js =====
+===== FILE: static/js/layout.js =====
 /**
  * layout.js — Layout algorithms and animated transitions.
  * Each algorithm returns a position map { tableName: {x, y} }.
@@ -18543,8 +19856,8 @@ function getBlockWidth(table, positions, name) {
   return calculateBlockWidth(table);
 }
 
-===== END: static\js\layout.js =====
-===== FILE: static\js\search.js =====
+===== END: static/js/layout.js =====
+===== FILE: static/js/search.js =====
 /**
  * search.js — Cross-table value search UI.
  * Debounced search input, results panel, click-to-pan.
@@ -18661,8 +19974,8 @@ function groupByTable(matches) {
   return groups;
 }
 
-===== END: static\js\search.js =====
-===== FILE: static\js\state.js =====
+===== END: static/js/search.js =====
+===== FILE: static/js/state.js =====
 /**
  * state.js — Central State Store
  * Single source of truth for the entire application.
@@ -18907,8 +20220,8 @@ export const importState = (data) => {
   });
   emitChange('stateReset', null, 'all');
 };
-===== END: static\js\state.js =====
-===== FILE: static\js\table-viewer.js =====
+===== END: static/js/state.js =====
+===== FILE: static/js/table-viewer.js =====
 /**
  * table-viewer.js — Modal popup showing table data in an Excel-like grid.
  * Clicking a cell value triggers a trace across FK relationships.
@@ -19021,8 +20334,8 @@ function closeViewer() {
     modalEl = null;
   }
 }
-===== END: static\js\table-viewer.js =====
-===== FILE: static\js\theme.js =====
+===== END: static/js/table-viewer.js =====
+===== FILE: static/js/theme.js =====
 /**
  * theme.js — Dark/light theme toggle.
  * Manages body.dark class, swaps canvas color constants,
@@ -19064,8 +20377,8 @@ function wireToggle() {
   if (!btn) return;
   btn.addEventListener('click', toggleTheme);
 }
-===== END: static\js\theme.js =====
-===== FILE: static\js\trace.js =====
+===== END: static/js/theme.js =====
+===== FILE: static/js/trace.js =====
 /**
  * trace.js — Value tracing across FK relationships.
  * Triggered by per-result trace buttons in search.js.
@@ -19132,8 +20445,8 @@ function renderTracePath(trace) {
   });
 }
 
-===== END: static\js\trace.js =====
-===== FILE: static\js\utils.js =====
+===== END: static/js/trace.js =====
+===== FILE: static/js/utils.js =====
 /**
  * utils.js — Shared utility functions.
  */
@@ -19145,8 +20458,8 @@ export function escapeHtml(str) {
   _escDiv.textContent = String(str);
   return _escDiv.innerHTML;
 }
-===== END: static\js\utils.js =====
-===== FILE: static\js\builder\builder-app.js =====
+===== END: static/js/utils.js =====
+===== FILE: static/js/builder/builder-app.js =====
 /**
  * builder-app.js — Orchestrator for the PostgreSQL Schema Builder page.
  * Initializes modules, wires events, owns the render cycle.
@@ -19366,8 +20679,8 @@ if (document.readyState === 'loading') {
 } else {
   init();
 }
-===== END: static\js\builder\builder-app.js =====
-===== FILE: static\js\builder\builder-connections.js =====
+===== END: static/js/builder/builder-app.js =====
+===== FILE: static/js/builder/builder-connections.js =====
 /**
  * builder-connections.js — Pure canvas drawing helpers for FK connection lines.
  * Stateless functions used by builder-map.js. No DOM, no state imports.
@@ -19459,8 +20772,8 @@ export function drawCrowFoot(ctx, anchor, color) {
   ctx.lineCap = 'round';
   ctx.stroke();
 }
-===== END: static\js\builder\builder-connections.js =====
-===== FILE: static\js\builder\builder-constants.js =====
+===== END: static/js/builder/builder-connections.js =====
+===== FILE: static/js/builder/builder-constants.js =====
 /**
  * builder-constants.js — PG type catalog, constraint options, builder colors.
  */
@@ -19679,8 +20992,8 @@ export const DEFAULT_TABLE = {
   comment: null,
   ifNotExists: false,
 };
-===== END: static\js\builder\builder-constants.js =====
-===== FILE: static\js\builder\builder-editors.js =====
+===== END: static/js/builder/builder-constants.js =====
+===== FILE: static/js/builder/builder-editors.js =====
 /**
  * builder-editors.js — Table editor + column editor modal UI.
  */
@@ -20379,8 +21692,8 @@ export function showToast(message) {
     toast.classList.remove('builder-toast--visible');
   }, 2000);
 }
-===== END: static\js\builder\builder-editors.js =====
-===== FILE: static\js\builder\builder-map.js =====
+===== END: static/js/builder/builder-editors.js =====
+===== FILE: static/js/builder/builder-map.js =====
 /**
  * builder-map.js — Canvas-based relationship map for the builder output panel.
  * Renders simplified table boxes with FK connection lines.
@@ -20921,8 +22234,8 @@ function roundRect(ctx, x, y, w, h, r) {
   ctx.arcTo(x, y, x + r, y, r);
   ctx.closePath();
 }
-===== END: static\js\builder\builder-map.js =====
-===== FILE: static\js\builder\builder-output.js =====
+===== END: static/js/builder/builder-map.js =====
+===== FILE: static/js/builder/builder-output.js =====
 /**
  * builder-output.js — DDL preview panel (right) + export controls.
  * DDL preview and validation errors are derived data, NOT stored in state.
@@ -21180,8 +22493,8 @@ function downloadFile(content, filename, mimeType) {
   URL.revokeObjectURL(url);
   showToast(`Exported ${filename}`);
 }
-===== END: static\js\builder\builder-output.js =====
-===== FILE: static\js\builder\builder-panels.js =====
+===== END: static/js/builder/builder-output.js =====
+===== FILE: static/js/builder/builder-panels.js =====
 /**
  * builder-panels.js — Source panel (left) + target panel (center) rendering.
  */
@@ -21804,8 +23117,8 @@ export function initPanels() {
     addEnum({ name, values: ['value_1', 'value_2'] });
   });
 }
-===== END: static\js\builder\builder-panels.js =====
-===== FILE: static\js\builder\builder-pickers.js =====
+===== END: static/js/builder/builder-panels.js =====
+===== FILE: static/js/builder/builder-pickers.js =====
 /**
  * builder-pickers.js — Type selector dropdown + constraint picker + index picker UI.
  */
@@ -22115,8 +23428,8 @@ function openIndexPicker({ tableName }) {
     unique: false,
   });
 }
-===== END: static\js\builder\builder-pickers.js =====
-===== FILE: static\js\builder\builder-relationships.js =====
+===== END: static/js/builder/builder-pickers.js =====
+===== FILE: static/js/builder/builder-relationships.js =====
 /**
  * builder-relationships.js — FK relationship wiring between target tables.
  * Handles source column drops onto target tables for source mapping.
@@ -22204,8 +23517,8 @@ async function suggestType(sourceTable, sourceColumn, targetTable, targetColumn)
     // Silent failure — type remains 'text'
   }
 }
-===== END: static\js\builder\builder-relationships.js =====
-===== FILE: static\js\builder\builder-state.js =====
+===== END: static/js/builder/builder-relationships.js =====
+===== FILE: static/js/builder/builder-state.js =====
 /**
  * builder-state.js — Single source of truth for builder schema state.
  * All mutations go through exported functions. Every mutation emits builderStateChanged.
@@ -22421,8 +23734,8 @@ export function clearActiveEditor() {
   state.activeEditor = null;
   EventBus.emit('builderStateChanged', { key: 'activeEditor' });
 }
-===== END: static\js\builder\builder-state.js =====
-===== FILE: templates\builder.html =====
+===== END: static/js/builder/builder-state.js =====
+===== FILE: templates/builder.html =====
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -22630,8 +23943,8 @@ export function clearActiveEditor() {
   <script type="module" src="{{ url_for('static', filename='js/builder/builder-app.js') }}"></script>
 </body>
 </html>
-===== END: templates\builder.html =====
-===== FILE: templates\index.html =====
+===== END: templates/builder.html =====
+===== FILE: templates/index.html =====
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -22747,6 +24060,7 @@ export function clearActiveEditor() {
           <div class="toolbar__dropdown">
             <button class="toolbar__btn" id="btn-export">Export</button>
           </div>
+          <button class="toolbar__btn" id="btn-advisor" title="Analyze loaded schema for improvements">Advisor</button>
           <a href="/builder" class="toolbar__btn" id="btn-builder" title="Open PostgreSQL Schema Builder">Builder</a>
           <button class="toolbar__btn toolbar__btn--icon" id="btn-theme" title="Toggle dark mode">&#9790;</button>
         </div>
@@ -22817,4 +24131,4 @@ export function clearActiveEditor() {
   <script type="module" src="{{ url_for('static', filename='js/app.js') }}"></script>
 </body>
 </html>
-===== END: templates\index.html =====
+===== END: templates/index.html =====

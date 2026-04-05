@@ -17,6 +17,7 @@ from metadata_parser import (
     build_metadata_relationships,
 )
 from relationship_analyzer import detect_relationships
+from schema_advisor import analyze_designer_schema, report_to_markdown, advisory_to_markdown
 from search import search_all_tables
 from trace import trace_value
 from builder_routes import builder_bp
@@ -304,6 +305,61 @@ def column_values():
     values = df[column].dropna().unique()
     values_list = [str(v) for v in values[:100]]
     return jsonify({"table": table, "column": column, "values": values_list})
+
+
+@app.route("/api/analyze-schema", methods=["POST"])
+def analyze_schema():
+    """Run the schema advisor over loaded CSV tables and detected relationships.
+
+    Returns:
+        advisories — list of improvement suggestions with fix SQL
+        counts — {error, warning, info} tallies
+        scores — {structure, type_precision, relationships} 0.0-1.0
+        stats  — {tables, columns, relationships}
+        markdown — full LLM-friendly copy-paste report
+    """
+    if not loaded_tables:
+        return jsonify({
+            "advisories": [],
+            "counts": {"error": 0, "warning": 0, "info": 0},
+            "scores": {"structure": 1.0, "type_precision": 1.0, "relationships": 1.0},
+            "stats": {"tables": 0, "columns": 0, "relationships": 0},
+            "markdown": "",
+        })
+
+    tables = list(loaded_tables.values())
+    report = analyze_designer_schema(
+        tables,
+        loaded_dataframes,
+        detected_relationships,
+    )
+    report["markdown"] = report_to_markdown(report, tables, detected_relationships)
+    return jsonify(report)
+
+
+@app.route("/api/advisory-markdown", methods=["POST"])
+def advisory_markdown():
+    """Render a single advisory as standalone Markdown for copy-paste.
+
+    Expects JSON body: {advisory: {...}}. Uses current loaded state to
+    attach table context.
+    """
+    data = request.get_json(silent=True) or {}
+    advisory = data.get("advisory")
+    if not advisory:
+        return jsonify({"error": "advisory is required"}), 400
+
+    tables_by_name = dict(loaded_tables)
+    rels_by_table: dict[str, list[dict]] = {}
+    for r in detected_relationships:
+        rels_by_table.setdefault(r["source_table"], []).append(r)
+        rels_by_table.setdefault(r["target_table"], []).append(r)
+
+    md = advisory_to_markdown(advisory, {
+        "tables_by_name": tables_by_name,
+        "rels_by_table": rels_by_table,
+    })
+    return jsonify({"markdown": md})
 
 
 @app.route("/api/debug-table")

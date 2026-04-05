@@ -16,6 +16,7 @@ import { initFilters } from './filters.js';
 import { initExport } from './export.js';
 import { initTableViewer } from './table-viewer.js';
 import { initTheme } from './theme.js';
+import { initAdvisor } from './advisor.js';
 
 // ---- Interaction state (not application state) ----
 
@@ -505,6 +506,7 @@ function init() {
   initFilters();
   initExport();
   initTableViewer();
+  initAdvisor();
   wireEventSubscriptions();
   wireCanvasEvents();
   wireToolbar();
