@@ -173,7 +173,157 @@ function renderActiveTab() {
     content.innerHTML = renderDecisionsTable(currentResult.decisions || []);
   } else if (activeTab === 'flags') {
     content.innerHTML = renderFlagsTable(currentResult.flags || []);
+  } else if (activeTab === 'viz') {
+    content.innerHTML = renderVisualization(currentResult.schema || { tables: [], enums: [] });
   }
+}
+
+// Visualization constants
+const VIZ_CARD_WIDTH = 240;
+const VIZ_ROW_HEIGHT = 22;
+const VIZ_HEADER_HEIGHT = 34;
+const VIZ_CARD_PADDING = 10;
+const VIZ_GAP_X = 60;
+const VIZ_GAP_Y = 50;
+const VIZ_COLS = 3;
+const VIZ_MARGIN = 30;
+
+function renderVisualization(schema) {
+  const tables = schema.tables || [];
+  if (tables.length === 0) {
+    return '<div class="rebuilder-empty">No tables to visualize.</div>';
+  }
+  const positions = computeVizLayout(tables);
+  const anchors = computeVizAnchors(tables, positions);
+  const fks = collectVizFKs(tables);
+  const canvasW = VIZ_COLS * VIZ_CARD_WIDTH + (VIZ_COLS - 1) * VIZ_GAP_X + VIZ_MARGIN * 2;
+  const lastRow = Math.floor((tables.length - 1) / VIZ_COLS);
+  const canvasH = (lastRow + 1) * (maxRowHeight(tables, positions, lastRow) + VIZ_GAP_Y) + VIZ_MARGIN;
+
+  const linesSvg = fks.map(fk => renderVizLine(fk, anchors)).filter(Boolean).join('');
+  const cards = tables.map(t => renderVizCard(t, positions.get(t.name))).join('');
+
+  return `
+    <div class="rebuilder-viz" style="width:${canvasW}px;height:${canvasH}px;">
+      <svg class="rebuilder-viz__lines" width="${canvasW}" height="${canvasH}">
+        <defs>
+          <marker id="viz-arrow" viewBox="0 0 10 10" refX="9" refY="5"
+                  markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M0,0 L10,5 L0,10 z" fill="#6366f1"/>
+          </marker>
+        </defs>
+        ${linesSvg}
+      </svg>
+      ${cards}
+    </div>
+  `;
+}
+
+function computeVizLayout(tables) {
+  const positions = new Map();
+  let rowTops = [VIZ_MARGIN];
+  let rowMax = 0;
+  tables.forEach((t, i) => {
+    const row = Math.floor(i / VIZ_COLS);
+    const col = i % VIZ_COLS;
+    if (col === 0 && row > 0) {
+      rowTops.push(rowTops[row - 1] + rowMax + VIZ_GAP_Y);
+      rowMax = 0;
+    }
+    const height = cardHeight(t);
+    if (height > rowMax) rowMax = height;
+    const x = VIZ_MARGIN + col * (VIZ_CARD_WIDTH + VIZ_GAP_X);
+    const y = rowTops[row];
+    positions.set(t.name, { x, y, w: VIZ_CARD_WIDTH, h: height });
+  });
+  return positions;
+}
+
+function maxRowHeight(tables, positions, row) {
+  let max = 0;
+  for (let i = row * VIZ_COLS; i < Math.min(tables.length, (row + 1) * VIZ_COLS); i++) {
+    const p = positions.get(tables[i].name);
+    if (p && p.h > max) max = p.h;
+  }
+  return max || VIZ_HEADER_HEIGHT;
+}
+
+function cardHeight(table) {
+  const cols = (table.columns || []).length;
+  return VIZ_HEADER_HEIGHT + cols * VIZ_ROW_HEIGHT + VIZ_CARD_PADDING * 2;
+}
+
+function computeVizAnchors(tables, positions) {
+  const anchors = new Map();
+  tables.forEach(t => {
+    const pos = positions.get(t.name);
+    if (!pos) return;
+    const colAnchors = new Map();
+    (t.columns || []).forEach((c, i) => {
+      const y = pos.y + VIZ_HEADER_HEIGHT + VIZ_CARD_PADDING + i * VIZ_ROW_HEIGHT + VIZ_ROW_HEIGHT / 2;
+      colAnchors.set(c.name, { left: pos.x, right: pos.x + pos.w, y });
+    });
+    anchors.set(t.name, { pos, cols: colAnchors });
+  });
+  return anchors;
+}
+
+function collectVizFKs(tables) {
+  const fks = [];
+  tables.forEach(t => {
+    (t.constraints || []).forEach(c => {
+      if (c.type !== 'fk') return;
+      fks.push({
+        from_table: t.name,
+        from_column: (c.columns || [])[0],
+        to_table: c.refTable,
+        to_column: (c.refColumns || [])[0],
+      });
+    });
+  });
+  return fks;
+}
+
+function renderVizLine(fk, anchors) {
+  const src = anchors.get(fk.from_table);
+  const tgt = anchors.get(fk.to_table);
+  if (!src || !tgt) return '';
+  const srcCol = src.cols.get(fk.from_column);
+  const tgtCol = tgt.cols.get(fk.to_column);
+  if (!srcCol || !tgtCol) return '';
+  // Pick left or right edge of each side
+  const srcOnLeft = src.pos.x + src.pos.w / 2 < tgt.pos.x + tgt.pos.w / 2;
+  const x1 = srcOnLeft ? srcCol.right : srcCol.left;
+  const x2 = srcOnLeft ? tgtCol.left : tgtCol.right;
+  const y1 = srcCol.y;
+  const y2 = tgtCol.y;
+  const dx = Math.abs(x2 - x1);
+  const cx1 = x1 + (srcOnLeft ? dx * 0.4 : -dx * 0.4);
+  const cx2 = x2 + (srcOnLeft ? -dx * 0.4 : dx * 0.4);
+  return `<path d="M${x1},${y1} C${cx1},${y1} ${cx2},${y2} ${x2},${y2}" class="rebuilder-viz__line" marker-end="url(#viz-arrow)"/>`;
+}
+
+function renderVizCard(table, pos) {
+  if (!pos) return '';
+  const cols = (table.columns || []).map(c => {
+    const badges = [];
+    if (c.isPrimaryKey) badges.push('<span class="rebuilder-viz__badge rebuilder-viz__badge--pk">PK</span>');
+    if (c.isUnique) badges.push('<span class="rebuilder-viz__badge rebuilder-viz__badge--uq">UQ</span>');
+    const isFk = (table.constraints || []).some(ct => ct.type === 'fk' && (ct.columns || []).includes(c.name));
+    if (isFk) badges.push('<span class="rebuilder-viz__badge rebuilder-viz__badge--fk">FK</span>');
+    const nullMark = c.nullable ? '' : '<span class="rebuilder-viz__nn">*</span>';
+    return `
+      <div class="rebuilder-viz__col">
+        <span class="rebuilder-viz__colname">${escapeHtml(c.name)}${nullMark}</span>
+        <span class="rebuilder-viz__coltype">${escapeHtml(c.type || '')}</span>
+        ${badges.join('')}
+      </div>`;
+  }).join('');
+  return `
+    <div class="rebuilder-viz__card" style="left:${pos.x}px;top:${pos.y}px;width:${pos.w}px;">
+      <div class="rebuilder-viz__header">${escapeHtml(table.name)}</div>
+      <div class="rebuilder-viz__body">${cols}</div>
+    </div>`;
 }
 
 function renderDecisionsTable(decisions) {
@@ -375,6 +525,7 @@ function ensureModal() {
       ${renderOptionsPanel()}
       <nav class="rebuilder-tabs">
         <button class="rebuilder-tab rebuilder-tab--active" data-tab="ddl">DDL</button>
+        <button class="rebuilder-tab" data-tab="viz">Visualization</button>
         <button class="rebuilder-tab" data-tab="report">Report</button>
         <button class="rebuilder-tab" data-tab="decisions">Decisions</button>
         <button class="rebuilder-tab" data-tab="flags">Flags</button>
