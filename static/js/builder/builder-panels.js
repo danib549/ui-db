@@ -10,7 +10,7 @@ import {
   addEnum, removeEnum, updateEnum,
   setTargetSchema, setOriginalSchema, clearOriginalSchema,
   setActiveEditor, getSourceMapping,
-  removeConstraint, removeIndex,
+  removeConstraint, removeIndex, addIndex,
 } from './builder-state.js';
 import { DEFAULT_TABLE, DEFAULT_COLUMN } from './builder-constants.js';
 import { showConfirm, showToast } from './builder-editors.js';
@@ -287,6 +287,7 @@ function createTableCard(table) {
         <button class="builder-index-badge__delete" data-index="${escapeHtml(idx.name)}" title="Remove index">&times;</button>
       </span>`).join('')}
       <button class="builder-table-card__add-index">+ Index</button>
+      <button class="builder-table-card__index-fks" title="Create btree indexes on all FK columns that are missing them. PostgreSQL does not auto-index the referencing side of a FK.">Index FKs</button>
     </div>
     <div class="builder-table-card__options">
       <label class="builder-table-card__option" title="Partition this table by range, list, or hash">
@@ -414,6 +415,15 @@ function createTableCard(table) {
     EventBus.emit('builderOpenIndexPicker', { tableName: table.name });
   });
 
+  card.querySelector('.builder-table-card__index-fks')?.addEventListener('click', () => {
+    const added = _indexAllFKColumns(table);
+    if (added === 0) {
+      showToast('All FK columns are already indexed');
+    } else {
+      showToast(`Added ${added} FK ${added === 1 ? 'index' : 'indexes'}`);
+    }
+  });
+
   // Drop target for source column mapping
   card.addEventListener('dragover', (e) => {
     e.preventDefault();
@@ -475,6 +485,33 @@ function _renderColumnRow(tableName, col, sourceMapping) {
       <button class="builder-column-row__delete" title="Remove column">&times;</button>
     </div>
   `;
+}
+
+function _indexAllFKColumns(table) {
+  const existing = new Set(
+    (table.indexes || []).map(i => (i.columns || []).join('|'))
+  );
+  let added = 0;
+  for (const c of table.constraints || []) {
+    if (c.type !== 'fk' || !(c.columns || []).length) continue;
+    const key = c.columns.join('|');
+    if (existing.has(key)) continue;
+    const idxName = _generateIndexName(table.name, c.columns);
+    addIndex(table.name, {
+      name: idxName,
+      columns: [...c.columns],
+      type: 'btree',
+      unique: false,
+    });
+    existing.add(key);
+    added += 1;
+  }
+  return added;
+}
+
+function _generateIndexName(tableName, columns) {
+  const name = `${tableName}_${columns.join('_')}_idx`;
+  return name.length > 63 ? name.slice(0, 63) : name;
 }
 
 function _constraintLabel(c) {

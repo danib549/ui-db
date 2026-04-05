@@ -649,7 +649,8 @@ body {
 }
 
 .builder-table-card__add-constraint,
-.builder-table-card__add-index {
+.builder-table-card__add-index,
+.builder-table-card__index-fks {
   font-size: 10px;
   color: var(--text-secondary);
   background: transparent;
@@ -661,9 +662,15 @@ body {
 }
 
 .builder-table-card__add-constraint:hover,
-.builder-table-card__add-index:hover {
+.builder-table-card__add-index:hover,
+.builder-table-card__index-fks:hover {
   border-color: var(--accent);
   color: var(--accent);
+}
+
+.builder-table-card__index-fks {
+  margin-left: 4px;
+  font-weight: 500;
 }
 
 /* ---- Enum Card ---- */
