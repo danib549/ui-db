@@ -1037,3 +1037,288 @@ ul {
 .table-viewer__badge--pk { background: var(--pk-color); }
 .table-viewer__badge--fk { background: var(--fk-color); }
 .table-viewer__badge--uq { background: var(--uq-color); }
+
+/* ============================================================
+   Schema Advisor Panel
+   ============================================================ */
+
+.advisor-panel {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 480px;
+  max-width: 90vw;
+  background: var(--bg-white);
+  border-left: 1px solid var(--border-color);
+  box-shadow: -4px 0 16px rgba(0, 0, 0, 0.08);
+  z-index: 1000;
+  transform: translateX(100%);
+  transition: transform 0.22s ease-out;
+  display: flex;
+  flex-direction: column;
+  font-size: 13px;
+}
+
+.advisor-panel--open {
+  transform: translateX(0);
+}
+
+.advisor-panel__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-header);
+  flex-shrink: 0;
+}
+
+.advisor-panel__title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.advisor-panel__actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.advisor-panel__close {
+  background: transparent;
+  border: none;
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+  color: #6b7280;
+  padding: 0 6px;
+}
+
+.advisor-panel__close:hover { color: #111; }
+
+.advisor-panel__summary {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-header);
+  flex-shrink: 0;
+}
+
+.advisor-panel__body {
+  overflow-y: auto;
+  padding: 12px 16px;
+  flex: 1;
+}
+
+.advisor-counts {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 6px;
+  font-weight: 600;
+  font-size: 12px;
+}
+
+.advisor-count--error { color: #dc2626; }
+.advisor-count--warning { color: #d97706; }
+.advisor-count--info { color: #2563eb; }
+
+.advisor-stats {
+  font-size: 11px;
+  color: #6b7280;
+  margin-bottom: 10px;
+}
+
+.advisor-scores {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.advisor-score {
+  display: grid;
+  grid-template-columns: 110px 1fr 40px;
+  gap: 8px;
+  align-items: center;
+  font-size: 11px;
+}
+
+.advisor-score__label { color: #374151; }
+
+.advisor-score__bar {
+  height: 6px;
+  background: #e5e7eb;
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.advisor-score__fill {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.2s;
+}
+
+.advisor-score__fill--good { background: #10b981; }
+.advisor-score__fill--ok { background: #f59e0b; }
+.advisor-score__fill--bad { background: #ef4444; }
+
+.advisor-score__value {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  color: #6b7280;
+}
+
+.advisor-empty {
+  text-align: center;
+  color: #6b7280;
+  padding: 32px 16px;
+  font-size: 13px;
+}
+
+.advisor-empty--ok { color: #065f46; }
+.advisor-empty--error { color: #b91c1c; }
+
+.advisor-card {
+  border: 1px solid var(--border-color);
+  border-left-width: 4px;
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+  background: var(--bg-white);
+}
+
+.advisor-card--error { border-left-color: #dc2626; }
+.advisor-card--warning { border-left-color: #d97706; }
+.advisor-card--info { border-left-color: #2563eb; }
+
+.advisor-card__header {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  margin-bottom: 6px;
+}
+
+.advisor-card__icon {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: bold;
+  color: #fff;
+  background: #9ca3af;
+}
+
+.advisor-card--error .advisor-card__icon { background: #dc2626; }
+.advisor-card--warning .advisor-card__icon { background: #d97706; }
+.advisor-card--info .advisor-card__icon { background: #2563eb; }
+
+.advisor-card__title { flex: 1; min-width: 0; }
+
+.advisor-card__name {
+  font-weight: 600;
+  font-size: 13px;
+  color: #111827;
+}
+
+.advisor-card__location {
+  font-size: 11px;
+  color: #6b7280;
+  margin-top: 2px;
+}
+
+.advisor-card__location code {
+  background: transparent;
+  padding: 0;
+}
+
+.advisor-card__reason {
+  margin: 4px 0 8px;
+  color: #374151;
+  line-height: 1.4;
+  font-size: 12px;
+}
+
+.advisor-card__evidence {
+  margin: 6px 0;
+  font-size: 11px;
+  color: #4b5563;
+}
+
+.advisor-card__evidence summary {
+  cursor: pointer;
+  color: #6b7280;
+  user-select: none;
+}
+
+.advisor-card__evidence ul {
+  margin: 4px 0 0 0;
+  padding-left: 16px;
+}
+
+.advisor-card__sql {
+  background: #f9fafb;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  padding: 8px 10px;
+  font-size: 11px;
+  overflow-x: auto;
+  margin: 8px 0;
+  line-height: 1.4;
+  font-family: 'SF Mono', Monaco, Consolas, monospace;
+}
+
+.advisor-card__actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.advisor-btn {
+  padding: 5px 10px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-white);
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  color: #111827;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.advisor-btn:hover {
+  background: var(--bg-selected);
+  border-color: var(--accent);
+  color: var(--accent-dark);
+}
+
+.advisor-btn--secondary {
+  background: var(--bg-header);
+}
+
+/* Dark mode support */
+body.dark .advisor-panel {
+  background: #1f2937;
+  border-left-color: #374151;
+  color: #e5e7eb;
+}
+
+body.dark .advisor-panel__header,
+body.dark .advisor-panel__summary {
+  background: #111827;
+  border-bottom-color: #374151;
+}
+
+body.dark .advisor-panel__title { color: #f3f4f6; }
+body.dark .advisor-card { background: #111827; border-color: #374151; }
+body.dark .advisor-card__name { color: #f3f4f6; }
+body.dark .advisor-card__reason { color: #d1d5db; }
+body.dark .advisor-card__sql { background: #0f172a; border-color: #374151; color: #e5e7eb; }
+body.dark .advisor-btn { background: #1f2937; border-color: #374151; color: #e5e7eb; }
+body.dark .advisor-btn:hover { background: #374151; border-color: #60a5fa; color: #dbeafe; }
+body.dark .advisor-score__bar { background: #374151; }
+body.dark .advisor-score__label { color: #d1d5db; }
+body.dark .advisor-empty { color: #9ca3af; }
