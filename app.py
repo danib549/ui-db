@@ -18,6 +18,7 @@ from metadata_parser import (
 )
 from relationship_analyzer import detect_relationships
 from schema_advisor import analyze_designer_schema, report_to_markdown, advisory_to_markdown
+from schema_rebuilder import rebuild_schema
 from search import search_all_tables
 from trace import trace_value
 from builder_routes import builder_bp
@@ -360,6 +361,32 @@ def advisory_markdown():
         "rels_by_table": rels_by_table,
     })
     return jsonify({"markdown": md})
+
+
+@app.route("/api/rebuild-schema", methods=["POST"])
+def rebuild_schema_route():
+    """Generate a redesigned PostgreSQL schema from loaded CSVs.
+
+    Returns:
+        schema     — builder schema dict (loadable into Builder page)
+        ddl        — full PostgreSQL DDL string (BEGIN/COMMIT wrapped)
+        report     — markdown decisions log (LLM-friendly)
+        decisions  — list of decision dicts
+    """
+    if not loaded_tables:
+        return jsonify({
+            "schema": {"name": "public", "tables": [], "enums": []},
+            "ddl": "-- No tables loaded. Upload CSVs first.\n",
+            "report": "# Schema Rebuild Report\n\nNo tables loaded.\n",
+            "decisions": [],
+        })
+
+    result = rebuild_schema(
+        list(loaded_tables.values()),
+        loaded_dataframes,
+        detected_relationships,
+    )
+    return jsonify(result)
 
 
 @app.route("/api/debug-table")

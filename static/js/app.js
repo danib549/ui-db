@@ -17,6 +17,7 @@ import { initExport } from './export.js';
 import { initTableViewer } from './table-viewer.js';
 import { initTheme } from './theme.js';
 import { initAdvisor } from './advisor.js';
+import { initRebuilder } from './rebuilder.js';
 
 // ---- Interaction state (not application state) ----
 
@@ -507,6 +508,7 @@ function init() {
   initExport();
   initTableViewer();
   initAdvisor();
+  initRebuilder();
   wireEventSubscriptions();
   wireCanvasEvents();
   wireToolbar();
