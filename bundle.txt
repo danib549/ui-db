@@ -805,12 +805,17 @@ def rebuild_schema_route():
             "ddl": "-- No tables loaded. Upload CSVs first.\n",
             "report": "# Schema Rebuild Report\n\nNo tables loaded.\n",
             "decisions": [],
+            "flags": [],
         })
+
+    payload = request.get_json(silent=True) or {}
+    options = payload.get("options") if isinstance(payload, dict) else None
 
     result = rebuild_schema(
         list(loaded_tables.values()),
         loaded_dataframes,
         detected_relationships,
+        options=options,
     )
     return jsonify(result)
 
@@ -5261,6 +5266,1096 @@ def _constraint_changed(orig: dict, mod: dict) -> bool:
             return True
     return False
 ===== END: schema_differ.py =====
+===== FILE: schema_optimizer.py =====
+"""Schema optimizer — gated post-processing transforms for rebuild_schema.
+
+Each optimization is one of 16 options the user toggles from the UI. Options
+are exposed as `{enabled: bool, mode: "apply" | "flag"}`. "apply" mutates the
+schema and appends to `decisions`; "flag" leaves the schema alone and appends
+to `flags`. Some options are flag-only (destructive or too speculative to
+auto-apply) and ignore the mode field.
+
+Every detector is a pure function: `(schema, dataframes, ...) -> list[dict]`.
+Apply functions mutate schema in place and return decision entries.
+
+The canonical option keys and their defaults live in DEFAULT_OPTIONS.
+"""
+
+from __future__ import annotations
+
+import re
+
+from schema_builder import (
+    add_constraint,
+    add_index,
+    find_table,
+    generate_constraint_name,
+    generate_index_name,
+    remove_index,
+)
+
+
+# Threshold constants
+DOWNSIZE_SAFETY = 1.5          # shrink VARCHAR to ceil(max_len * SAFETY)
+ENUM_MAX_UNIQUE = 15
+ENUM_MIN_TOTAL = 10
+DEAD_COLUMN_MIN_ROWS = 5
+FAT_TABLE_COL_THRESHOLD = 50
+FAT_TABLE_SPARSE_COL_COUNT = 40
+FAT_TABLE_SPARSE_RATIO = 0.9
+TIME_SERIES_MIN_ROWS = 1000
+IMPLICIT_FK_MIN_OVERLAP = 0.9
+LOOKUP_TABLE_MAX_COLS = 2
+
+_FK_SUFFIX = re.compile(r'_(?:id|ref|key)$', re.IGNORECASE)
+
+
+# ---------------------------------------------------------------------------
+# Canonical catalog
+# ---------------------------------------------------------------------------
+
+DEFAULT_OPTIONS: dict[str, dict] = {
+    # Data-driven structure
+    "mn_to_1n_downgrade":              {"enabled": True,  "mode": "apply", "flag_only": False},
+    "inline_lookup_tables":            {"enabled": False, "mode": "apply", "flag_only": False},
+    "merge_1_1_pairs":                 {"enabled": False, "mode": "flag",  "flag_only": False},
+    "drop_orphan_tables":              {"enabled": True,  "mode": "flag",  "flag_only": True},
+    # Column optimization
+    "type_downsizing":                 {"enabled": True,  "mode": "apply", "flag_only": False},
+    "strict_nullability":              {"enabled": True,  "mode": "apply", "flag_only": False},
+    "enum_discovery":                  {"enabled": True,  "mode": "apply", "flag_only": False},
+    "dead_column_detection":           {"enabled": False, "mode": "flag",  "flag_only": True},
+    # Indexes & FKs
+    "collapse_redundant_indexes":      {"enabled": True,  "mode": "apply", "flag_only": False},
+    "missing_fk_indexes":              {"enabled": True,  "mode": "apply", "flag_only": False},
+    "implicit_fk_discovery":           {"enabled": False, "mode": "apply", "flag_only": False},
+    # Advanced (flag only)
+    "eav_to_jsonb":                    {"enabled": False, "mode": "flag",  "flag_only": True},
+    "vertical_split_fat_tables":       {"enabled": False, "mode": "flag",  "flag_only": True},
+    "time_series_partition_candidates": {"enabled": False, "mode": "flag",  "flag_only": True},
+    # Data integrity (flag only)
+    "dangling_reference_detect":       {"enabled": False, "mode": "flag",  "flag_only": True},
+    "soft_delete_ghosting":            {"enabled": False, "mode": "flag",  "flag_only": True},
+}
+
+
+def merge_options(user_options: dict | None) -> dict[str, dict]:
+    """Merge user-supplied option dict onto DEFAULT_OPTIONS. Unknown keys ignored."""
+    result: dict[str, dict] = {}
+    user = user_options or {}
+    for key, default in DEFAULT_OPTIONS.items():
+        user_entry = user.get(key) or {}
+        enabled = bool(user_entry.get("enabled", default["enabled"]))
+        mode = user_entry.get("mode", default["mode"])
+        if default["flag_only"] or mode not in ("apply", "flag"):
+            mode = "flag"
+        result[key] = {"enabled": enabled, "mode": mode, "flag_only": default["flag_only"]}
+    return result
+
+
+def _active_mode(options: dict, key: str) -> str | None:
+    """Return 'apply' | 'flag' if option enabled, else None."""
+    opt = options.get(key)
+    if not opt or not opt.get("enabled"):
+        return None
+    return opt.get("mode")
+
+
+def _flag(rule: str, severity: str, title: str, table: str | None = None,
+          column: str | None = None, reason: str = "", evidence: dict | None = None,
+          fix_sql: str | None = None) -> dict:
+    """Build a flag entry compatible with schema_advisor's advisory schema."""
+    return {
+        "rule": rule,
+        "severity": severity,
+        "title": title,
+        "table": table,
+        "column": column,
+        "reason": reason,
+        "fix_sql": fix_sql,
+        "evidence": evidence or {},
+    }
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+def apply_optimizations(
+    schema: dict,
+    dataframes: dict,
+    name_map: dict,
+    col_map: dict,
+    relationships: list[dict],
+    options: dict,
+) -> tuple[list[dict], list[dict], bool]:
+    """Run all enabled optimizations in order.
+
+    Returns (decisions, flags, schema_was_mutated).
+    `name_map` maps source table name -> normalized table name.
+    `col_map` maps (source_table, source_col) -> normalized col name.
+    """
+    decisions: list[dict] = []
+    flags: list[dict] = []
+    mutated = False
+
+    # Build normalized-side helpers
+    norm_to_src_table = {v: k for k, v in name_map.items()}
+    df_by_norm = {name_map[s]: dataframes.get(s) for s in name_map if s in dataframes}
+
+    # Structural (order matters — downgrades can invalidate inlines, etc.)
+    if mode := _active_mode(options, "mn_to_1n_downgrade"):
+        d, f, m = _opt_mn_downgrade(schema, df_by_norm, col_map, norm_to_src_table, mode)
+        decisions += d; flags += f; mutated = mutated or m
+
+    if mode := _active_mode(options, "inline_lookup_tables"):
+        d, f, m = _opt_inline_lookup(schema, mode)
+        decisions += d; flags += f; mutated = mutated or m
+
+    if mode := _active_mode(options, "merge_1_1_pairs"):
+        d, f, m = _opt_merge_1to1(schema, df_by_norm, col_map, norm_to_src_table, mode)
+        decisions += d; flags += f; mutated = mutated or m
+
+    if _active_mode(options, "drop_orphan_tables"):
+        flags += _opt_flag_orphan_tables(schema, df_by_norm)
+
+    # Column-level
+    if mode := _active_mode(options, "type_downsizing"):
+        d, f, m = _opt_type_downsizing(schema, df_by_norm, col_map, norm_to_src_table, mode)
+        decisions += d; flags += f; mutated = mutated or m
+
+    if mode := _active_mode(options, "strict_nullability"):
+        d, f, m = _opt_strict_nullability(schema, df_by_norm, col_map, norm_to_src_table, mode)
+        decisions += d; flags += f; mutated = mutated or m
+
+    if mode := _active_mode(options, "enum_discovery"):
+        d, f, m = _opt_enum_discovery(schema, df_by_norm, col_map, norm_to_src_table, mode)
+        decisions += d; flags += f; mutated = mutated or m
+
+    if _active_mode(options, "dead_column_detection"):
+        flags += _opt_flag_dead_columns(schema, df_by_norm, col_map, norm_to_src_table)
+
+    # Indexes & FKs
+    if mode := _active_mode(options, "collapse_redundant_indexes"):
+        d, f, m = _opt_collapse_indexes(schema, mode)
+        decisions += d; flags += f; mutated = mutated or m
+
+    if mode := _active_mode(options, "missing_fk_indexes"):
+        d, f, m = _opt_missing_fk_indexes(schema, mode)
+        decisions += d; flags += f; mutated = mutated or m
+
+    if mode := _active_mode(options, "implicit_fk_discovery"):
+        d, f, m = _opt_implicit_fk(schema, df_by_norm, col_map, norm_to_src_table, mode)
+        decisions += d; flags += f; mutated = mutated or m
+
+    # Advanced / integrity (flag only)
+    if _active_mode(options, "eav_to_jsonb"):
+        flags += _opt_flag_eav(schema)
+    if _active_mode(options, "vertical_split_fat_tables"):
+        flags += _opt_flag_fat_tables(schema, df_by_norm, col_map, norm_to_src_table)
+    if _active_mode(options, "time_series_partition_candidates"):
+        flags += _opt_flag_time_series(schema, df_by_norm, col_map, norm_to_src_table)
+    if _active_mode(options, "dangling_reference_detect"):
+        flags += _opt_flag_dangling_fks(schema, df_by_norm, col_map, norm_to_src_table)
+    if _active_mode(options, "soft_delete_ghosting"):
+        flags += _opt_flag_soft_delete(schema, df_by_norm, col_map, norm_to_src_table)
+
+    return decisions, flags, mutated
+
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
+def _source_df_for(df_by_norm: dict, table_name: str):
+    """Get dataframe for a normalized table name."""
+    return df_by_norm.get(table_name)
+
+
+def _source_col_name(col_map: dict, norm_to_src: dict, norm_table: str, norm_col: str) -> str | None:
+    """Reverse lookup — find the source column name for a normalized one."""
+    src_t = norm_to_src.get(norm_table)
+    if src_t is None:
+        return None
+    for (st, sc), nc in col_map.items():
+        if st == src_t and nc == norm_col:
+            return sc
+    return None
+
+
+def _fks_by_table(schema: dict) -> dict[str, list[dict]]:
+    """Return {table_name: [fk_constraint, ...]}."""
+    out: dict[str, list[dict]] = {}
+    for t in schema["tables"]:
+        out[t["name"]] = [c for c in t.get("constraints", []) if c.get("type") == "fk"]
+    return out
+
+
+def _incoming_fks(schema: dict, target_table: str) -> list[tuple[str, dict]]:
+    """Return [(source_table_name, fk_constraint), ...] targeting `target_table`."""
+    out: list[tuple[str, dict]] = []
+    for t in schema["tables"]:
+        for c in t.get("constraints", []):
+            if c.get("type") == "fk" and c.get("refTable") == target_table:
+                out.append((t["name"], c))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Structural optimizations
+# ---------------------------------------------------------------------------
+
+def _opt_mn_downgrade(schema, df_by_norm, col_map, norm_to_src, mode):
+    """Detect junction tables whose data is actually 1:N and downgrade them."""
+    decisions: list[dict] = []
+    flags: list[dict] = []
+    mutated = False
+
+    fks_by_tbl = _fks_by_table(schema)
+    for tbl in list(schema["tables"]):
+        fks = fks_by_tbl.get(tbl["name"], [])
+        if len(fks) != 2:
+            continue
+        # Junction heuristic: only PK + 2 FK cols (possibly plus timestamps)
+        non_meta = [c for c in tbl["columns"]
+                    if c["name"].lower() not in ("id", "created_at", "updated_at", "deleted_at")
+                    and not c.get("isPrimaryKey")]
+        fk_col_names = {c["columns"][0] for c in fks if c.get("columns")}
+        extras = [c for c in non_meta if c["name"] not in fk_col_names]
+        if len(extras) > 1:
+            continue
+
+        a, b = fks[0], fks[1]
+        a_col = a["columns"][0]
+        b_col = b["columns"][0]
+        a_ref = a.get("refTable")
+        b_ref = b.get("refTable")
+        if not a_ref or not b_ref:
+            continue
+
+        df_junction = df_by_norm.get(tbl["name"])
+        if df_junction is None:
+            continue
+
+        src_a_col = _source_col_name(col_map, norm_to_src, tbl["name"], a_col)
+        src_b_col = _source_col_name(col_map, norm_to_src, tbl["name"], b_col)
+        src_junction = norm_to_src.get(tbl["name"])
+        if not (src_a_col and src_b_col and src_junction):
+            continue
+
+        # Cardinality: is a_col unique within the junction? Then each row in `a`
+        # maps to at most one row in `b` → downgrade to 1:N on `a` side.
+        try:
+            a_unique = df_junction[src_a_col].is_unique
+            b_unique = df_junction[src_b_col].is_unique
+        except Exception:
+            continue
+
+        if not (a_unique or b_unique):
+            continue
+
+        # Decide which side to keep as 1:N
+        keep_side, drop_side = (a, b) if a_unique else (b, a)
+        keep_ref = keep_side.get("refTable")
+        drop_ref = drop_side.get("refTable")
+        evidence = {"junction": tbl["name"], "unique_side": keep_side["columns"][0],
+                    "row_count": int(len(df_junction))}
+
+        if mode == "flag":
+            flags.append(_flag(
+                "mn_to_1n_downgrade", "info",
+                f"M:N junction '{tbl['name']}' is actually 1:N",
+                table=tbl["name"], column=keep_side["columns"][0],
+                reason=f"Column is unique in data — relationship to '{keep_ref}' is 1:1 per row",
+                evidence=evidence,
+            ))
+            continue
+
+        # Apply: add FK on `keep_ref` table pointing to `drop_ref`, drop junction
+        keep_tbl = find_table(schema, keep_ref)
+        drop_ref_tbl = find_table(schema, drop_ref)
+        if not keep_tbl or not drop_ref_tbl:
+            continue
+        new_col_name = f"{drop_ref}_id"
+        # Avoid collision
+        if any(c["name"] == new_col_name for c in keep_tbl["columns"]):
+            new_col_name = f"{drop_ref}_ref_id"
+        # Find target PK type
+        tgt_pk = next((c for c in drop_ref_tbl["columns"] if c.get("isPrimaryKey")), None)
+        if not tgt_pk:
+            continue
+        keep_tbl["columns"].append({
+            "name": new_col_name,
+            "type": tgt_pk["type"],
+            "nullable": True,
+            "isPrimaryKey": False,
+            "isUnique": False,
+            "identity": None,
+            "defaultValue": None,
+            "checkExpression": None,
+            "comment": None,
+        })
+        add_constraint(keep_tbl, {
+            "type": "fk",
+            "columns": [new_col_name],
+            "refTable": drop_ref,
+            "refColumns": [tgt_pk["name"]],
+            "onDelete": "NO ACTION",
+            "onUpdate": "NO ACTION",
+            "name": generate_constraint_name(keep_ref, [new_col_name], "fk"),
+        })
+        add_index(keep_tbl, {
+            "name": generate_index_name(keep_ref, [new_col_name]),
+            "columns": [new_col_name],
+            "type": "btree",
+            "unique": False,
+        })
+        schema["tables"] = [t for t in schema["tables"] if t["name"] != tbl["name"]]
+        mutated = True
+        decisions.append({
+            "kind": "mn_downgrade",
+            "table": tbl["name"],
+            "keep_table": keep_ref,
+            "new_column": new_col_name,
+            "drop_table_ref": drop_ref,
+            "reason": f"Junction data shows 1:N cardinality — replaced with direct FK",
+        })
+
+    return decisions, flags, mutated
+
+
+def _opt_inline_lookup(schema, mode):
+    """Inline thin lookup tables (id+name, single inbound FK) into their consumer."""
+    decisions: list[dict] = []
+    flags: list[dict] = []
+    mutated = False
+
+    for tbl in list(schema["tables"]):
+        cols = tbl.get("columns", [])
+        non_pk = [c for c in cols if not c.get("isPrimaryKey")]
+        if len(cols) > LOOKUP_TABLE_MAX_COLS or len(non_pk) != 1:
+            continue
+        label_col = non_pk[0]
+        if label_col.get("name", "").lower() not in ("name", "label", "title", "value", "description"):
+            continue
+        incoming = _incoming_fks(schema, tbl["name"])
+        if len(incoming) != 1:
+            continue
+        # Don't inline if this lookup has outgoing FKs
+        has_outgoing = any(c.get("type") == "fk" for c in tbl.get("constraints", []))
+        if has_outgoing:
+            continue
+
+        consumer_name, fk = incoming[0]
+        fk_col_name = fk["columns"][0]
+        consumer = find_table(schema, consumer_name)
+        if not consumer:
+            continue
+
+        evidence = {"lookup_table": tbl["name"], "consumer": consumer_name,
+                    "fk_column": fk_col_name, "inline_as": f"{tbl['name']}_{label_col['name']}"}
+
+        if mode == "flag":
+            flags.append(_flag(
+                "inline_lookup_tables", "info",
+                f"Lookup table '{tbl['name']}' could be inlined",
+                table=tbl["name"], reason=f"Only column '{label_col['name']}' is used by '{consumer_name}'",
+                evidence=evidence,
+            ))
+            continue
+
+        # Apply: add column to consumer, remove FK+index referencing lookup, drop lookup
+        new_col_name = f"{tbl['name']}_{label_col['name']}"
+        if any(c["name"] == new_col_name for c in consumer["columns"]):
+            new_col_name = new_col_name + "_val"
+        consumer["columns"].append({
+            "name": new_col_name,
+            "type": label_col["type"],
+            "nullable": True,
+            "isPrimaryKey": False,
+            "isUnique": False,
+            "identity": None,
+            "defaultValue": None,
+            "checkExpression": None,
+            "comment": None,
+        })
+        # Remove the FK constraint and its index, then drop the FK column
+        consumer["constraints"] = [c for c in consumer.get("constraints", [])
+                                   if not (c.get("type") == "fk" and c.get("refTable") == tbl["name"])]
+        consumer["indexes"] = [i for i in consumer.get("indexes", [])
+                               if fk_col_name not in i.get("columns", [])]
+        consumer["columns"] = [c for c in consumer["columns"] if c["name"] != fk_col_name]
+        schema["tables"] = [t for t in schema["tables"] if t["name"] != tbl["name"]]
+        mutated = True
+        decisions.append({
+            "kind": "inline_lookup",
+            "table": tbl["name"],
+            "inlined_into": consumer_name,
+            "column": new_col_name,
+            "dropped_fk_column": fk_col_name,
+            "reason": f"Thin lookup with single consumer — inlined as '{new_col_name}'",
+        })
+
+    return decisions, flags, mutated
+
+
+def _opt_merge_1to1(schema, df_by_norm, col_map, norm_to_src, mode):
+    """Merge tables whose PK values match 1:1 in data."""
+    decisions: list[dict] = []
+    flags: list[dict] = []
+    mutated = False
+
+    # Find pairs connected by FK where both sides have matching unique PKs
+    seen_pairs: set[tuple[str, str]] = set()
+    for tbl in list(schema["tables"]):
+        for fk in [c for c in tbl.get("constraints", []) if c.get("type") == "fk"]:
+            ref = fk.get("refTable")
+            if not ref or (tbl["name"], ref) in seen_pairs or (ref, tbl["name"]) in seen_pairs:
+                continue
+            seen_pairs.add((tbl["name"], ref))
+            ref_tbl = find_table(schema, ref)
+            if not ref_tbl:
+                continue
+            # FK column must be unique (or the PK itself) for 1:1
+            fk_col = fk["columns"][0]
+            src_table = norm_to_src.get(tbl["name"])
+            src_ref = norm_to_src.get(ref)
+            if not (src_table and src_ref):
+                continue
+            df_src = df_by_norm.get(tbl["name"])
+            df_ref = df_by_norm.get(ref)
+            if df_src is None or df_ref is None:
+                continue
+            src_fk = _source_col_name(col_map, norm_to_src, tbl["name"], fk_col)
+            src_ref_pk_col = fk.get("refColumns", [None])[0]
+            src_ref_pk = _source_col_name(col_map, norm_to_src, ref, src_ref_pk_col) if src_ref_pk_col else None
+            if not (src_fk and src_ref_pk):
+                continue
+            try:
+                fk_vals = set(df_src[src_fk].dropna().unique())
+                ref_vals = set(df_ref[src_ref_pk].dropna().unique())
+            except Exception:
+                continue
+            if not fk_vals or not ref_vals:
+                continue
+            # 1:1 means: every FK value is unique AND every ref PK has exactly one child
+            try:
+                fk_unique = df_src[src_fk].dropna().is_unique
+            except Exception:
+                fk_unique = False
+            if not fk_unique:
+                continue
+            if fk_vals != ref_vals:
+                continue
+
+            evidence = {"pair": [tbl["name"], ref], "shared_keys": len(fk_vals)}
+            if mode == "flag":
+                flags.append(_flag(
+                    "merge_1_1_pairs", "warning",
+                    f"Tables '{tbl['name']}' and '{ref}' appear 1:1",
+                    table=tbl["name"], reason=f"All {len(fk_vals)} PK values match in both tables",
+                    evidence=evidence, fix_sql=f"-- Consider merging {tbl['name']} into {ref}",
+                ))
+            else:
+                # Apply: merge tbl's non-FK columns into ref
+                ref_col_names = {c["name"] for c in ref_tbl["columns"]}
+                for c in tbl["columns"]:
+                    if c["name"] == fk_col or c.get("isPrimaryKey") or c["name"] in ref_col_names:
+                        continue
+                    ref_tbl["columns"].append(dict(c))
+                schema["tables"] = [t for t in schema["tables"] if t["name"] != tbl["name"]]
+                mutated = True
+                decisions.append({
+                    "kind": "merge_1_1",
+                    "table": tbl["name"],
+                    "merged_into": ref,
+                    "reason": f"Data shows 1:1 match on {len(fk_vals)} keys — tables merged",
+                })
+                break  # tbl is gone, move on
+    return decisions, flags, mutated
+
+
+def _opt_flag_orphan_tables(schema, df_by_norm):
+    """Flag tables with no incoming or outgoing FKs."""
+    flags: list[dict] = []
+    fks_by_tbl = _fks_by_table(schema)
+    for tbl in schema["tables"]:
+        outgoing = len(fks_by_tbl.get(tbl["name"], []))
+        incoming = len(_incoming_fks(schema, tbl["name"]))
+        if outgoing == 0 and incoming == 0:
+            df = df_by_norm.get(tbl["name"])
+            row_count = int(len(df)) if df is not None else None
+            flags.append(_flag(
+                "drop_orphan_tables", "warning",
+                f"Orphan table: '{tbl['name']}'",
+                table=tbl["name"],
+                reason="No incoming or outgoing foreign keys — possibly unused",
+                evidence={"column_count": len(tbl.get("columns", [])), "row_count": row_count},
+            ))
+    return flags
+
+
+# ---------------------------------------------------------------------------
+# Column-level optimizations
+# ---------------------------------------------------------------------------
+
+def _opt_type_downsizing(schema, df_by_norm, col_map, norm_to_src, mode):
+    """Shrink oversized int/varchar types to fit observed data."""
+    decisions: list[dict] = []
+    flags: list[dict] = []
+    mutated = False
+
+    for tbl in schema["tables"]:
+        df = df_by_norm.get(tbl["name"])
+        if df is None:
+            continue
+        for col in tbl["columns"]:
+            src_name = _source_col_name(col_map, norm_to_src, tbl["name"], col["name"])
+            if not src_name or src_name not in df.columns:
+                continue
+            new_type = _downsize_type(col, df[src_name])
+            if new_type is None or new_type == col["type"]:
+                continue
+            evidence = {"from": col["type"], "to": new_type}
+            if mode == "flag":
+                flags.append(_flag(
+                    "type_downsizing", "info",
+                    f"Column '{tbl['name']}.{col['name']}' oversized",
+                    table=tbl["name"], column=col["name"],
+                    reason=f"Actual data fits in {new_type}", evidence=evidence,
+                ))
+            else:
+                old_type = col["type"]
+                col["type"] = new_type
+                mutated = True
+                decisions.append({
+                    "kind": "type_downsize", "table": tbl["name"], "column": col["name"],
+                    "from_type": old_type, "to_type": new_type,
+                    "reason": f"Downsized from {old_type} to fit actual data",
+                })
+    return decisions, flags, mutated
+
+
+def _downsize_type(col: dict, series) -> str | None:
+    """Return a smaller PG type if the data fits, else None."""
+    current = (col.get("type") or "").lower()
+    # Integer types
+    if current in ("bigint", "integer", "int"):
+        try:
+            non_null = series.dropna()
+            if non_null.empty:
+                return None
+            max_v = int(abs(non_null.max()))
+            min_v = int(non_null.min())
+        except Exception:
+            return None
+        if min_v >= -32768 and max_v <= 32767 and current != "smallint":
+            return "smallint"
+        if min_v >= -2147483648 and max_v <= 2147483647 and current == "bigint":
+            return "integer"
+        return None
+    # VARCHAR / text
+    if current.startswith("varchar") or current == "text":
+        try:
+            max_len = int(series.dropna().astype(str).str.len().max() or 0)
+        except Exception:
+            return None
+        if max_len == 0:
+            return None
+        target_len = max(4, int(max_len * DOWNSIZE_SAFETY))
+        # Extract current length
+        m = re.match(r'varchar\((\d+)\)', current)
+        cur_len = int(m.group(1)) if m else 10000
+        if target_len < cur_len:
+            return f"varchar({target_len})"
+    return None
+
+
+def _opt_strict_nullability(schema, df_by_norm, col_map, norm_to_src, mode):
+    """Set NOT NULL when data has zero nulls."""
+    decisions: list[dict] = []
+    flags: list[dict] = []
+    mutated = False
+
+    for tbl in schema["tables"]:
+        df = df_by_norm.get(tbl["name"])
+        if df is None or len(df) == 0:
+            continue
+        for col in tbl["columns"]:
+            if not col.get("nullable"):
+                continue  # already NOT NULL
+            if col.get("isPrimaryKey"):
+                continue
+            src_name = _source_col_name(col_map, norm_to_src, tbl["name"], col["name"])
+            if not src_name or src_name not in df.columns:
+                continue
+            try:
+                has_null = int(df[src_name].isna().sum()) > 0
+            except Exception:
+                continue
+            if has_null:
+                continue
+            evidence = {"row_count": int(len(df)), "null_count": 0}
+            if mode == "flag":
+                flags.append(_flag(
+                    "strict_nullability", "info",
+                    f"Column '{tbl['name']}.{col['name']}' has no nulls",
+                    table=tbl["name"], column=col["name"],
+                    reason="Could be NOT NULL", evidence=evidence,
+                ))
+            else:
+                col["nullable"] = False
+                mutated = True
+                decisions.append({
+                    "kind": "strict_not_null", "table": tbl["name"], "column": col["name"],
+                    "reason": f"No nulls observed in {len(df)} rows",
+                })
+    return decisions, flags, mutated
+
+
+def _opt_enum_discovery(schema, df_by_norm, col_map, norm_to_src, mode):
+    """Flag low-cardinality text columns as ENUM candidates.
+
+    The main rebuild already auto-promotes ENUMs when the option was implicit.
+    This option exposes that decision under a user-controlled flag and, in
+    flag mode, reports the candidate without creating the enum.
+    """
+    decisions: list[dict] = []
+    flags: list[dict] = []
+    mutated = False
+
+    for tbl in schema["tables"]:
+        df = df_by_norm.get(tbl["name"])
+        if df is None:
+            continue
+        for col in tbl["columns"]:
+            if col.get("isPrimaryKey"):
+                continue
+            ctype = (col.get("type") or "").lower()
+            if not (ctype == "text" or ctype.startswith("varchar")):
+                continue
+            src_name = _source_col_name(col_map, norm_to_src, tbl["name"], col["name"])
+            if not src_name or src_name not in df.columns:
+                continue
+            try:
+                total = int(df[src_name].count())
+                unique_vals = df[src_name].dropna().unique()
+            except Exception:
+                continue
+            unique = len(unique_vals)
+            if total < ENUM_MIN_TOTAL or unique == 0 or unique > ENUM_MAX_UNIQUE or unique >= total:
+                continue
+            values = sorted(str(v) for v in unique_vals)
+            evidence = {"distinct": unique, "total": total, "values": values[:10]}
+            if mode == "flag":
+                flags.append(_flag(
+                    "enum_discovery", "info",
+                    f"ENUM candidate: '{tbl['name']}.{col['name']}'",
+                    table=tbl["name"], column=col["name"],
+                    reason=f"{unique} distinct values in {total} rows", evidence=evidence,
+                ))
+            else:
+                # The main pipeline may have already created this enum; skip if exists
+                enum_name = f"{tbl['name']}_{col['name']}_enum"[:63]
+                if any(e["name"] == enum_name for e in schema.get("enums", [])):
+                    continue
+                schema.setdefault("enums", []).append({"name": enum_name, "values": values})
+                col["type"] = enum_name
+                mutated = True
+                decisions.append({
+                    "kind": "enum_discover", "table": tbl["name"], "column": col["name"],
+                    "enum_name": enum_name, "values": values,
+                    "reason": f"{unique} distinct values promoted to ENUM",
+                })
+    return decisions, flags, mutated
+
+
+def _opt_flag_dead_columns(schema, df_by_norm, col_map, norm_to_src):
+    """Flag columns that are 100% NULL or 100% a single constant value."""
+    flags: list[dict] = []
+    for tbl in schema["tables"]:
+        df = df_by_norm.get(tbl["name"])
+        if df is None or len(df) < DEAD_COLUMN_MIN_ROWS:
+            continue
+        for col in tbl["columns"]:
+            if col.get("isPrimaryKey"):
+                continue
+            src_name = _source_col_name(col_map, norm_to_src, tbl["name"], col["name"])
+            if not src_name or src_name not in df.columns:
+                continue
+            try:
+                non_null = int(df[src_name].count())
+                if non_null == 0:
+                    flags.append(_flag(
+                        "dead_column_detection", "warning",
+                        f"All-NULL column: '{tbl['name']}.{col['name']}'",
+                        table=tbl["name"], column=col["name"],
+                        reason=f"100% NULL across {len(df)} rows",
+                        evidence={"row_count": int(len(df))},
+                    ))
+                    continue
+                distinct = int(df[src_name].nunique(dropna=True))
+                if distinct == 1 and non_null == len(df):
+                    val = df[src_name].dropna().iloc[0]
+                    flags.append(_flag(
+                        "dead_column_detection", "warning",
+                        f"Constant column: '{tbl['name']}.{col['name']}'",
+                        table=tbl["name"], column=col["name"],
+                        reason=f"Single constant value ({val!r}) across {len(df)} rows",
+                        evidence={"row_count": int(len(df)), "constant_value": str(val)[:50]},
+                    ))
+            except Exception:
+                continue
+    return flags
+
+
+# ---------------------------------------------------------------------------
+# Index & FK optimizations
+# ---------------------------------------------------------------------------
+
+def _opt_collapse_indexes(schema, mode):
+    """Drop indexes whose columns are a prefix of another index's columns."""
+    decisions: list[dict] = []
+    flags: list[dict] = []
+    mutated = False
+
+    for tbl in schema["tables"]:
+        indexes = tbl.get("indexes", [])
+        to_drop: list[str] = []
+        for i, a in enumerate(indexes):
+            a_cols = a.get("columns", [])
+            for j, b in enumerate(indexes):
+                if i == j or b["name"] in to_drop:
+                    continue
+                b_cols = b.get("columns", [])
+                # a is redundant if a_cols is a strict prefix of b_cols
+                if len(a_cols) < len(b_cols) and a_cols == b_cols[:len(a_cols)] \
+                        and a.get("type") == b.get("type") \
+                        and not a.get("unique", False):
+                    to_drop.append(a["name"])
+                    break
+        for idx_name in to_drop:
+            covered_by = next((i["name"] for i in indexes
+                               if i["name"] != idx_name), None)
+            evidence = {"dropped": idx_name, "covered_by": covered_by}
+            if mode == "flag":
+                flags.append(_flag(
+                    "collapse_redundant_indexes", "info",
+                    f"Redundant index: '{idx_name}'",
+                    table=tbl["name"], reason=f"Covered by prefix of '{covered_by}'",
+                    evidence=evidence,
+                ))
+            else:
+                remove_index(tbl, idx_name)
+                mutated = True
+                decisions.append({
+                    "kind": "drop_redundant_index", "table": tbl["name"],
+                    "index": idx_name, "covered_by": covered_by,
+                    "reason": f"Prefix of index '{covered_by}'",
+                })
+    return decisions, flags, mutated
+
+
+def _opt_missing_fk_indexes(schema, mode):
+    """Ensure every FK column has an index."""
+    decisions: list[dict] = []
+    flags: list[dict] = []
+    mutated = False
+
+    for tbl in schema["tables"]:
+        existing_idx = {tuple(i.get("columns", [])) for i in tbl.get("indexes", [])}
+        for c in tbl.get("constraints", []):
+            if c.get("type") != "fk":
+                continue
+            cols = tuple(c.get("columns", []))
+            if not cols or cols in existing_idx:
+                continue
+            evidence = {"columns": list(cols), "fk": c.get("name")}
+            if mode == "flag":
+                flags.append(_flag(
+                    "missing_fk_indexes", "warning",
+                    f"FK without index: '{tbl['name']}.{cols[0]}'",
+                    table=tbl["name"], column=cols[0],
+                    reason="FK columns should be indexed", evidence=evidence,
+                ))
+            else:
+                idx_name = generate_index_name(tbl["name"], list(cols))
+                add_index(tbl, {
+                    "name": idx_name, "columns": list(cols),
+                    "type": "btree", "unique": False,
+                })
+                existing_idx.add(cols)
+                mutated = True
+                decisions.append({
+                    "kind": "add_fk_index", "table": tbl["name"], "index": idx_name,
+                    "columns": list(cols),
+                    "reason": "Added missing index on FK column",
+                })
+    return decisions, flags, mutated
+
+
+def _opt_implicit_fk(schema, df_by_norm, col_map, norm_to_src, mode):
+    """Discover *_id columns whose data overlaps another table's PK values."""
+    decisions: list[dict] = []
+    flags: list[dict] = []
+    mutated = False
+
+    # Build PK value sets per table
+    pk_values: dict[str, tuple[str, set]] = {}
+    for tbl in schema["tables"]:
+        pk = next((c for c in tbl["columns"] if c.get("isPrimaryKey")), None)
+        df = df_by_norm.get(tbl["name"])
+        if not pk or df is None:
+            continue
+        src_col = _source_col_name(col_map, norm_to_src, tbl["name"], pk["name"])
+        if not src_col or src_col not in df.columns:
+            continue
+        try:
+            pk_values[tbl["name"]] = (pk["name"], set(df[src_col].dropna().unique()))
+        except Exception:
+            continue
+
+    for tbl in schema["tables"]:
+        existing_fk_cols = {c["columns"][0] for c in tbl.get("constraints", [])
+                             if c.get("type") == "fk" and c.get("columns")}
+        df = df_by_norm.get(tbl["name"])
+        if df is None:
+            continue
+        for col in tbl["columns"]:
+            cname = col["name"]
+            if cname in existing_fk_cols or col.get("isPrimaryKey"):
+                continue
+            if not _FK_SUFFIX.search(cname):
+                continue
+            src_col = _source_col_name(col_map, norm_to_src, tbl["name"], cname)
+            if not src_col or src_col not in df.columns:
+                continue
+            try:
+                child_vals = set(df[src_col].dropna().unique())
+            except Exception:
+                continue
+            if not child_vals:
+                continue
+            # Try each candidate table
+            best = None
+            for cand_tbl, (cand_pk, cand_vals) in pk_values.items():
+                if cand_tbl == tbl["name"]:
+                    continue
+                overlap = len(child_vals & cand_vals) / max(len(child_vals), 1)
+                if overlap >= IMPLICIT_FK_MIN_OVERLAP and (best is None or overlap > best[2]):
+                    best = (cand_tbl, cand_pk, overlap)
+            if not best:
+                continue
+            cand_tbl, cand_pk, overlap = best
+            evidence = {"target_table": cand_tbl, "target_column": cand_pk,
+                        "overlap_ratio": round(overlap, 3)}
+            if mode == "flag":
+                flags.append(_flag(
+                    "implicit_fk_discovery", "info",
+                    f"Implicit FK: '{tbl['name']}.{cname}' → '{cand_tbl}.{cand_pk}'",
+                    table=tbl["name"], column=cname,
+                    reason=f"{overlap*100:.0f}% of values exist in {cand_tbl}.{cand_pk}",
+                    evidence=evidence,
+                ))
+            else:
+                add_constraint(tbl, {
+                    "type": "fk", "columns": [cname], "refTable": cand_tbl,
+                    "refColumns": [cand_pk], "onDelete": "NO ACTION",
+                    "onUpdate": "NO ACTION",
+                    "name": generate_constraint_name(tbl["name"], [cname], "fk"),
+                })
+                add_index(tbl, {
+                    "name": generate_index_name(tbl["name"], [cname]),
+                    "columns": [cname], "type": "btree", "unique": False,
+                })
+                mutated = True
+                decisions.append({
+                    "kind": "implicit_fk", "table": tbl["name"], "column": cname,
+                    "target_table": cand_tbl, "target_column": cand_pk,
+                    "overlap": round(overlap, 3),
+                    "reason": f"Data overlap {overlap*100:.0f}% with {cand_tbl}.{cand_pk}",
+                })
+    return decisions, flags, mutated
+
+
+# ---------------------------------------------------------------------------
+# Flag-only advanced / integrity detectors
+# ---------------------------------------------------------------------------
+
+def _opt_flag_eav(schema):
+    """Flag tables matching the EAV anti-pattern."""
+    flags: list[dict] = []
+    eav_attr_names = {"attribute_name", "attr_name", "key", "attribute", "property"}
+    eav_val_names = {"attribute_value", "attr_value", "value", "val"}
+    for tbl in schema["tables"]:
+        col_names = {c["name"].lower() for c in tbl["columns"]}
+        has_attr = bool(col_names & eav_attr_names)
+        has_val = bool(col_names & eav_val_names)
+        has_entity_fk = any(c.get("type") == "fk" for c in tbl.get("constraints", []))
+        if has_attr and has_val and has_entity_fk:
+            flags.append(_flag(
+                "eav_to_jsonb", "warning",
+                f"EAV pattern detected: '{tbl['name']}'",
+                table=tbl["name"],
+                reason="Table matches (entity_id, attribute_name, attribute_value) shape",
+                evidence={"columns": sorted(col_names)},
+                fix_sql=f"-- Consider collapsing {tbl['name']} into a JSONB column on the parent",
+            ))
+    return flags
+
+
+def _opt_flag_fat_tables(schema, df_by_norm, col_map, norm_to_src):
+    """Flag tables with many columns where most are sparsely populated."""
+    flags: list[dict] = []
+    for tbl in schema["tables"]:
+        cols = tbl.get("columns", [])
+        if len(cols) < FAT_TABLE_COL_THRESHOLD:
+            continue
+        df = df_by_norm.get(tbl["name"])
+        if df is None or len(df) == 0:
+            continue
+        sparse = 0
+        total_rows = len(df)
+        for col in cols:
+            src_name = _source_col_name(col_map, norm_to_src, tbl["name"], col["name"])
+            if not src_name or src_name not in df.columns:
+                continue
+            try:
+                null_ratio = 1.0 - (int(df[src_name].count()) / total_rows)
+            except Exception:
+                continue
+            if null_ratio > FAT_TABLE_SPARSE_RATIO:
+                sparse += 1
+        if sparse >= FAT_TABLE_SPARSE_COL_COUNT:
+            flags.append(_flag(
+                "vertical_split_fat_tables", "warning",
+                f"Fat sparse table: '{tbl['name']}'",
+                table=tbl["name"],
+                reason=f"{len(cols)} columns, {sparse} are >{FAT_TABLE_SPARSE_RATIO*100:.0f}% NULL",
+                evidence={"column_count": len(cols), "sparse_count": sparse},
+            ))
+    return flags
+
+
+def _opt_flag_time_series(schema, df_by_norm, col_map, norm_to_src):
+    """Flag tables suitable for date-based partitioning."""
+    flags: list[dict] = []
+    for tbl in schema["tables"]:
+        col_names = {c["name"].lower() for c in tbl["columns"]}
+        if "created_at" not in col_names or "updated_at" in col_names:
+            continue
+        df = df_by_norm.get(tbl["name"])
+        if df is None or len(df) < TIME_SERIES_MIN_ROWS:
+            continue
+        has_seq_pk = any(c.get("isPrimaryKey") and (c.get("identity") or "") in ("ALWAYS", "BY DEFAULT")
+                         for c in tbl["columns"])
+        if not has_seq_pk:
+            continue
+        flags.append(_flag(
+            "time_series_partition_candidates", "info",
+            f"Time-series candidate: '{tbl['name']}'",
+            table=tbl["name"],
+            reason=f"Append-only pattern: sequential PK + created_at, no updated_at, {len(df)} rows",
+            evidence={"row_count": int(len(df))},
+            fix_sql=f"-- Consider PARTITION BY RANGE (created_at) on {tbl['name']}",
+        ))
+    return flags
+
+
+def _opt_flag_dangling_fks(schema, df_by_norm, col_map, norm_to_src):
+    """Flag FK columns with values not present in the parent's PK data."""
+    flags: list[dict] = []
+    # Cache parent PK value sets
+    pk_cache: dict[str, set] = {}
+    for tbl in schema["tables"]:
+        df = df_by_norm.get(tbl["name"])
+        if df is None:
+            continue
+        pk = next((c for c in tbl["columns"] if c.get("isPrimaryKey")), None)
+        if not pk:
+            continue
+        src_pk = _source_col_name(col_map, norm_to_src, tbl["name"], pk["name"])
+        if not src_pk or src_pk not in df.columns:
+            continue
+        try:
+            pk_cache[tbl["name"]] = set(df[src_pk].dropna().unique())
+        except Exception:
+            continue
+
+    for tbl in schema["tables"]:
+        df = df_by_norm.get(tbl["name"])
+        if df is None:
+            continue
+        for c in tbl.get("constraints", []):
+            if c.get("type") != "fk":
+                continue
+            ref = c.get("refTable")
+            if ref not in pk_cache:
+                continue
+            fk_col = c["columns"][0]
+            src_col = _source_col_name(col_map, norm_to_src, tbl["name"], fk_col)
+            if not src_col or src_col not in df.columns:
+                continue
+            try:
+                child_vals = set(df[src_col].dropna().unique())
+            except Exception:
+                continue
+            dangling = child_vals - pk_cache[ref]
+            if not dangling:
+                continue
+            sample = sorted(str(v) for v in list(dangling)[:5])
+            flags.append(_flag(
+                "dangling_reference_detect", "error",
+                f"Dangling FK: '{tbl['name']}.{fk_col}'",
+                table=tbl["name"], column=fk_col,
+                reason=f"{len(dangling)} values not present in {ref}",
+                evidence={"dangling_count": len(dangling), "sample": sample, "target": ref},
+            ))
+    return flags
+
+
+def _opt_flag_soft_delete(schema, df_by_norm, col_map, norm_to_src):
+    """Flag soft-deleted rows that break unique constraints or bloat junctions."""
+    flags: list[dict] = []
+    for tbl in schema["tables"]:
+        has_deleted_at = any(c["name"].lower() == "deleted_at" for c in tbl["columns"])
+        if not has_deleted_at:
+            continue
+        df = df_by_norm.get(tbl["name"])
+        if df is None:
+            continue
+        src_del = _source_col_name(col_map, norm_to_src, tbl["name"], "deleted_at")
+        if not src_del or src_del not in df.columns:
+            continue
+        try:
+            deleted_rows = int(df[src_del].notna().sum())
+        except Exception:
+            continue
+        if deleted_rows == 0:
+            continue
+        # Check if a unique constraint has duplicates when counting soft-deleted
+        unique_cols = [c["columns"] for c in tbl.get("constraints", [])
+                        if c.get("type") == "unique"]
+        issues = []
+        for uc in unique_cols:
+            src_uc = [_source_col_name(col_map, norm_to_src, tbl["name"], n) for n in uc]
+            if not all(src_uc) or not all(c in df.columns for c in src_uc):
+                continue
+            try:
+                dup_count = int(df.duplicated(subset=src_uc).sum())
+            except Exception:
+                continue
+            if dup_count > 0:
+                issues.append({"unique_columns": uc, "duplicate_count": dup_count})
+        flags.append(_flag(
+            "soft_delete_ghosting", "warning",
+            f"Soft-deleted rows in '{tbl['name']}'",
+            table=tbl["name"],
+            reason=f"{deleted_rows} soft-deleted rows; consider hard-drop before rebuild",
+            evidence={"deleted_count": deleted_rows, "unique_conflicts": issues},
+        ))
+    return flags
+===== END: schema_optimizer.py =====
 ===== FILE: schema_rebuilder.py =====
 """Schema rebuilder — generates a redesigned PG schema from CSV designer state.
 
@@ -5302,6 +6397,7 @@ from schema_builder import (
 )
 from type_mapper import suggest_pg_type
 from ddl_generator import generate_full_ddl
+from schema_optimizer import apply_optimizations, merge_options
 
 ENUM_MAX_UNIQUE = 15
 ENUM_MIN_TOTAL = 10
@@ -5413,6 +6509,7 @@ def rebuild_schema(
     tables: list[dict],
     dataframes: dict,
     relationships: list[dict],
+    options: dict | None = None,
 ) -> dict:
     """Rebuild a PostgreSQL schema from designer state.
 
@@ -5623,6 +6720,18 @@ def rebuild_schema(
             "reason": f"Detected {rel.get('type', '?')} relationship",
         })
 
+    # Run user-gated optimizations (post-baseline pipeline)
+    merged_opts = merge_options(options)
+    opt_decisions, flags, _ = apply_optimizations(
+        schema=schema,
+        dataframes=dataframes,
+        name_map=name_map,
+        col_map=col_map,
+        relationships=relationships,
+        options=merged_opts,
+    )
+    decisions.extend(opt_decisions)
+
     ddl = generate_full_ddl(schema)
     report = _build_report(schema, decisions, tables, relationships)
     return {
@@ -5630,6 +6739,7 @@ def rebuild_schema(
         "ddl": ddl,
         "report": report,
         "decisions": decisions,
+        "flags": flags,
     }
 
 
@@ -17593,6 +18703,115 @@ body.dark .rebuilder-btn--secondary:hover {
   background: #374151;
   border-color: #60a5fa;
 }
+
+/* Schema rebuilder — optimization options panel */
+.rebuilder-options {
+  padding: 10px 24px;
+  border-bottom: 1px solid #e2e8f0;
+  max-height: 240px;
+  overflow-y: auto;
+  background: #f8fafc;
+}
+.rebuilder-option-group {
+  margin-bottom: 8px;
+}
+.rebuilder-option-group__summary {
+  font-size: 12px;
+  font-weight: 600;
+  color: #334155;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  padding: 4px 0;
+  list-style: none;
+}
+.rebuilder-option-group__summary::before {
+  content: "▸";
+  display: inline-block;
+  width: 14px;
+  transition: transform 0.1s;
+  color: #64748b;
+}
+.rebuilder-option-group[open] > .rebuilder-option-group__summary::before {
+  transform: rotate(90deg);
+}
+.rebuilder-option-group__body {
+  padding: 4px 0 8px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.rebuilder-option-row {
+  display: grid;
+  grid-template-columns: 18px 1fr auto;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  color: #0f172a;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 4px;
+}
+.rebuilder-option-row:hover { background: #e2e8f0; }
+.rebuilder-option-row input[type="checkbox"] { cursor: pointer; }
+.rebuilder-option-label { user-select: none; }
+.rebuilder-option-mode {
+  font-size: 11px;
+  padding: 2px 6px;
+  border: 1px solid #cbd5e1;
+  border-radius: 4px;
+  background: #fff;
+  color: #0f172a;
+  cursor: pointer;
+}
+.rebuilder-option-pill {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: #e0e7ff;
+  color: #3730a3;
+}
+.rebuilder-option-row--flag-only { color: #475569; }
+
+.rebuilder-stat--flags { background: #fef3c7; color: #92400e; }
+
+/* Flags table */
+.rebuilder-flags-table .rebuilder-sev {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  padding: 2px 8px;
+  border-radius: 10px;
+}
+.rebuilder-sev--error   { background: #fee2e2; color: #991b1b; }
+.rebuilder-sev--warning { background: #fef3c7; color: #92400e; }
+.rebuilder-sev--info    { background: #dbeafe; color: #1e40af; }
+.rebuilder-flag-reason { color: #64748b; font-size: 12px; }
+
+/* Dark mode */
+body.dark .rebuilder-options {
+  background: #0f172a;
+  border-bottom-color: #1e293b;
+}
+body.dark .rebuilder-option-group__summary { color: #cbd5e1; }
+body.dark .rebuilder-option-row { color: #e2e8f0; }
+body.dark .rebuilder-option-row:hover { background: #1e293b; }
+body.dark .rebuilder-option-mode {
+  background: #1e293b;
+  border-color: #334155;
+  color: #e2e8f0;
+}
+body.dark .rebuilder-option-pill { background: #312e81; color: #c7d2fe; }
+body.dark .rebuilder-option-row--flag-only { color: #94a3b8; }
+body.dark .rebuilder-stat--flags { background: #451a03; color: #fbbf24; }
+body.dark .rebuilder-sev--error   { background: #450a0a; color: #fca5a5; }
+body.dark .rebuilder-sev--warning { background: #451a03; color: #fbbf24; }
+body.dark .rebuilder-sev--info    { background: #172554; color: #93c5fd; }
+body.dark .rebuilder-flag-reason { color: #94a3b8; }
 ===== END: static/css/styles.css =====
 ===== FILE: static/js/advisor.js =====
 /**
@@ -20576,6 +21795,51 @@ const OPEN_CLASS = 'rebuilder-modal--open';
 let currentResult = null;
 let activeTab = 'ddl';
 
+// Option catalog — mirrors DEFAULT_OPTIONS in schema_optimizer.py
+const OPTION_CATALOG = [
+  {
+    group: 'Data-Driven Structure',
+    options: [
+      { key: 'mn_to_1n_downgrade',   label: 'Downgrade M:N → 1:N',          enabled: true,  mode: 'apply', flagOnly: false },
+      { key: 'inline_lookup_tables', label: 'Inline thin lookup tables',    enabled: false, mode: 'apply', flagOnly: false },
+      { key: 'merge_1_1_pairs',      label: 'Merge 1:1 pairs',              enabled: false, mode: 'flag',  flagOnly: false },
+      { key: 'drop_orphan_tables',   label: 'Flag orphan tables',           enabled: true,  mode: 'flag',  flagOnly: true },
+    ],
+  },
+  {
+    group: 'Column Optimization',
+    options: [
+      { key: 'type_downsizing',       label: 'Type downsizing',              enabled: true,  mode: 'apply', flagOnly: false },
+      { key: 'strict_nullability',    label: 'Strict NOT NULL',              enabled: true,  mode: 'apply', flagOnly: false },
+      { key: 'enum_discovery',        label: 'ENUM discovery',               enabled: true,  mode: 'apply', flagOnly: false },
+      { key: 'dead_column_detection', label: 'Dead column detection',        enabled: false, mode: 'flag',  flagOnly: true },
+    ],
+  },
+  {
+    group: 'Indexes & Foreign Keys',
+    options: [
+      { key: 'collapse_redundant_indexes', label: 'Collapse redundant indexes', enabled: true,  mode: 'apply', flagOnly: false },
+      { key: 'missing_fk_indexes',         label: 'Add missing FK indexes',     enabled: true,  mode: 'apply', flagOnly: false },
+      { key: 'implicit_fk_discovery',      label: 'Discover implicit FKs',      enabled: false, mode: 'apply', flagOnly: false },
+    ],
+  },
+  {
+    group: 'Advanced (Flag Only)',
+    options: [
+      { key: 'eav_to_jsonb',                   label: 'EAV → JSONB',                enabled: false, mode: 'flag', flagOnly: true },
+      { key: 'vertical_split_fat_tables',      label: 'Vertical split candidates',  enabled: false, mode: 'flag', flagOnly: true },
+      { key: 'time_series_partition_candidates', label: 'Time-series partitioning', enabled: false, mode: 'flag', flagOnly: true },
+    ],
+  },
+  {
+    group: 'Data Integrity (Flag Only)',
+    options: [
+      { key: 'dangling_reference_detect', label: 'Dangling FK references', enabled: false, mode: 'flag', flagOnly: true },
+      { key: 'soft_delete_ghosting',      label: 'Soft-delete ghosting',    enabled: false, mode: 'flag', flagOnly: true },
+    ],
+  },
+];
+
 export function initRebuilder() {
   const btn = document.getElementById('btn-rebuilder');
   if (btn) btn.addEventListener('click', openModal);
@@ -20610,7 +21874,11 @@ async function runRebuild() {
   content.innerHTML = '<div class="rebuilder-empty">Rebuilding schema…</div>';
 
   try {
-    const resp = await fetch('/api/rebuild-schema', { method: 'POST' });
+    const resp = await fetch('/api/rebuild-schema', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ options: collectOptions() }),
+    });
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
     currentResult = await resp.json();
     renderResult();
@@ -20619,12 +21887,28 @@ async function runRebuild() {
   }
 }
 
+function collectOptions() {
+  const out = {};
+  for (const group of OPTION_CATALOG) {
+    for (const opt of group.options) {
+      const enabledEl = document.getElementById(`ropt-en-${opt.key}`);
+      const modeEl = document.getElementById(`ropt-mode-${opt.key}`);
+      out[opt.key] = {
+        enabled: enabledEl ? enabledEl.checked : opt.enabled,
+        mode: opt.flagOnly ? 'flag' : (modeEl ? modeEl.value : opt.mode),
+      };
+    }
+  }
+  return out;
+}
+
 function renderResult() {
   const content = document.getElementById('rebuilder-content');
   if (!content || !currentResult) return;
 
   const schema = currentResult.schema || { tables: [], enums: [] };
   const decisions = currentResult.decisions || [];
+  const flags = currentResult.flags || [];
   const tableCount = (schema.tables || []).length;
   const enumCount = (schema.enums || []).length;
   const fkCount = decisions.filter(d => d.kind === 'foreign_key').length;
@@ -20639,7 +21923,14 @@ function renderResult() {
       <span class="rebuilder-stat">${fkCount} FKs</span>
       <span class="rebuilder-stat">${surrogateCount} surrogate PKs</span>
       <span class="rebuilder-stat">${renameCount} renames</span>
+      <span class="rebuilder-stat rebuilder-stat--flags">${flags.length} flags</span>
     `;
+  }
+
+  // Update flag tab badge
+  const flagsTab = document.querySelector('.rebuilder-tab[data-tab="flags"]');
+  if (flagsTab) {
+    flagsTab.textContent = flags.length > 0 ? `Flags (${flags.length})` : 'Flags';
   }
 
   renderActiveTab();
@@ -20661,6 +21952,8 @@ function renderActiveTab() {
     content.innerHTML = `<pre class="rebuilder-code rebuilder-code--markdown"><code>${escapeHtml(report)}</code></pre>`;
   } else if (activeTab === 'decisions') {
     content.innerHTML = renderDecisionsTable(currentResult.decisions || []);
+  } else if (activeTab === 'flags') {
+    content.innerHTML = renderFlagsTable(currentResult.flags || []);
   }
 }
 
@@ -20687,6 +21980,31 @@ function renderDecisionsTable(decisions) {
   `;
 }
 
+function renderFlagsTable(flags) {
+  if (flags.length === 0) {
+    return '<div class="rebuilder-empty">No flags raised. Enable flag-mode options to see advisories.</div>';
+  }
+  const sev = { error: 0, warning: 1, info: 2 };
+  const sorted = [...flags].sort((a, b) => (sev[a.severity] ?? 3) - (sev[b.severity] ?? 3));
+  const rows = sorted.map(f => {
+    const where = f.table
+      ? (f.column ? `${f.table}.${f.column}` : f.table)
+      : '—';
+    return `<tr class="rebuilder-flag-row rebuilder-flag-row--${escapeHtml(f.severity || 'info')}">
+      <td><span class="rebuilder-sev rebuilder-sev--${escapeHtml(f.severity || 'info')}">${escapeHtml(f.severity || 'info')}</span></td>
+      <td><code>${escapeHtml(f.rule || '')}</code></td>
+      <td><code>${escapeHtml(where)}</code></td>
+      <td>${escapeHtml(f.title || '')}<br><span class="rebuilder-flag-reason">${escapeHtml(f.reason || '')}</span></td>
+    </tr>`;
+  }).join('');
+  return `
+    <table class="rebuilder-table rebuilder-flags-table">
+      <thead><tr><th>Severity</th><th>Rule</th><th>Location</th><th>Detail</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+  `;
+}
+
 function buildDecisionDetail(d) {
   switch (d.kind) {
     case 'rename_table':
@@ -20695,11 +22013,28 @@ function buildDecisionDetail(d) {
     case 'column_type':
       return `${d.source_type} → ${d.target_type}${d.not_null ? ' NOT NULL' : ''} — ${d.reason}`;
     case 'create_enum':
+    case 'enum_discover':
       return `${d.enum_name} (${(d.values || []).length} values) — ${d.reason}`;
     case 'surrogate_pk':
       return `${d.column} — ${d.reason}`;
     case 'foreign_key':
       return `${d.from_table}.${d.from_column} → ${d.to_table}.${d.to_column} (${d.relationship}, ${d.confidence})`;
+    case 'mn_downgrade':
+      return `junction '${d.table}' removed — FK on '${d.keep_table}.${d.new_column}' → '${d.drop_table_ref}'`;
+    case 'inline_lookup':
+      return `'${d.table}' inlined into '${d.inlined_into}' as '${d.column}'`;
+    case 'merge_1_1':
+      return `'${d.table}' merged into '${d.merged_into}' — ${d.reason}`;
+    case 'type_downsize':
+      return `${d.from_type} → ${d.to_type} — ${d.reason}`;
+    case 'strict_not_null':
+      return d.reason;
+    case 'drop_redundant_index':
+      return `'${d.index}' dropped (covered by '${d.covered_by}')`;
+    case 'add_fk_index':
+      return `index '${d.index}' on (${(d.columns || []).join(', ')})`;
+    case 'implicit_fk':
+      return `'${d.table}.${d.column}' → '${d.target_table}.${d.target_column}' (overlap ${d.overlap})`;
     default:
       return d.reason || '';
   }
@@ -20773,6 +22108,32 @@ function flashToast(msg) {
   }, 2200);
 }
 
+function renderOptionsPanel() {
+  const groups = OPTION_CATALOG.map(group => {
+    const rows = group.options.map(opt => {
+      const checked = opt.enabled ? 'checked' : '';
+      const modeControl = opt.flagOnly
+        ? '<span class="rebuilder-option-pill">flag only</span>'
+        : `<select class="rebuilder-option-mode" id="ropt-mode-${opt.key}">
+             <option value="apply"${opt.mode === 'apply' ? ' selected' : ''}>apply</option>
+             <option value="flag"${opt.mode === 'flag' ? ' selected' : ''}>flag</option>
+           </select>`;
+      return `
+        <label class="rebuilder-option-row${opt.flagOnly ? ' rebuilder-option-row--flag-only' : ''}">
+          <input type="checkbox" id="ropt-en-${opt.key}" ${checked}>
+          <span class="rebuilder-option-label">${escapeHtml(opt.label)}</span>
+          ${modeControl}
+        </label>`;
+    }).join('');
+    return `
+      <details class="rebuilder-option-group" open>
+        <summary class="rebuilder-option-group__summary">${escapeHtml(group.group)}</summary>
+        <div class="rebuilder-option-group__body">${rows}</div>
+      </details>`;
+  }).join('');
+  return `<section class="rebuilder-options" aria-label="Optimization options">${groups}</section>`;
+}
+
 function ensureModal() {
   let modal = document.getElementById(MODAL_ID);
   if (modal) return modal;
@@ -20792,10 +22153,12 @@ function ensureModal() {
         </div>
         <button class="rebuilder-modal__close" data-action="close" aria-label="Close">&times;</button>
       </header>
+      ${renderOptionsPanel()}
       <nav class="rebuilder-tabs">
         <button class="rebuilder-tab rebuilder-tab--active" data-tab="ddl">DDL</button>
         <button class="rebuilder-tab" data-tab="report">Report</button>
         <button class="rebuilder-tab" data-tab="decisions">Decisions</button>
+        <button class="rebuilder-tab" data-tab="flags">Flags</button>
       </nav>
       <main class="rebuilder-modal__content" id="rebuilder-content">
         <div class="rebuilder-empty">Click Rebuild to generate a schema.</div>
