@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>C Struct Visualizer</title>
   <link rel="stylesheet" href="/static/css/styles.css">
@@ -32,8 +33,13 @@
         <div class="sidebar__section-title">Upload Files</div>
         <div class="upload-zone" id="upload-zone">
           <div class="upload-zone__icon">+</div>
-          <div class="upload-zone__text">Drop .c / .h files here<br>or click to browse</div>
-          <input type="file" id="file-input" accept=".c,.h,.cpp,.hpp" multiple hidden>
+          <div class="upload-zone__text">Drop files or a project folder here</div>
+          <div class="upload-zone__buttons">
+            <button class="upload-zone__btn" id="browse-files">Browse Files</button>
+            <button class="upload-zone__btn" id="browse-folder">Browse Folder</button>
+          </div>
+          <input type="file" id="file-input" accept=".c,.h,.cpp,.hpp,.cc,.hh,.cxx,.hxx" multiple hidden>
+          <input type="file" id="folder-input" webkitdirectory hidden>
         </div>
         <div class="upload-status" id="upload-status" hidden>
           <span id="upload-status-text"></span>

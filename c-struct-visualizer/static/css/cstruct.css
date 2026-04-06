@@ -46,6 +46,30 @@
   margin-bottom: 4px;
 }
 
+.upload-zone__buttons {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+  margin-top: 8px;
+}
+
+.upload-zone__btn {
+  padding: 4px 12px;
+  font-size: 11px;
+  border-radius: var(--radius-sm);
+  background: var(--chrome-hover);
+  color: var(--chrome-text);
+  border: 1px solid var(--chrome-border);
+  cursor: pointer;
+  transition: background-color 0.1s, border-color 0.1s;
+}
+
+.upload-zone__btn:hover {
+  background: var(--chrome-selected);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
 .upload-zone__text {
   font-size: 12px;
   color: var(--chrome-text-secondary);
