@@ -15,8 +15,14 @@ app.py — Flask application for C Struct Visualizer.
 Thin route layer: registers blueprints, serves pages.
 """
 
+import mimetypes
 from flask import Flask, render_template
 from cstruct_routes import cstruct_bp
+
+# Fix MIME types — some systems (especially Windows) return text/plain for .js
+mimetypes.add_type("text/javascript", ".js")
+mimetypes.add_type("text/javascript", ".mjs")
+mimetypes.add_type("text/css", ".css")
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16 MB upload limit
