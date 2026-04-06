@@ -24,6 +24,7 @@ let rafId = null;
 // Drag state
 let isDragging = false;
 let isPanning = false;
+let dragMoved = false;
 let dragTarget = null;
 let dragOffset = { x: 0, y: 0 };
 let panStart = { x: 0, y: 0 };
@@ -114,22 +115,33 @@ function render() {
     return;
   }
 
+  // Compute trace subgraph if something is selected
+  const selected = getSelectedEntity();
+  const traceGraph = selected ? getConnectedSubgraph(selected) : null;
+
   // Draw connections first (under blocks)
-  drawAllConnections(colors);
+  drawAllConnections(colors, traceGraph);
 
   // Draw blocks
   const hovered = getHoveredEntity();
-  const selected = getSelectedEntity();
 
   for (const entity of entities) {
     const pos = getPosition(entity.name);
     if (!pos) continue;
+
+    // Dim blocks not in trace subgraph
+    if (traceGraph && !traceGraph.entities.has(entity.name)) {
+      ctx.globalAlpha = 0.15;
+    }
+
     drawBlock(
       ctx, entity, pos,
       entity.name === hovered,
       entity.name === selected,
       isCollapsed(entity.name),
     );
+
+    ctx.globalAlpha = 1.0;
   }
 }
 
@@ -165,24 +177,34 @@ function drawGrid(colors, viewport, dpr) {
 
 // ---- Connections ----
 
-function drawAllConnections(colors) {
+function drawAllConnections(colors, traceGraph) {
   const connections = getConnections();
   const hovered = getHoveredEntity();
 
-  for (const conn of connections) {
+  for (let i = 0; i < connections.length; i++) {
+    const conn = connections[i];
     const srcPos = getPosition(conn.source);
     const tgtPos = getPosition(conn.target);
     if (!srcPos || !tgtPos) continue;
 
     const srcEntity = getEntity(conn.source);
-    const tgtEntity = getEntity(conn.target);
     if (!srcEntity) continue;
 
     const isHighlighted = hovered === conn.source || hovered === conn.target;
-    const color = isHighlighted ? colors.connectionLine : colors.connectionLineDim;
+    const isInTrace = traceGraph ? traceGraph.connections.has(i) : true;
+
+    // Choose color based on connection type
+    let color;
+    if (conn.type === 'return') {
+      color = colors.connectionReturn;
+    } else if (conn.type === 'uses') {
+      color = colors.connectionUses;
+    } else {
+      color = colors.connectionLine;  // 'nested' and 'param'
+    }
     const lineWidth = isHighlighted ? LINE.strokeWidthHover : LINE.strokeWidth;
 
-    // Find the field that references the target to get its Y position
+    // Find the field row for source anchor Y position
     const fieldIdx = srcEntity.fields
       ? srcEntity.fields.findIndex(f => f.name === conn.field)
       : -1;
@@ -195,11 +217,52 @@ function drawAllConnections(colors) {
     const srcAnchor = calculateAnchor(srcPos, srcSide, srcYOffset);
     const tgtAnchor = calculateAnchor(tgtPos, tgtSide, tgtYOffset);
 
-    ctx.globalAlpha = isHighlighted ? 1.0 : (hovered ? 0.2 : 0.6);
+    // Dimming: trace mode dims non-trace connections, hover dims non-hovered
+    if (traceGraph && !isInTrace) {
+      ctx.globalAlpha = 0.05;
+    } else {
+      ctx.globalAlpha = isHighlighted ? 1.0 : (hovered ? 0.2 : 0.6);
+    }
+
+    // Dashed lines for 'uses' connections
+    if (conn.type === 'uses') {
+      ctx.setLineDash([4, 4]);
+    }
+
     drawBezierConnection(ctx, srcAnchor, tgtAnchor, color, lineWidth);
     drawArrow(ctx, tgtAnchor, color);
+
+    ctx.setLineDash([]);
     ctx.globalAlpha = 1.0;
   }
+}
+
+/** BFS through connections to find all entities connected to the selected one. */
+function getConnectedSubgraph(entityName) {
+  const connections = getConnections();
+  const connected = new Set([entityName]);
+  const connectedConns = new Set();
+
+  const queue = [entityName];
+  while (queue.length > 0) {
+    const current = queue.shift();
+    for (let i = 0; i < connections.length; i++) {
+      const conn = connections[i];
+      if (conn.source === current && !connected.has(conn.target)) {
+        connected.add(conn.target);
+        connectedConns.add(i);
+        queue.push(conn.target);
+      } else if (conn.target === current && !connected.has(conn.source)) {
+        connected.add(conn.source);
+        connectedConns.add(i);
+        queue.push(conn.source);
+      } else if (conn.source === current || conn.target === current) {
+        connectedConns.add(i);
+      }
+    }
+  }
+
+  return { entities: connected, connections: connectedConns };
 }
 
 // ---- Layout ----
@@ -361,6 +424,8 @@ function onMouseDown(e) {
   const { x, y } = screenToCanvas(pos.x, pos.y);
   const hit = hitTestBlock(x, y);
 
+  dragMoved = false;
+
   if (hit) {
     isDragging = true;
     dragTarget = hit;
@@ -379,6 +444,7 @@ function onMouseMove(e) {
   const { x, y } = screenToCanvas(pos.x, pos.y);
 
   if (isDragging && dragTarget) {
+    dragMoved = true;
     setPosition(dragTarget, {
       ...getPosition(dragTarget),
       x: x - dragOffset.x,
@@ -388,6 +454,7 @@ function onMouseMove(e) {
   }
 
   if (isPanning) {
+    dragMoved = true;
     const vp = getViewport();
     setViewport({
       panX: vp.panX + (pos.x - panStart.x),
@@ -418,10 +485,25 @@ function onMouseMove(e) {
   updateFieldDetail(hit, x, y);
 }
 
-function onMouseUp() {
+function onMouseUp(e) {
+  const wasDrag = dragMoved;
   isDragging = false;
   isPanning = false;
   dragTarget = null;
+
+  // Click-to-select: if mouse didn't move, treat as a click
+  if (!wasDrag && e) {
+    const pos = getMousePos(e);
+    const { x, y } = screenToCanvas(pos.x, pos.y);
+    const hit = hitTestBlock(x, y);
+    if (hit) {
+      setSelectedEntity(hit);
+    } else if (getSelectedEntity()) {
+      // Click empty space to deselect
+      setSelectedEntity(getSelectedEntity());
+    }
+  }
+
   canvas.style.cursor = getHoveredEntity() ? 'pointer' : 'grab';
 }
 
@@ -453,13 +535,7 @@ function onDblClick(e) {
   const hit = hitTestBlock(x, y);
 
   if (hit) {
-    // Double-click header area to collapse/expand
-    const blockPos = getPosition(hit);
-    if (blockPos && y < blockPos.y + BLOCK.headerHeight) {
-      toggleCollapsed(hit);
-    } else {
-      setSelectedEntity(hit);
-    }
+    toggleCollapsed(hit);
   }
 }
 
@@ -473,18 +549,31 @@ function renderStructList() {
   const enums = getState().enums || [];
 
   if (entities.length === 0 && enums.length === 0) {
-    list.innerHTML = '<div class="sidebar__empty">Upload C files to see structs</div>';
+    list.innerHTML = '<div class="sidebar__empty">Upload C files to see types</div>';
     return;
   }
 
   let html = '';
   for (const entity of entities) {
-    const icon = entity.isUnion ? 'U' : 'S';
-    const iconClass = entity.isUnion ? 'sidebar__badge--union' : 'sidebar__badge--struct';
+    let icon, iconClass, meta;
+    if (entity.isFunction) {
+      icon = 'F';
+      iconClass = 'sidebar__badge--function';
+      meta = `${entity.params ? entity.params.length : 0}p`;
+    } else if (entity.isUnion) {
+      icon = 'U';
+      iconClass = 'sidebar__badge--union';
+      meta = `${entity.totalSize}B`;
+    } else {
+      icon = 'S';
+      iconClass = 'sidebar__badge--struct';
+      meta = `${entity.totalSize}B`;
+    }
+    const displayName = entity.name.startsWith('__anon_') ? '(anonymous)' : entity.name;
     html += `<div class="sidebar__struct-item" data-entity="${entity.name}">
       <span class="sidebar__badge ${iconClass}">${icon}</span>
-      <span class="sidebar__struct-name">${entity.name.startsWith('__anon_') ? '(anonymous)' : entity.name}</span>
-      <span class="sidebar__struct-size">${entity.totalSize}B</span>
+      <span class="sidebar__struct-name">${displayName}</span>
+      <span class="sidebar__struct-size">${meta}</span>
     </div>`;
   }
 
@@ -546,6 +635,28 @@ function updateFieldDetail(entityName, cx, cy) {
   if (!entity || !pos) return;
 
   const fIdx = hitTestField(entity, pos, cx, cy, isCollapsed(entityName));
+
+  // Function entity — show return type and param info
+  if (entity.isFunction) {
+    if (fIdx < 0 || !entity.params || fIdx >= entity.params.length) {
+      const retStr = entity.returnType || 'void';
+      detail.innerHTML = `<div class="field-detail__header">${entity.name}()</div>
+        <div class="field-detail__meta">Returns: <code>${retStr}</code></div>
+        <div class="field-detail__meta">${entity.params?.length || 0} parameter(s)</div>
+        ${entity.bodyStructRefs?.length ? `<div class="field-detail__meta">Uses: ${entity.bodyStructRefs.join(', ')}</div>` : ''}`;
+      return;
+    }
+    const param = entity.params[fIdx];
+    detail.innerHTML = `
+      <div class="field-detail__header">${entity.name}(${param.name})</div>
+      <div class="field-detail__row"><span>Type:</span> <code>${param.type}</code></div>
+      <div class="field-detail__row"><span>Direction:</span> parameter${param.isPointer ? ' (pointer)' : ' (by value)'}</div>
+      ${param.refStruct ? `<div class="field-detail__row"><span>Struct ref:</span> ${param.refStruct}</div>` : ''}
+    `;
+    return;
+  }
+
+  // Struct/union entity
   if (fIdx < 0 || !entity.fields || fIdx >= entity.fields.length) {
     detail.innerHTML = `<div class="field-detail__header">${entity.name}</div>
       <div class="field-detail__meta">${entity.totalSize}B | ${entity.alignment}-byte aligned${entity.packed ? ' | PACKED' : ''}</div>`;

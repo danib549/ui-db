@@ -248,9 +248,11 @@ async function uploadFileMap(fileMap) {
     const summary = fileCount <= 3
       ? paths.join(', ')
       : `${fileCount} files from ${getCommonPrefix(paths)}`;
+    const funcCount = result.functions?.length || 0;
     const types = [
       structCount ? `${structCount} struct${structCount !== 1 ? 's' : ''}` : '',
       enumCount ? `${enumCount} enum${enumCount !== 1 ? 's' : ''}` : '',
+      funcCount ? `${funcCount} function${funcCount !== 1 ? 's' : ''}` : '',
     ].filter(Boolean).join(', ');
 
     setUploadStatus('success', `${summary} \u2014 ${types || 'no types found'}`);

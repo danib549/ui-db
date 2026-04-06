@@ -149,6 +149,7 @@ def _parse_in_directory(
     unions = []
     typedefs = {}
     enums = []
+    functions = []
     connections = []
     seen_names: set[str] = set()
     anon_counter = {"struct": 0, "union": 0}
@@ -160,6 +161,7 @@ def _parse_in_directory(
         unions,
         typedefs,
         enums,
+        functions,
         connections,
         seen_names,
         anon_counter,
@@ -167,7 +169,7 @@ def _parse_in_directory(
     )
 
     # Add diagnostic info if nothing was found
-    total = len(structs) + len(unions) + len(enums)
+    total = len(structs) + len(unions) + len(enums) + len(functions)
     if total == 0:
         file_list = ", ".join(os.path.basename(f) for f in sorted(user_files) if "__main__" not in f)
         warnings.append(f"No types found in {len(file_contents)} file(s): {file_list}")
@@ -181,6 +183,7 @@ def _parse_in_directory(
         "unions": unions,
         "typedefs": typedefs,
         "enums": enums,
+        "functions": functions,
         "connections": connections,
         "warnings": warnings,
         "target_info": {
@@ -198,6 +201,7 @@ def _empty_result(target_info: dict) -> dict:
         "unions": [],
         "typedefs": {},
         "enums": [],
+        "functions": [],
         "connections": [],
         "warnings": [],
         "target_info": {
@@ -252,20 +256,17 @@ def _walk_cursor(
     unions: list,
     typedefs: dict,
     enums: list,
+    functions: list,
     connections: list,
     seen_names: set,
     anon_counter: dict,
     target_info: dict,
 ) -> None:
-    """Recursively walk the AST and collect type definitions."""
+    """Recursively walk the AST and collect type definitions and functions."""
     for child in cursor.get_children():
         # Only process items from user files
         if not _is_from_user_file(child, user_files):
-            # Still recurse into included user files
-            if child.location.file and _is_from_user_file(child, user_files):
-                pass  # will be handled below
-            else:
-                continue
+            continue
 
         if child.kind == CursorKind.STRUCT_DECL:
             _process_record(
@@ -281,11 +282,13 @@ def _walk_cursor(
             _process_typedef(child, typedefs)
         elif child.kind == CursorKind.ENUM_DECL:
             _process_enum(child, enums, seen_names, anon_counter)
+        elif child.kind == CursorKind.FUNCTION_DECL:
+            _process_function(child, functions, connections, seen_names)
         else:
             # Recurse into children
             _walk_cursor(
                 child, user_files, structs, unions,
-                typedefs, enums, connections, seen_names,
+                typedefs, enums, functions, connections, seen_names,
                 anon_counter, target_info,
             )
 
@@ -584,3 +587,186 @@ def _process_enum(
         "name": name,
         "values": values,
     })
+
+
+# ---- Phase 2: Function extraction ----
+
+
+def _resolve_struct_name(type_obj) -> Optional[str]:
+    """If type is a struct or pointer-to-struct (any depth), return the struct name.
+
+    Handles multi-level pointers (e.g. SensorConfig **) by unwrapping
+    all pointer layers before checking for a record type. Uses
+    get_canonical() to pierce through typedef aliases.
+    """
+    canonical = type_obj.get_canonical()
+
+    # Unwrap all pointer layers (SensorConfig **, void ***, etc.)
+    while canonical.kind == TypeKind.POINTER:
+        canonical = canonical.get_pointee().get_canonical()
+
+    if canonical.kind == TypeKind.RECORD:
+        name = canonical.spelling
+        for prefix in ("struct ", "union "):
+            if name.startswith(prefix):
+                name = name[len(prefix):]
+        return name or None
+
+    return None
+
+
+def _is_pointer_type(type_obj) -> bool:
+    """Check if a type is any level of pointer."""
+    return type_obj.get_canonical().kind == TypeKind.POINTER
+
+
+def _categorize_param_type(type_obj) -> str:
+    """Categorize a function parameter type for visual badging.
+
+    Uses get_canonical() to resolve through typedef aliases so that
+    e.g. status_t (typedef for enum) gets categorized as 'enum'.
+    """
+    canonical = type_obj.get_canonical()
+
+    if canonical.kind == TypeKind.POINTER:
+        return "pointer"
+    if canonical.kind == TypeKind.RECORD:
+        return "struct"
+    if canonical.kind == TypeKind.ENUM:
+        return "enum"
+    if canonical.kind in (TypeKind.FLOAT, TypeKind.DOUBLE, TypeKind.LONGDOUBLE):
+        return "float"
+    if canonical.kind == TypeKind.CONSTANTARRAY or canonical.kind == TypeKind.INCOMPLETEARRAY:
+        return "array"
+    if canonical.kind == TypeKind.BOOL:
+        return "integer"
+    return "integer"
+
+
+def _collect_body_struct_refs(
+    cursor: Cursor,
+    func_name: str,
+    connections: list,
+    seen_refs: set[str],
+) -> None:
+    """Recursively walk a function body to find local VAR_DECL with struct types.
+
+    Recurses into all nested scopes (if/while/for/switch/compound) to catch
+    structs declared in inner blocks.
+    """
+    for child in cursor.get_children():
+        if child.kind == CursorKind.VAR_DECL:
+            ref = _resolve_struct_name(child.type)
+            if ref and ref not in seen_refs:
+                seen_refs.add(ref)
+                connections.append({
+                    "source": func_name,
+                    "target": ref,
+                    "type": "uses",
+                    "field": child.spelling or "(local)",
+                })
+        # Recurse into any compound/control-flow children
+        _collect_body_struct_refs(child, func_name, connections, seen_refs)
+
+
+def _process_function(
+    cursor: Cursor,
+    functions: list,
+    connections: list,
+    seen_names: set[str],
+) -> None:
+    """Extract a function declaration with params, return type, and body struct refs."""
+    name = cursor.spelling
+    if not name:
+        return
+
+    # Prefer definitions over declarations. If we already saw a declaration
+    # and this is the definition, replace it. If we already saw the definition, skip.
+    is_def = cursor.is_definition()
+    existing_idx = None
+    for i, f in enumerate(functions):
+        if f["name"] == name:
+            existing_idx = i
+            break
+
+    if existing_idx is not None:
+        if not is_def:
+            return  # Already have it (maybe even the definition), skip this declaration
+        # This is the definition — replace the previous declaration
+        # Remove old connections from the previous pass
+        connections[:] = [c for c in connections
+                         if not (c["source"] == name and c["type"] in ("param", "return", "uses"))]
+    elif name in seen_names:
+        return
+
+    seen_names.add(name)
+
+    # Return type
+    result_type = cursor.result_type
+    return_type_str = result_type.spelling
+    return_struct = _resolve_struct_name(result_type)
+    is_pointer_return = _is_pointer_type(result_type)
+
+    # Params
+    params = []
+    seen_param_refs: set[str] = set()  # Avoid duplicate param connections
+
+    for child in cursor.get_children():
+        if child.kind == CursorKind.PARM_DECL:
+            param_type = child.type
+            param_name = child.spelling or f"param{len(params)}"
+            ref_struct = _resolve_struct_name(param_type)
+            is_ptr = _is_pointer_type(param_type)
+            category = _categorize_param_type(param_type)
+
+            params.append({
+                "name": param_name,
+                "type": param_type.spelling,
+                "refStruct": ref_struct,
+                "isPointer": is_ptr,
+                "category": category,
+            })
+
+            # Add param connection (deduplicate by struct name)
+            if ref_struct and ref_struct not in seen_param_refs:
+                seen_param_refs.add(ref_struct)
+                connections.append({
+                    "source": name,
+                    "target": ref_struct,
+                    "type": "param",
+                    "field": param_name,
+                })
+
+    # Return type connection
+    if return_struct:
+        connections.append({
+            "source": name,
+            "target": return_struct,
+            "type": "return",
+            "field": None,
+        })
+
+    # Walk function body for local struct variable usage
+    body_refs: set[str] = set()
+    # Don't duplicate refs already captured as params or return
+    body_refs.update(seen_param_refs)
+    if return_struct:
+        body_refs.add(return_struct)
+
+    for child in cursor.get_children():
+        if child.kind == CursorKind.COMPOUND_STMT:
+            _collect_body_struct_refs(child, name, connections, body_refs)
+
+    func_data = {
+        "name": name,
+        "returnType": return_type_str,
+        "returnStruct": return_struct,
+        "isPointerReturn": is_pointer_return,
+        "params": params,
+        "bodyStructRefs": sorted(body_refs - seen_param_refs - ({return_struct} if return_struct else set())),
+    }
+
+    if existing_idx is not None:
+        functions[existing_idx] = func_data
+    else:
+        functions.append(func_data)
