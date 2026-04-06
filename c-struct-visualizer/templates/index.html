@@ -96,8 +96,9 @@
   </script>
   <script type="module">
     import { EventBus } from '/static/js/events.js';
+    import { init } from '/static/js/cstruct/cstruct-app.js';
     window.__eventBus = { EventBus };
-    import('/static/js/cstruct/cstruct-app.js');
+    init();
   </script>
 </body>
 </html>

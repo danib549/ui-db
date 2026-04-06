@@ -9,7 +9,6 @@ import {
   getPosition, getViewport, isCollapsed, getHoveredEntity, getSelectedEntity,
   setPositions, setPosition, setViewport, toggleCollapsed,
   setHoveredEntity, setHoveredField, setSelectedEntity,
-  getHoveredField,
 } from './cstruct-state.js';
 import {
   BLOCK, CANVAS_COLORS, CANVAS_COLORS_DARK, LINE,
@@ -613,5 +612,4 @@ function drawEmptyMessage(dpr) {
   ctx.textAlign = 'start';
 }
 
-// ---- Bootstrap ----
-document.addEventListener('DOMContentLoaded', init);
+// init() is called from the HTML module script after all imports resolve.
