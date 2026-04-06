@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>C Struct Visualizer</title>
+  <link rel="stylesheet" href="/static/css/styles.css">
+  <link rel="stylesheet" href="/static/css/dark-mode.css">
+  <link rel="stylesheet" href="/static/css/cstruct.css">
+</head>
+<body>
+  <script>
+    if (localStorage.getItem('cstruct-theme') === 'dark') {
+      document.body.classList.add('dark');
+    }
+  </script>
+
+  <div class="app">
+    <!-- Sidebar -->
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar__header">
+        <h1 class="sidebar__title">C Struct Visualizer</h1>
+        <button class="sidebar__theme-btn" id="btn-theme" title="Toggle dark mode">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+            <path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm0 12.5V2.5a5.5 5.5 0 0 1 0 11z"/>
+          </svg>
+        </button>
+      </div>
+
+      <!-- Upload Section -->
+      <div class="sidebar__section">
+        <div class="sidebar__section-title">Upload Files</div>
+        <div class="upload-zone" id="upload-zone">
+          <div class="upload-zone__icon">+</div>
+          <div class="upload-zone__text">Drop .c / .h files here<br>or click to browse</div>
+          <input type="file" id="file-input" accept=".c,.h,.cpp,.hpp" multiple hidden>
+        </div>
+        <div class="upload-status" id="upload-status" hidden>
+          <span id="upload-status-text"></span>
+        </div>
+      </div>
+
+      <!-- Target Architecture -->
+      <div class="sidebar__section">
+        <div class="sidebar__section-title">Target Architecture</div>
+        <select class="sidebar__select" id="arch-select">
+          <option value="arm" selected>ARM (32-bit embedded)</option>
+          <option value="sparc">SPARC / LEON3</option>
+          <option value="linux_x64">Linux x86_64</option>
+          <option value="win_x64">Windows x64 (MSVC)</option>
+        </select>
+      </div>
+
+      <!-- Struct List -->
+      <div class="sidebar__section sidebar__section--grow">
+        <div class="sidebar__section-title">Structs &amp; Unions</div>
+        <div class="sidebar__struct-list" id="struct-list">
+          <div class="sidebar__empty">Upload C files to see structs</div>
+        </div>
+      </div>
+
+      <!-- Warnings -->
+      <div class="sidebar__section" id="warnings" hidden>
+        <div class="sidebar__section-title">Warnings</div>
+      </div>
+
+      <!-- Field Detail -->
+      <div class="sidebar__section">
+        <div class="sidebar__section-title">Field Detail</div>
+        <div class="field-detail" id="field-detail">
+          <div class="sidebar__empty">Hover over a field to see details</div>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Canvas Area -->
+    <main class="canvas-area" id="canvas-container">
+      <canvas id="cstruct-canvas"></canvas>
+    </main>
+  </div>
+
+  <script>
+    // Theme toggle
+    document.getElementById('btn-theme').addEventListener('click', () => {
+      document.body.classList.toggle('dark');
+      localStorage.setItem('cstruct-theme',
+        document.body.classList.contains('dark') ? 'dark' : 'light');
+      // Trigger re-render
+      window.dispatchEvent(new Event('themeChanged'));
+    });
+
+    window.addEventListener('themeChanged', () => {
+      const { EventBus } = window.__eventBus || {};
+      if (EventBus) EventBus.emit('cstructStateChanged', { key: 'theme' });
+    });
+  </script>
+  <script type="module">
+    import { EventBus } from '/static/js/events.js';
+    import { init } from '/static/js/cstruct/cstruct-app.js';
+    window.__eventBus = { EventBus };
+    init();
+  </script>
+</body>
+</html>

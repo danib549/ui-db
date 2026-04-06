@@ -1,0 +1,84 @@
+/* ============================================
+   Dark Mode Theme Overrides
+   Applied when body has the "dark" class.
+   In dark mode, chrome and canvas are both dark
+   (light mode already has dark chrome with light canvas).
+   ============================================ */
+
+body.dark {
+  /* Canvas */
+  --canvas-bg: #1a1b23;
+  --grid-color: #2d2e3a;
+
+  /* Key colors (slightly brighter for dark bg) */
+  --pk-color: #FBBF24;
+  --fk-color: #60A5FA;
+  --uq-color: #A78BFA;
+  --idx-color: #2DD4BF;
+
+  /* Relationship colors */
+  --rel-one-one: #60A5FA;
+  --rel-one-many: #34D399;
+  --rel-many-many: #FB923C;
+  --rel-self: #C4B5FD;
+
+  /* UI (canvas-area elements like table-viewer modal) */
+  --text-primary: #E5E7EB;
+  --text-secondary: #9CA3AF;
+  --border-color: #374151;
+  --bg-white: #1F2028;
+  --bg-sidebar: #1a1b23;
+  --bg-header: #252630;
+  --bg-selected: rgba(59, 130, 246, 0.15);
+  --bg-hover: #2d2e3a;
+  --accent: #60A5FA;
+  --accent-dark: #93C5FD;
+
+  /* Chrome (sidebar/toolbar) — deeper dark in full dark mode */
+  --chrome-bg: #141520;
+  --chrome-text: #E5E7EB;
+  --chrome-text-secondary: #9CA3AF;
+  --chrome-border: #252630;
+  --chrome-hover: #1e1f2b;
+  --chrome-selected: rgba(59, 130, 246, 0.2);
+  --chrome-input-bg: #1a1b23;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 4px 6px rgba(0, 0, 0, 0.4);
+
+  color-scheme: dark;
+}
+
+/* Table viewer td border */
+body.dark .table-viewer__td {
+  border-bottom-color: #2d2e3a;
+}
+
+body.dark .table-viewer__th {
+  border-bottom-color: #374151;
+}
+
+/* Toast in dark mode */
+body.dark .toast {
+  background: #E5E7EB;
+  color: #1F2028;
+}
+
+/* Zoom indicator */
+body.dark .zoom-indicator {
+  background: rgba(229, 231, 235, 0.85);
+  color: #1F2028;
+}
+
+/* Table viewer backdrop darker */
+body.dark .table-viewer__backdrop {
+  background: rgba(0, 0, 0, 0.55);
+}
+
+/* Dark mode toggle button active state */
+body.dark #btn-theme {
+  background: var(--chrome-hover);
+  border-color: var(--accent);
+  color: var(--accent);
+}
