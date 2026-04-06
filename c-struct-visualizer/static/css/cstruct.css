@@ -1,0 +1,249 @@
+/* ============================================
+   C Struct Visualizer — Page-Specific Styles
+   ============================================ */
+
+/* ---- Canvas area ---- */
+.canvas-area {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+  background: var(--canvas-bg);
+}
+
+.canvas-area canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  cursor: grab;
+}
+
+.canvas--dragover {
+  outline: 3px dashed var(--accent);
+  outline-offset: -3px;
+}
+
+/* ---- Upload zone ---- */
+.upload-zone {
+  border: 2px dashed var(--chrome-border);
+  border-radius: var(--radius-lg);
+  padding: 20px 16px;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color 0.15s, background-color 0.15s;
+}
+
+.upload-zone:hover,
+.upload-zone--active {
+  border-color: var(--accent);
+  background: var(--chrome-selected);
+}
+
+.upload-zone__icon {
+  font-size: 28px;
+  font-weight: 300;
+  color: var(--chrome-text-secondary);
+  line-height: 1;
+  margin-bottom: 4px;
+}
+
+.upload-zone__text {
+  font-size: 12px;
+  color: var(--chrome-text-secondary);
+  line-height: 1.5;
+}
+
+/* ---- Upload status ---- */
+.upload-status {
+  margin-top: 8px;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+}
+
+.upload-status--parsing {
+  background: var(--chrome-hover);
+  color: var(--chrome-text-secondary);
+}
+
+.upload-status--success {
+  background: rgba(34, 197, 94, 0.1);
+  color: #22C55E;
+}
+
+.upload-status--error {
+  background: rgba(239, 68, 68, 0.1);
+  color: #EF4444;
+}
+
+/* ---- Sidebar select ---- */
+.sidebar__select {
+  width: 100%;
+  padding: 6px 10px;
+  background: var(--chrome-input-bg);
+  color: var(--chrome-text);
+  border: 1px solid var(--chrome-border);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  font-family: inherit;
+  cursor: pointer;
+  appearance: auto;
+}
+
+.sidebar__select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* ---- Sidebar section grow ---- */
+.sidebar__section--grow {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+/* ---- Struct list ---- */
+.sidebar__struct-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sidebar__struct-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background-color 0.1s;
+  font-size: 13px;
+}
+
+.sidebar__struct-item:hover {
+  background: var(--chrome-hover);
+}
+
+.sidebar__struct-item--selected {
+  background: var(--chrome-selected);
+}
+
+.sidebar__badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.sidebar__badge--struct {
+  background: rgba(59, 130, 246, 0.15);
+  color: #3B82F6;
+}
+
+.sidebar__badge--union {
+  background: rgba(124, 58, 237, 0.15);
+  color: #8B5CF6;
+}
+
+.sidebar__badge--enum {
+  background: rgba(236, 72, 153, 0.15);
+  color: #EC4899;
+}
+
+.sidebar__struct-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--chrome-text);
+}
+
+.sidebar__struct-size {
+  font-size: 11px;
+  color: var(--chrome-text-secondary);
+  flex-shrink: 0;
+}
+
+/* ---- Sidebar empty state ---- */
+.sidebar__empty {
+  font-size: 12px;
+  color: var(--chrome-text-secondary);
+  padding: 8px 0;
+}
+
+/* ---- Theme toggle in header ---- */
+.sidebar__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.sidebar__theme-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-sm);
+  color: var(--chrome-text-secondary);
+  transition: background-color 0.1s, color 0.1s;
+}
+
+.sidebar__theme-btn:hover {
+  background: var(--chrome-hover);
+  color: var(--chrome-text);
+}
+
+body.dark .sidebar__theme-btn {
+  color: var(--accent);
+}
+
+/* ---- Warnings ---- */
+.warning-item {
+  padding: 6px 8px;
+  margin-bottom: 4px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  background: rgba(234, 179, 8, 0.1);
+  color: #EAB308;
+  border-left: 3px solid #EAB308;
+}
+
+/* ---- Field detail panel ---- */
+.field-detail {
+  font-size: 12px;
+}
+
+.field-detail__header {
+  font-weight: 600;
+  color: var(--chrome-text);
+  margin-bottom: 6px;
+  font-size: 13px;
+}
+
+.field-detail__meta {
+  color: var(--chrome-text-secondary);
+  margin-bottom: 4px;
+}
+
+.field-detail__row {
+  display: flex;
+  gap: 6px;
+  padding: 2px 0;
+  color: var(--chrome-text-secondary);
+}
+
+.field-detail__row span {
+  color: var(--chrome-text);
+  font-weight: 500;
+  flex-shrink: 0;
+}
+
+.field-detail__row code {
+  font-size: 12px;
+  color: var(--accent);
+}
