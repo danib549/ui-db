@@ -70,10 +70,19 @@ function initSidebar() {
   const archSelect = document.getElementById('arch-select');
   if (archSelect) {
     archSelect.addEventListener('change', () => {
-      // Re-upload with new target (handled by upload module)
       EventBus.emit('cstructArchChanged', { arch: archSelect.value });
     });
   }
+
+  // Layout buttons
+  const layoutBtns = document.querySelectorAll('.layout-btn');
+  layoutBtns.forEach(btn => {
+    btn.addEventListener('click', () => {
+      layoutBtns.forEach(b => b.classList.remove('layout-btn--active'));
+      btn.classList.add('layout-btn--active');
+      applyLayout(btn.dataset.layout);
+    });
+  });
 
   // Listen for data to populate struct list
   EventBus.on('cstructDataLoaded', renderStructList);
@@ -267,20 +276,47 @@ function getConnectedSubgraph(entityName) {
 
 // ---- Layout ----
 
+let currentLayoutMode = 'top-down';
+let animationId = null;
+
 function onDataLoaded() {
-  computeLayout();
+  applyLayout(currentLayoutMode, false);
   autoFit();
   scheduleRender();
 }
 
-function computeLayout() {
+/** Apply a named layout with optional animation. */
+function applyLayout(mode, animate = true) {
+  currentLayoutMode = mode;
   const entities = getAllEntities();
   if (entities.length === 0) return;
 
+  const entityMap = Object.fromEntries(entities.map(e => [e.name, e]));
   const connections = getConnections();
   const nameSet = new Set(entities.map(e => e.name));
 
-  // Build dependency graph for topological layout
+  let newPositions;
+  if (mode === 'left-right') {
+    newPositions = layoutLeftRight(entities, entityMap, connections, nameSet);
+  } else if (mode === 'force') {
+    newPositions = layoutForceDirected(entities, entityMap, connections, nameSet);
+  } else if (mode === 'grid') {
+    newPositions = layoutGrid(entities, entityMap);
+  } else {
+    newPositions = layoutTopDown(entities, entityMap, connections, nameSet);
+  }
+
+  if (animate && Object.keys(getPositions()).length > 0) {
+    animateToPositions(newPositions);
+  } else {
+    setPositions(newPositions);
+  }
+  autoFit();
+}
+
+// ---- Dependency graph (shared by top-down and left-right) ----
+
+function buildDepthMap(connections, nameSet) {
   const children = {};
   const inDegree = {};
   for (const name of nameSet) {
@@ -291,11 +327,11 @@ function computeLayout() {
   for (const conn of connections) {
     if (conn.source === conn.target) continue;
     if (!nameSet.has(conn.source) || !nameSet.has(conn.target)) continue;
+    if (children[conn.source].includes(conn.target)) continue;
     children[conn.source].push(conn.target);
     inDegree[conn.target]++;
   }
 
-  // BFS depth assignment
   const depth = {};
   const queue = [];
   for (const name of nameSet) {
@@ -319,42 +355,248 @@ function computeLayout() {
     }
   }
 
-  // Orphans at end
   for (const name of nameSet) {
     if (depth[name] === undefined) depth[name] = maxDepth + 1;
   }
 
-  // Group by depth
-  const rows = {};
+  // Group by depth level
+  const groups = {};
   for (const [name, d] of Object.entries(depth)) {
-    if (!rows[d]) rows[d] = [];
-    rows[d].push(name);
+    if (!groups[d]) groups[d] = [];
+    groups[d].push(name);
   }
 
-  const entityMap = Object.fromEntries(entities.map(e => [e.name, e]));
-  const positions = {};
-  let y = 0;
+  return { groups, maxDepth };
+}
 
-  const rowKeys = Object.keys(rows).map(Number).sort((a, b) => a - b);
-  for (const key of rowKeys) {
-    const row = rows[key];
-    let x = 0;
+// ---- Top-Down (default) ----
+
+function layoutTopDown(entities, entityMap, connections, nameSet) {
+  const { groups } = buildDepthMap(connections, nameSet);
+  const positions = {};
+  const groupKeys = Object.keys(groups).map(Number).sort((a, b) => a - b);
+
+  let y = 0;
+  for (const key of groupKeys) {
+    const row = groups[key];
+    const rowWidth = row.reduce((sum, name) => {
+      return sum + BLOCK.minWidth;
+    }, 0) + (row.length - 1) * BLOCK.gapX;
+
+    // Center the row
+    let x = -rowWidth / 2;
     let maxH = 0;
 
     for (const name of row) {
       const entity = entityMap[name];
       const height = calculateBlockHeight(entity, false);
-      const width = BLOCK.minWidth;
-      positions[name] = { x, y, width, height };
+      positions[name] = { x, y, width: BLOCK.minWidth, height };
       maxH = Math.max(maxH, height);
-      x += width + BLOCK.gapX;
+      x += BLOCK.minWidth + BLOCK.gapX;
     }
 
     y += maxH + BLOCK.gapY;
   }
 
-  setPositions(positions);
+  return positions;
 }
+
+// ---- Left-Right ----
+
+function layoutLeftRight(entities, entityMap, connections, nameSet) {
+  const { groups } = buildDepthMap(connections, nameSet);
+  const positions = {};
+  const groupKeys = Object.keys(groups).map(Number).sort((a, b) => a - b);
+
+  let x = 0;
+  for (const key of groupKeys) {
+    const col = groups[key];
+    let y = 0;
+    let maxW = 0;
+
+    for (const name of col) {
+      const entity = entityMap[name];
+      const height = calculateBlockHeight(entity, false);
+      positions[name] = { x, y, width: BLOCK.minWidth, height };
+      maxW = Math.max(maxW, BLOCK.minWidth);
+      y += height + 40;
+    }
+
+    x += maxW + 200;
+  }
+
+  return positions;
+}
+
+// ---- Force-Directed ----
+
+function layoutForceDirected(entities, entityMap, connections, nameSet) {
+  const REPULSION = 8000;
+  const SPRING_LENGTH = 300;
+  const SPRING_STRENGTH = 0.015;
+  const DAMPING = 0.85;
+  const ITERATIONS = 120;
+
+  // Initialize nodes from current positions or random
+  const currentPos = getPositions();
+  const nodes = {};
+  entities.forEach((e, i) => {
+    const p = currentPos[e.name];
+    nodes[e.name] = {
+      x: p ? p.x : (i % 5) * 400 + Math.random() * 50,
+      y: p ? p.y : Math.floor(i / 5) * 300 + Math.random() * 50,
+      vx: 0, vy: 0,
+    };
+  });
+
+  const names = Object.keys(nodes);
+
+  // Build unique edges
+  const edges = [];
+  const edgeSet = new Set();
+  for (const conn of connections) {
+    if (!nameSet.has(conn.source) || !nameSet.has(conn.target)) continue;
+    if (conn.source === conn.target) continue;
+    const key = [conn.source, conn.target].sort().join('|');
+    if (edgeSet.has(key)) continue;
+    edgeSet.add(key);
+    edges.push({ a: conn.source, b: conn.target });
+  }
+
+  for (let iter = 0; iter < ITERATIONS; iter++) {
+    // Repulsion between all pairs
+    for (let i = 0; i < names.length; i++) {
+      for (let j = i + 1; j < names.length; j++) {
+        const a = nodes[names[i]];
+        const b = nodes[names[j]];
+        const dx = b.x - a.x;
+        const dy = b.y - a.y;
+        const dist = Math.max(Math.hypot(dx, dy), 1);
+        const force = REPULSION / (dist * dist);
+        const fx = (dx / dist) * force;
+        const fy = (dy / dist) * force;
+        a.vx -= fx; a.vy -= fy;
+        b.vx += fx; b.vy += fy;
+      }
+    }
+
+    // Spring forces along connections
+    for (const edge of edges) {
+      const a = nodes[edge.a];
+      const b = nodes[edge.b];
+      if (!a || !b) continue;
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const dist = Math.max(Math.hypot(dx, dy), 1);
+      const displacement = dist - SPRING_LENGTH;
+      const force = displacement * SPRING_STRENGTH;
+      const fx = (dx / dist) * force;
+      const fy = (dy / dist) * force;
+      a.vx += fx; a.vy += fy;
+      b.vx -= fx; b.vy -= fy;
+    }
+
+    // Apply velocity with damping
+    for (const name of names) {
+      const node = nodes[name];
+      node.x += node.vx;
+      node.y += node.vy;
+      node.vx *= DAMPING;
+      node.vy *= DAMPING;
+    }
+  }
+
+  const positions = {};
+  for (const name of names) {
+    const entity = entityMap[name];
+    const height = calculateBlockHeight(entity, false);
+    positions[name] = {
+      x: nodes[name].x,
+      y: nodes[name].y,
+      width: BLOCK.minWidth,
+      height,
+    };
+  }
+  return positions;
+}
+
+// ---- Grid ----
+
+function layoutGrid(entities, entityMap) {
+  const sorted = [...entities].sort((a, b) => {
+    // Structs first, then unions, then functions
+    const order = (e) => e.isFunction ? 2 : e.isUnion ? 1 : 0;
+    const diff = order(a) - order(b);
+    return diff !== 0 ? diff : a.name.localeCompare(b.name);
+  });
+
+  const cols = Math.max(2, Math.ceil(Math.sqrt(sorted.length)));
+  const positions = {};
+  let x = 0, y = 0, col = 0, rowMaxH = 0;
+
+  for (const entity of sorted) {
+    const height = calculateBlockHeight(entity, false);
+    positions[entity.name] = { x, y, width: BLOCK.minWidth, height };
+    rowMaxH = Math.max(rowMaxH, height);
+    col++;
+
+    if (col >= cols) {
+      col = 0;
+      x = 0;
+      y += rowMaxH + BLOCK.gapY;
+      rowMaxH = 0;
+    } else {
+      x += BLOCK.minWidth + BLOCK.gapX;
+    }
+  }
+
+  return positions;
+}
+
+// ---- Animated transition ----
+
+function animateToPositions(targetPositions, duration = 350) {
+  if (animationId) cancelAnimationFrame(animationId);
+
+  const startPositions = {};
+  const current = getPositions();
+  for (const name of Object.keys(targetPositions)) {
+    startPositions[name] = current[name]
+      ? { ...current[name] }
+      : { ...targetPositions[name] };
+  }
+
+  const startTime = performance.now();
+
+  function step(now) {
+    const t = Math.min((now - startTime) / duration, 1);
+    const eased = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+
+    const interpolated = {};
+    for (const name of Object.keys(targetPositions)) {
+      const from = startPositions[name];
+      const to = targetPositions[name];
+      interpolated[name] = {
+        x: from.x + (to.x - from.x) * eased,
+        y: from.y + (to.y - from.y) * eased,
+        width: to.width,
+        height: to.height,
+      };
+    }
+
+    setPositions(interpolated);
+
+    if (t < 1) {
+      animationId = requestAnimationFrame(step);
+    } else {
+      animationId = null;
+    }
+  }
+
+  animationId = requestAnimationFrame(step);
+}
+
+// ---- Auto-fit viewport ----
 
 function autoFit() {
   const positions = getPositions();
@@ -366,8 +608,8 @@ function autoFit() {
     const p = positions[k];
     minX = Math.min(minX, p.x);
     minY = Math.min(minY, p.y);
-    maxX = Math.max(maxX, p.x + p.width);
-    maxY = Math.max(maxY, p.y + p.height);
+    maxX = Math.max(maxX, p.x + (p.width || BLOCK.minWidth));
+    maxY = Math.max(maxY, p.y + (p.height || 100));
   }
 
   const pad = 60;
