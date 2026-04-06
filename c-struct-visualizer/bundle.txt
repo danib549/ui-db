@@ -186,6 +186,8 @@ Pure functions only — no Flask, no HTTP, no side effects.
 from __future__ import annotations
 
 import os
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -250,20 +252,48 @@ def parse_c_files(
     target_info = get_target_info(target)
     triple = target_info["triple"]
 
-    # Build unsaved_files list for libclang
-    unsaved = [(name, content) for name, content in file_contents.items()]
-
-    # Pick the first file as the "main" translation unit
-    if not unsaved:
+    if not file_contents:
         return _empty_result(target_info)
 
-    main_file = unsaved[0][0]
+    # Write files to a temp directory so cross-file #includes resolve correctly.
+    # unsaved_files can't handle relative include paths between virtual files.
+    tmpdir = tempfile.mkdtemp(prefix="cstruct_")
+    try:
+        return _parse_in_directory(tmpdir, file_contents, triple, target, target_info)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
-    # Create a virtual main file that includes all uploaded files
-    if len(unsaved) > 1:
-        includes = "\n".join(f'#include "{name}"' for name, _ in unsaved)
-        main_file = "__main__.c"
-        unsaved.append((main_file, includes))
+
+def _parse_in_directory(
+    tmpdir: str,
+    file_contents: dict[str, str],
+    triple: str,
+    target: str,
+    target_info: dict,
+) -> dict:
+    """Write files to tmpdir, parse with libclang, return results."""
+    # Write all uploaded files preserving directory structure
+    include_dirs: set[str] = set()
+    include_dirs.add(tmpdir)
+    written_paths: list[str] = []
+
+    for name, content in file_contents.items():
+        safe_name = name.replace("\\", "/")
+        file_path = os.path.join(tmpdir, safe_name)
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        written_paths.append(file_path)
+
+        # Add each directory as an include path
+        parent = os.path.dirname(file_path)
+        include_dirs.add(parent)
+
+    # Create a main file that includes all uploaded files
+    main_path = os.path.join(tmpdir, "__main__.c")
+    includes = "\n".join(f'#include "{p}"' for p in written_paths)
+    with open(main_path, "w", encoding="utf-8") as f:
+        f.write(includes)
 
     args = [
         "-target", triple,
@@ -272,20 +302,25 @@ def parse_c_files(
         "-fsyntax-only",
         "-Wno-everything",
     ]
+    for d in sorted(include_dirs):
+        args.extend(["-I", d])
 
     index = Index.create()
     try:
         tu = index.parse(
-            main_file,
+            main_path,
             args=args,
-            unsaved_files=unsaved,
             options=TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD,
         )
     except Exception as e:
         return {**_empty_result(target_info), "warnings": [f"Parse error: {e}"]}
 
+    # Build a set of absolute paths of user files for filtering
+    user_files = set(written_paths)
+    user_files.add(main_path)
+
     # Collect diagnostics as warnings
-    warnings = _collect_warnings(tu, file_contents)
+    warnings = _collect_warnings(tu, user_files)
 
     # Walk AST
     structs = []
@@ -298,7 +333,7 @@ def parse_c_files(
 
     _walk_cursor(
         tu.cursor,
-        file_contents,
+        user_files,
         structs,
         unions,
         typedefs,
@@ -308,6 +343,16 @@ def parse_c_files(
         anon_counter,
         target_info,
     )
+
+    # Add diagnostic info if nothing was found
+    total = len(structs) + len(unions) + len(enums)
+    if total == 0:
+        file_list = ", ".join(os.path.basename(f) for f in sorted(user_files) if "__main__" not in f)
+        warnings.append(f"No types found in {len(file_contents)} file(s): {file_list}")
+        warnings.append(
+            "Tip: ensure files contain struct/union/enum definitions "
+            "(not just function implementations)"
+        )
 
     return {
         "structs": structs,
@@ -342,7 +387,7 @@ def _empty_result(target_info: dict) -> dict:
     }
 
 
-def _collect_warnings(tu: TranslationUnit, file_contents: dict[str, str]) -> list[str]:
+def _collect_warnings(tu: TranslationUnit, user_files: set[str]) -> list[str]:
     """Extract useful diagnostics from the translation unit."""
     warnings = []
     for diag in tu.diagnostics:
@@ -358,19 +403,29 @@ def _collect_warnings(tu: TranslationUnit, file_contents: dict[str, str]) -> lis
     return warnings
 
 
-def _is_from_user_file(cursor: Cursor, file_contents: dict[str, str]) -> bool:
+def _is_from_user_file(cursor: Cursor, user_files: set[str]) -> bool:
     """Check if a cursor is from one of the user-uploaded files."""
     loc = cursor.location
     if loc.file is None:
         return False
     fname = loc.file.name
-    # Accept user files and our virtual main file
-    return fname in file_contents or fname == "__main__.c"
+    # Direct match (absolute paths)
+    if fname in user_files:
+        return True
+    # Normalize and retry
+    normalized = os.path.normpath(fname)
+    if normalized in user_files:
+        return True
+    # Check if any user file path matches as suffix
+    for uf in user_files:
+        if normalized.endswith(os.path.basename(uf)) or uf.endswith(os.path.basename(normalized)):
+            return True
+    return False
 
 
 def _walk_cursor(
     cursor: Cursor,
-    file_contents: dict[str, str],
+    user_files: set[str],
     structs: list,
     unions: list,
     typedefs: dict,
@@ -383,24 +438,21 @@ def _walk_cursor(
     """Recursively walk the AST and collect type definitions."""
     for child in cursor.get_children():
         # Only process items from user files
-        if not _is_from_user_file(child, file_contents):
-            # Still recurse into __main__.c includes
-            if child.location.file and child.location.file.name == "__main__.c":
-                _walk_cursor(
-                    child, file_contents, structs, unions,
-                    typedefs, enums, connections, seen_names,
-                    anon_counter, target_info,
-                )
-            continue
+        if not _is_from_user_file(child, user_files):
+            # Still recurse into included user files
+            if child.location.file and _is_from_user_file(child, user_files):
+                pass  # will be handled below
+            else:
+                continue
 
         if child.kind == CursorKind.STRUCT_DECL:
             _process_record(
-                child, False, file_contents, structs, unions,
+                child, False, user_files, structs, unions,
                 connections, seen_names, anon_counter, target_info,
             )
         elif child.kind == CursorKind.UNION_DECL:
             _process_record(
-                child, True, file_contents, structs, unions,
+                child, True, user_files, structs, unions,
                 connections, seen_names, anon_counter, target_info,
             )
         elif child.kind == CursorKind.TYPEDEF_DECL:
@@ -408,9 +460,9 @@ def _walk_cursor(
         elif child.kind == CursorKind.ENUM_DECL:
             _process_enum(child, enums, seen_names, anon_counter)
         else:
-            # Recurse
+            # Recurse into children
             _walk_cursor(
-                child, file_contents, structs, unions,
+                child, user_files, structs, unions,
                 typedefs, enums, connections, seen_names,
                 anon_counter, target_info,
             )
@@ -419,7 +471,7 @@ def _walk_cursor(
 def _process_record(
     cursor: Cursor,
     is_union: bool,
-    file_contents: dict[str, str],
+    user_files: set[str],
     structs: list,
     unions: list,
     connections: list,
