@@ -327,6 +327,7 @@ def _parse_in_directory(
     unions = []
     typedefs = {}
     enums = []
+    functions = []
     connections = []
     seen_names: set[str] = set()
     anon_counter = {"struct": 0, "union": 0}
@@ -338,6 +339,7 @@ def _parse_in_directory(
         unions,
         typedefs,
         enums,
+        functions,
         connections,
         seen_names,
         anon_counter,
@@ -345,7 +347,7 @@ def _parse_in_directory(
     )
 
     # Add diagnostic info if nothing was found
-    total = len(structs) + len(unions) + len(enums)
+    total = len(structs) + len(unions) + len(enums) + len(functions)
     if total == 0:
         file_list = ", ".join(os.path.basename(f) for f in sorted(user_files) if "__main__" not in f)
         warnings.append(f"No types found in {len(file_contents)} file(s): {file_list}")
@@ -359,6 +361,7 @@ def _parse_in_directory(
         "unions": unions,
         "typedefs": typedefs,
         "enums": enums,
+        "functions": functions,
         "connections": connections,
         "warnings": warnings,
         "target_info": {
@@ -376,6 +379,7 @@ def _empty_result(target_info: dict) -> dict:
         "unions": [],
         "typedefs": {},
         "enums": [],
+        "functions": [],
         "connections": [],
         "warnings": [],
         "target_info": {
@@ -430,20 +434,17 @@ def _walk_cursor(
     unions: list,
     typedefs: dict,
     enums: list,
+    functions: list,
     connections: list,
     seen_names: set,
     anon_counter: dict,
     target_info: dict,
 ) -> None:
-    """Recursively walk the AST and collect type definitions."""
+    """Recursively walk the AST and collect type definitions and functions."""
     for child in cursor.get_children():
         # Only process items from user files
         if not _is_from_user_file(child, user_files):
-            # Still recurse into included user files
-            if child.location.file and _is_from_user_file(child, user_files):
-                pass  # will be handled below
-            else:
-                continue
+            continue
 
         if child.kind == CursorKind.STRUCT_DECL:
             _process_record(
@@ -459,11 +460,13 @@ def _walk_cursor(
             _process_typedef(child, typedefs)
         elif child.kind == CursorKind.ENUM_DECL:
             _process_enum(child, enums, seen_names, anon_counter)
+        elif child.kind == CursorKind.FUNCTION_DECL:
+            _process_function(child, functions, connections, seen_names)
         else:
             # Recurse into children
             _walk_cursor(
                 child, user_files, structs, unions,
-                typedefs, enums, connections, seen_names,
+                typedefs, enums, functions, connections, seen_names,
                 anon_counter, target_info,
             )
 
@@ -762,6 +765,189 @@ def _process_enum(
         "name": name,
         "values": values,
     })
+
+
+# ---- Phase 2: Function extraction ----
+
+
+def _resolve_struct_name(type_obj) -> Optional[str]:
+    """If type is a struct or pointer-to-struct (any depth), return the struct name.
+
+    Handles multi-level pointers (e.g. SensorConfig **) by unwrapping
+    all pointer layers before checking for a record type. Uses
+    get_canonical() to pierce through typedef aliases.
+    """
+    canonical = type_obj.get_canonical()
+
+    # Unwrap all pointer layers (SensorConfig **, void ***, etc.)
+    while canonical.kind == TypeKind.POINTER:
+        canonical = canonical.get_pointee().get_canonical()
+
+    if canonical.kind == TypeKind.RECORD:
+        name = canonical.spelling
+        for prefix in ("struct ", "union "):
+            if name.startswith(prefix):
+                name = name[len(prefix):]
+        return name or None
+
+    return None
+
+
+def _is_pointer_type(type_obj) -> bool:
+    """Check if a type is any level of pointer."""
+    return type_obj.get_canonical().kind == TypeKind.POINTER
+
+
+def _categorize_param_type(type_obj) -> str:
+    """Categorize a function parameter type for visual badging.
+
+    Uses get_canonical() to resolve through typedef aliases so that
+    e.g. status_t (typedef for enum) gets categorized as 'enum'.
+    """
+    canonical = type_obj.get_canonical()
+
+    if canonical.kind == TypeKind.POINTER:
+        return "pointer"
+    if canonical.kind == TypeKind.RECORD:
+        return "struct"
+    if canonical.kind == TypeKind.ENUM:
+        return "enum"
+    if canonical.kind in (TypeKind.FLOAT, TypeKind.DOUBLE, TypeKind.LONGDOUBLE):
+        return "float"
+    if canonical.kind == TypeKind.CONSTANTARRAY or canonical.kind == TypeKind.INCOMPLETEARRAY:
+        return "array"
+    if canonical.kind == TypeKind.BOOL:
+        return "integer"
+    return "integer"
+
+
+def _collect_body_struct_refs(
+    cursor: Cursor,
+    func_name: str,
+    connections: list,
+    seen_refs: set[str],
+) -> None:
+    """Recursively walk a function body to find local VAR_DECL with struct types.
+
+    Recurses into all nested scopes (if/while/for/switch/compound) to catch
+    structs declared in inner blocks.
+    """
+    for child in cursor.get_children():
+        if child.kind == CursorKind.VAR_DECL:
+            ref = _resolve_struct_name(child.type)
+            if ref and ref not in seen_refs:
+                seen_refs.add(ref)
+                connections.append({
+                    "source": func_name,
+                    "target": ref,
+                    "type": "uses",
+                    "field": child.spelling or "(local)",
+                })
+        # Recurse into any compound/control-flow children
+        _collect_body_struct_refs(child, func_name, connections, seen_refs)
+
+
+def _process_function(
+    cursor: Cursor,
+    functions: list,
+    connections: list,
+    seen_names: set[str],
+) -> None:
+    """Extract a function declaration with params, return type, and body struct refs."""
+    name = cursor.spelling
+    if not name:
+        return
+
+    # Prefer definitions over declarations. If we already saw a declaration
+    # and this is the definition, replace it. If we already saw the definition, skip.
+    is_def = cursor.is_definition()
+    existing_idx = None
+    for i, f in enumerate(functions):
+        if f["name"] == name:
+            existing_idx = i
+            break
+
+    if existing_idx is not None:
+        if not is_def:
+            return  # Already have it (maybe even the definition), skip this declaration
+        # This is the definition — replace the previous declaration
+        # Remove old connections from the previous pass
+        connections[:] = [c for c in connections
+                         if not (c["source"] == name and c["type"] in ("param", "return", "uses"))]
+    elif name in seen_names:
+        return
+
+    seen_names.add(name)
+
+    # Return type
+    result_type = cursor.result_type
+    return_type_str = result_type.spelling
+    return_struct = _resolve_struct_name(result_type)
+    is_pointer_return = _is_pointer_type(result_type)
+
+    # Params
+    params = []
+    seen_param_refs: set[str] = set()  # Avoid duplicate param connections
+
+    for child in cursor.get_children():
+        if child.kind == CursorKind.PARM_DECL:
+            param_type = child.type
+            param_name = child.spelling or f"param{len(params)}"
+            ref_struct = _resolve_struct_name(param_type)
+            is_ptr = _is_pointer_type(param_type)
+            category = _categorize_param_type(param_type)
+
+            params.append({
+                "name": param_name,
+                "type": param_type.spelling,
+                "refStruct": ref_struct,
+                "isPointer": is_ptr,
+                "category": category,
+            })
+
+            # Add param connection (deduplicate by struct name)
+            if ref_struct and ref_struct not in seen_param_refs:
+                seen_param_refs.add(ref_struct)
+                connections.append({
+                    "source": name,
+                    "target": ref_struct,
+                    "type": "param",
+                    "field": param_name,
+                })
+
+    # Return type connection
+    if return_struct:
+        connections.append({
+            "source": name,
+            "target": return_struct,
+            "type": "return",
+            "field": None,
+        })
+
+    # Walk function body for local struct variable usage
+    body_refs: set[str] = set()
+    # Don't duplicate refs already captured as params or return
+    body_refs.update(seen_param_refs)
+    if return_struct:
+        body_refs.add(return_struct)
+
+    for child in cursor.get_children():
+        if child.kind == CursorKind.COMPOUND_STMT:
+            _collect_body_struct_refs(child, name, connections, body_refs)
+
+    func_data = {
+        "name": name,
+        "returnType": return_type_str,
+        "returnStruct": return_struct,
+        "isPointerReturn": is_pointer_return,
+        "params": params,
+        "bodyStructRefs": sorted(body_refs - seen_param_refs - ({return_struct} if return_struct else set())),
+    }
+
+    if existing_idx is not None:
+        functions[existing_idx] = func_data
+    else:
+        functions.append(func_data)
 ===== END: c_parser.py =====
 ===== FILE: cstruct_routes.py =====
 """
@@ -1131,6 +1317,11 @@ char  *strstr(const char *haystack, const char *needle);
 .sidebar__badge--enum {
   background: rgba(236, 72, 153, 0.15);
   color: #EC4899;
+}
+
+.sidebar__badge--function {
+  background: rgba(5, 150, 105, 0.15);
+  color: #059669;
 }
 
 .sidebar__struct-name {
@@ -3241,6 +3432,7 @@ let rafId = null;
 // Drag state
 let isDragging = false;
 let isPanning = false;
+let dragMoved = false;
 let dragTarget = null;
 let dragOffset = { x: 0, y: 0 };
 let panStart = { x: 0, y: 0 };
@@ -3331,22 +3523,33 @@ function render() {
     return;
   }
 
+  // Compute trace subgraph if something is selected
+  const selected = getSelectedEntity();
+  const traceGraph = selected ? getConnectedSubgraph(selected) : null;
+
   // Draw connections first (under blocks)
-  drawAllConnections(colors);
+  drawAllConnections(colors, traceGraph);
 
   // Draw blocks
   const hovered = getHoveredEntity();
-  const selected = getSelectedEntity();
 
   for (const entity of entities) {
     const pos = getPosition(entity.name);
     if (!pos) continue;
+
+    // Dim blocks not in trace subgraph
+    if (traceGraph && !traceGraph.entities.has(entity.name)) {
+      ctx.globalAlpha = 0.15;
+    }
+
     drawBlock(
       ctx, entity, pos,
       entity.name === hovered,
       entity.name === selected,
       isCollapsed(entity.name),
     );
+
+    ctx.globalAlpha = 1.0;
   }
 }
 
@@ -3382,24 +3585,34 @@ function drawGrid(colors, viewport, dpr) {
 
 // ---- Connections ----
 
-function drawAllConnections(colors) {
+function drawAllConnections(colors, traceGraph) {
   const connections = getConnections();
   const hovered = getHoveredEntity();
 
-  for (const conn of connections) {
+  for (let i = 0; i < connections.length; i++) {
+    const conn = connections[i];
     const srcPos = getPosition(conn.source);
     const tgtPos = getPosition(conn.target);
     if (!srcPos || !tgtPos) continue;
 
     const srcEntity = getEntity(conn.source);
-    const tgtEntity = getEntity(conn.target);
     if (!srcEntity) continue;
 
     const isHighlighted = hovered === conn.source || hovered === conn.target;
-    const color = isHighlighted ? colors.connectionLine : colors.connectionLineDim;
+    const isInTrace = traceGraph ? traceGraph.connections.has(i) : true;
+
+    // Choose color based on connection type
+    let color;
+    if (conn.type === 'return') {
+      color = colors.connectionReturn;
+    } else if (conn.type === 'uses') {
+      color = colors.connectionUses;
+    } else {
+      color = colors.connectionLine;  // 'nested' and 'param'
+    }
     const lineWidth = isHighlighted ? LINE.strokeWidthHover : LINE.strokeWidth;
 
-    // Find the field that references the target to get its Y position
+    // Find the field row for source anchor Y position
     const fieldIdx = srcEntity.fields
       ? srcEntity.fields.findIndex(f => f.name === conn.field)
       : -1;
@@ -3412,11 +3625,52 @@ function drawAllConnections(colors) {
     const srcAnchor = calculateAnchor(srcPos, srcSide, srcYOffset);
     const tgtAnchor = calculateAnchor(tgtPos, tgtSide, tgtYOffset);
 
-    ctx.globalAlpha = isHighlighted ? 1.0 : (hovered ? 0.2 : 0.6);
+    // Dimming: trace mode dims non-trace connections, hover dims non-hovered
+    if (traceGraph && !isInTrace) {
+      ctx.globalAlpha = 0.05;
+    } else {
+      ctx.globalAlpha = isHighlighted ? 1.0 : (hovered ? 0.2 : 0.6);
+    }
+
+    // Dashed lines for 'uses' connections
+    if (conn.type === 'uses') {
+      ctx.setLineDash([4, 4]);
+    }
+
     drawBezierConnection(ctx, srcAnchor, tgtAnchor, color, lineWidth);
     drawArrow(ctx, tgtAnchor, color);
+
+    ctx.setLineDash([]);
     ctx.globalAlpha = 1.0;
   }
+}
+
+/** BFS through connections to find all entities connected to the selected one. */
+function getConnectedSubgraph(entityName) {
+  const connections = getConnections();
+  const connected = new Set([entityName]);
+  const connectedConns = new Set();
+
+  const queue = [entityName];
+  while (queue.length > 0) {
+    const current = queue.shift();
+    for (let i = 0; i < connections.length; i++) {
+      const conn = connections[i];
+      if (conn.source === current && !connected.has(conn.target)) {
+        connected.add(conn.target);
+        connectedConns.add(i);
+        queue.push(conn.target);
+      } else if (conn.target === current && !connected.has(conn.source)) {
+        connected.add(conn.source);
+        connectedConns.add(i);
+        queue.push(conn.source);
+      } else if (conn.source === current || conn.target === current) {
+        connectedConns.add(i);
+      }
+    }
+  }
+
+  return { entities: connected, connections: connectedConns };
 }
 
 // ---- Layout ----
@@ -3578,6 +3832,8 @@ function onMouseDown(e) {
   const { x, y } = screenToCanvas(pos.x, pos.y);
   const hit = hitTestBlock(x, y);
 
+  dragMoved = false;
+
   if (hit) {
     isDragging = true;
     dragTarget = hit;
@@ -3596,6 +3852,7 @@ function onMouseMove(e) {
   const { x, y } = screenToCanvas(pos.x, pos.y);
 
   if (isDragging && dragTarget) {
+    dragMoved = true;
     setPosition(dragTarget, {
       ...getPosition(dragTarget),
       x: x - dragOffset.x,
@@ -3605,6 +3862,7 @@ function onMouseMove(e) {
   }
 
   if (isPanning) {
+    dragMoved = true;
     const vp = getViewport();
     setViewport({
       panX: vp.panX + (pos.x - panStart.x),
@@ -3635,10 +3893,25 @@ function onMouseMove(e) {
   updateFieldDetail(hit, x, y);
 }
 
-function onMouseUp() {
+function onMouseUp(e) {
+  const wasDrag = dragMoved;
   isDragging = false;
   isPanning = false;
   dragTarget = null;
+
+  // Click-to-select: if mouse didn't move, treat as a click
+  if (!wasDrag && e) {
+    const pos = getMousePos(e);
+    const { x, y } = screenToCanvas(pos.x, pos.y);
+    const hit = hitTestBlock(x, y);
+    if (hit) {
+      setSelectedEntity(hit);
+    } else if (getSelectedEntity()) {
+      // Click empty space to deselect
+      setSelectedEntity(getSelectedEntity());
+    }
+  }
+
   canvas.style.cursor = getHoveredEntity() ? 'pointer' : 'grab';
 }
 
@@ -3670,13 +3943,7 @@ function onDblClick(e) {
   const hit = hitTestBlock(x, y);
 
   if (hit) {
-    // Double-click header area to collapse/expand
-    const blockPos = getPosition(hit);
-    if (blockPos && y < blockPos.y + BLOCK.headerHeight) {
-      toggleCollapsed(hit);
-    } else {
-      setSelectedEntity(hit);
-    }
+    toggleCollapsed(hit);
   }
 }
 
@@ -3690,18 +3957,31 @@ function renderStructList() {
   const enums = getState().enums || [];
 
   if (entities.length === 0 && enums.length === 0) {
-    list.innerHTML = '<div class="sidebar__empty">Upload C files to see structs</div>';
+    list.innerHTML = '<div class="sidebar__empty">Upload C files to see types</div>';
     return;
   }
 
   let html = '';
   for (const entity of entities) {
-    const icon = entity.isUnion ? 'U' : 'S';
-    const iconClass = entity.isUnion ? 'sidebar__badge--union' : 'sidebar__badge--struct';
+    let icon, iconClass, meta;
+    if (entity.isFunction) {
+      icon = 'F';
+      iconClass = 'sidebar__badge--function';
+      meta = `${entity.params ? entity.params.length : 0}p`;
+    } else if (entity.isUnion) {
+      icon = 'U';
+      iconClass = 'sidebar__badge--union';
+      meta = `${entity.totalSize}B`;
+    } else {
+      icon = 'S';
+      iconClass = 'sidebar__badge--struct';
+      meta = `${entity.totalSize}B`;
+    }
+    const displayName = entity.name.startsWith('__anon_') ? '(anonymous)' : entity.name;
     html += `<div class="sidebar__struct-item" data-entity="${entity.name}">
       <span class="sidebar__badge ${iconClass}">${icon}</span>
-      <span class="sidebar__struct-name">${entity.name.startsWith('__anon_') ? '(anonymous)' : entity.name}</span>
-      <span class="sidebar__struct-size">${entity.totalSize}B</span>
+      <span class="sidebar__struct-name">${displayName}</span>
+      <span class="sidebar__struct-size">${meta}</span>
     </div>`;
   }
 
@@ -3763,6 +4043,28 @@ function updateFieldDetail(entityName, cx, cy) {
   if (!entity || !pos) return;
 
   const fIdx = hitTestField(entity, pos, cx, cy, isCollapsed(entityName));
+
+  // Function entity — show return type and param info
+  if (entity.isFunction) {
+    if (fIdx < 0 || !entity.params || fIdx >= entity.params.length) {
+      const retStr = entity.returnType || 'void';
+      detail.innerHTML = `<div class="field-detail__header">${entity.name}()</div>
+        <div class="field-detail__meta">Returns: <code>${retStr}</code></div>
+        <div class="field-detail__meta">${entity.params?.length || 0} parameter(s)</div>
+        ${entity.bodyStructRefs?.length ? `<div class="field-detail__meta">Uses: ${entity.bodyStructRefs.join(', ')}</div>` : ''}`;
+      return;
+    }
+    const param = entity.params[fIdx];
+    detail.innerHTML = `
+      <div class="field-detail__header">${entity.name}(${param.name})</div>
+      <div class="field-detail__row"><span>Type:</span> <code>${param.type}</code></div>
+      <div class="field-detail__row"><span>Direction:</span> parameter${param.isPointer ? ' (pointer)' : ' (by value)'}</div>
+      ${param.refStruct ? `<div class="field-detail__row"><span>Struct ref:</span> ${param.refStruct}</div>` : ''}
+    `;
+    return;
+  }
+
+  // Struct/union entity
   if (fIdx < 0 || !entity.fields || fIdx >= entity.fields.length) {
     detail.innerHTML = `<div class="field-detail__header">${entity.name}</div>
       <div class="field-detail__meta">${entity.totalSize}B | ${entity.alignment}-byte aligned${entity.packed ? ' | PACKED' : ''}</div>`;
@@ -3908,7 +4210,9 @@ function drawHeader(ctx, entity, x, y, width, r, colors) {
   ctx.arcTo(x, y, x + r, y, r);
   ctx.closePath();
 
-  if (entity.isUnion) {
+  if (entity.isFunction) {
+    ctx.fillStyle = colors.functionHeader;
+  } else if (entity.isUnion) {
     ctx.fillStyle = colors.unionHeader;
   } else {
     ctx.fillStyle = colors.headerBg;
@@ -3925,7 +4229,8 @@ function drawHeader(ctx, entity, x, y, width, r, colors) {
   ctx.stroke();
 
   // Entity name
-  const textColor = entity.isUnion ? colors.unionHeaderText : colors.headerText;
+  const textColor = entity.isFunction ? colors.functionHeaderText
+    : entity.isUnion ? colors.unionHeaderText : colors.headerText;
   ctx.fillStyle = textColor;
   ctx.font = 'bold 12px system-ui, sans-serif';
   ctx.textBaseline = 'middle';
@@ -3939,20 +4244,28 @@ function drawHeader(ctx, entity, x, y, width, r, colors) {
   label = truncateText(ctx, label, maxNameWidth);
   ctx.fillText(label, x + 10, y + hh / 2);
 
-  // Meta info: size, alignment, endianness
+  // Meta info
   ctx.font = '10px system-ui, sans-serif';
-  ctx.fillStyle = entity.isUnion ? colors.unionHeaderText : colors.headerMeta;
+  ctx.fillStyle = entity.isFunction ? colors.functionHeaderText
+    : entity.isUnion ? colors.unionHeaderText : colors.headerMeta;
   ctx.textAlign = 'right';
 
-  const sizeStr = entity.totalSize >= 0 ? `${entity.totalSize}B` : '?B';
-  const alignStr = entity.alignment > 0 ? `${entity.alignment}-al` : '';
-  const typeLabel = entity.isUnion ? 'union' : '';
-  const parts = [typeLabel, sizeStr, alignStr].filter(Boolean);
-  ctx.fillText(parts.join('  '), x + width - 10, y + hh / 2);
+  if (entity.isFunction) {
+    const retStr = entity.returnType || 'void';
+    const paramCount = entity.params ? entity.params.length : 0;
+    const parts = [`\u2192 ${retStr}`, `${paramCount}p`];
+    ctx.fillText(parts.join('  '), x + width - 10, y + hh / 2);
+  } else {
+    const sizeStr = entity.totalSize >= 0 ? `${entity.totalSize}B` : '?B';
+    const alignStr = entity.alignment > 0 ? `${entity.alignment}-al` : '';
+    const typeLabel = entity.isUnion ? 'union' : '';
+    const parts = [typeLabel, sizeStr, alignStr].filter(Boolean);
+    ctx.fillText(parts.join('  '), x + width - 10, y + hh / 2);
+  }
   ctx.textAlign = 'start';
 
-  // Packed badge
-  if (entity.packed) {
+  // Packed badge (structs only)
+  if (entity.packed && !entity.isFunction) {
     drawPackedBadge(ctx, x + width - 10, y + 4, colors);
   }
 }
@@ -4234,6 +4547,10 @@ export const CANVAS_COLORS = {
   unionHeaderText: '#FFFFFF',
   packedBadgeBg: '#FEF3C7',
   packedBadgeText: '#92400E',
+  functionHeader: '#059669',
+  functionHeaderText: '#FFFFFF',
+  connectionReturn: '#059669',
+  connectionUses: '#9CA3AF',
 };
 
 // ---- Canvas colors (dark mode) ----
@@ -4259,6 +4576,10 @@ export const CANVAS_COLORS_DARK = {
   unionHeaderText: '#F5F3FF',
   packedBadgeBg: '#422006',
   packedBadgeText: '#FDE68A',
+  functionHeader: '#10B981',
+  functionHeaderText: '#ECFDF5',
+  connectionReturn: '#34D399',
+  connectionUses: '#6B7280',
 };
 
 // ---- Connection line constants ----
@@ -4293,9 +4614,10 @@ import { EventBus } from '../events.js';
 const state = {
   structs: [],        // [{name, totalSize, alignment, packed, isUnion:false, fields:[...]}]
   unions: [],         // [{name, totalSize, alignment, packed, isUnion:true, fields:[...]}]
+  functions: [],      // [{name, returnType, returnStruct, isFunction:true, params:[...], fields:[...]}]
   typedefs: {},       // {typedef_name: canonical_name}
   enums: [],          // [{name, values:[{name, value}]}]
-  connections: [],    // [{source, target, type:'nested', field}]
+  connections: [],    // [{source, target, type:'nested'|'param'|'return'|'uses', field}]
   positions: {},      // {entityName: {x, y, width, height}}
   viewport: { panX: 0, panY: 0, zoom: 1.0 },
   collapsed: {},      // {entityName: true}
@@ -4321,13 +4643,18 @@ export function getUnions() {
   return state.unions;
 }
 
+export function getFunctions() {
+  return state.functions;
+}
+
 export function getAllEntities() {
-  return [...state.structs, ...state.unions];
+  return [...state.structs, ...state.unions, ...state.functions];
 }
 
 export function getEntity(name) {
   return state.structs.find(s => s.name === name)
-    || state.unions.find(u => u.name === name);
+    || state.unions.find(u => u.name === name)
+    || state.functions.find(f => f.name === name);
 }
 
 export function getTypedefs() {
@@ -4396,12 +4723,29 @@ export function loadParseResult(result) {
   state.hoveredField = null;
   state.selectedEntity = null;
 
+  // Map functions: create a fields array from params so block drawing works
+  state.functions = (result.functions || []).map(f => ({
+    ...f,
+    isFunction: true,
+    fields: (f.params || []).map(p => ({
+      name: p.name || '(unnamed)',
+      type: p.type,
+      category: p.category || (p.refStruct ? (p.isPointer ? 'pointer' : 'struct') : 'integer'),
+      refStruct: p.refStruct || null,
+      offset: null,
+      size: null,
+      bitOffset: null,
+      bitSize: null,
+    })),
+  }));
+
   if (result.target_info) {
     state.targetArch = result.target_info.key || 'arm';
     state.endianness = result.target_info.endianness || 'little';
   }
 
-  EventBus.emit('cstructDataLoaded', { count: state.structs.length + state.unions.length });
+  const count = state.structs.length + state.unions.length + state.functions.length;
+  EventBus.emit('cstructDataLoaded', { count });
   EventBus.emit('cstructStateChanged', { key: 'all' });
 }
 
@@ -4451,6 +4795,7 @@ export function setTargetArch(arch) {
 export function resetState() {
   state.structs = [];
   state.unions = [];
+  state.functions = [];
   state.typedefs = {};
   state.enums = [];
   state.connections = [];
@@ -4715,9 +5060,11 @@ async function uploadFileMap(fileMap) {
     const summary = fileCount <= 3
       ? paths.join(', ')
       : `${fileCount} files from ${getCommonPrefix(paths)}`;
+    const funcCount = result.functions?.length || 0;
     const types = [
       structCount ? `${structCount} struct${structCount !== 1 ? 's' : ''}` : '',
       enumCount ? `${enumCount} enum${enumCount !== 1 ? 's' : ''}` : '',
+      funcCount ? `${funcCount} function${funcCount !== 1 ? 's' : ''}` : '',
     ].filter(Boolean).join(', ');
 
     setUploadStatus('success', `${summary} \u2014 ${types || 'no types found'}`);
@@ -4829,7 +5176,7 @@ function setUploadStatus(status, message) {
 
       <!-- Struct List -->
       <div class="sidebar__section sidebar__section--grow">
-        <div class="sidebar__section-title">Structs &amp; Unions</div>
+        <div class="sidebar__section-title">Types &amp; Functions</div>
         <div class="sidebar__struct-list" id="struct-list">
           <div class="sidebar__empty">Upload C files to see structs</div>
         </div>

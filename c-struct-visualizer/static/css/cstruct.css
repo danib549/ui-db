@@ -178,6 +178,11 @@
   color: #EC4899;
 }
 
+.sidebar__badge--function {
+  background: rgba(5, 150, 105, 0.15);
+  color: #059669;
+}
+
 .sidebar__struct-name {
   flex: 1;
   overflow: hidden;

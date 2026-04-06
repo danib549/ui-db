@@ -67,6 +67,10 @@ export const CANVAS_COLORS = {
   unionHeaderText: '#FFFFFF',
   packedBadgeBg: '#FEF3C7',
   packedBadgeText: '#92400E',
+  functionHeader: '#059669',
+  functionHeaderText: '#FFFFFF',
+  connectionReturn: '#059669',
+  connectionUses: '#9CA3AF',
 };
 
 // ---- Canvas colors (dark mode) ----
@@ -92,6 +96,10 @@ export const CANVAS_COLORS_DARK = {
   unionHeaderText: '#F5F3FF',
   packedBadgeBg: '#422006',
   packedBadgeText: '#FDE68A',
+  functionHeader: '#10B981',
+  functionHeaderText: '#ECFDF5',
+  connectionReturn: '#34D399',
+  connectionUses: '#6B7280',
 };
 
 // ---- Connection line constants ----

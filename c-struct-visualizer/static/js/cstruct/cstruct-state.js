@@ -9,9 +9,10 @@ import { EventBus } from '../events.js';
 const state = {
   structs: [],        // [{name, totalSize, alignment, packed, isUnion:false, fields:[...]}]
   unions: [],         // [{name, totalSize, alignment, packed, isUnion:true, fields:[...]}]
+  functions: [],      // [{name, returnType, returnStruct, isFunction:true, params:[...], fields:[...]}]
   typedefs: {},       // {typedef_name: canonical_name}
   enums: [],          // [{name, values:[{name, value}]}]
-  connections: [],    // [{source, target, type:'nested', field}]
+  connections: [],    // [{source, target, type:'nested'|'param'|'return'|'uses', field}]
   positions: {},      // {entityName: {x, y, width, height}}
   viewport: { panX: 0, panY: 0, zoom: 1.0 },
   collapsed: {},      // {entityName: true}
@@ -37,13 +38,18 @@ export function getUnions() {
   return state.unions;
 }
 
+export function getFunctions() {
+  return state.functions;
+}
+
 export function getAllEntities() {
-  return [...state.structs, ...state.unions];
+  return [...state.structs, ...state.unions, ...state.functions];
 }
 
 export function getEntity(name) {
   return state.structs.find(s => s.name === name)
-    || state.unions.find(u => u.name === name);
+    || state.unions.find(u => u.name === name)
+    || state.functions.find(f => f.name === name);
 }
 
 export function getTypedefs() {
@@ -112,12 +118,29 @@ export function loadParseResult(result) {
   state.hoveredField = null;
   state.selectedEntity = null;
 
+  // Map functions: create a fields array from params so block drawing works
+  state.functions = (result.functions || []).map(f => ({
+    ...f,
+    isFunction: true,
+    fields: (f.params || []).map(p => ({
+      name: p.name || '(unnamed)',
+      type: p.type,
+      category: p.category || (p.refStruct ? (p.isPointer ? 'pointer' : 'struct') : 'integer'),
+      refStruct: p.refStruct || null,
+      offset: null,
+      size: null,
+      bitOffset: null,
+      bitSize: null,
+    })),
+  }));
+
   if (result.target_info) {
     state.targetArch = result.target_info.key || 'arm';
     state.endianness = result.target_info.endianness || 'little';
   }
 
-  EventBus.emit('cstructDataLoaded', { count: state.structs.length + state.unions.length });
+  const count = state.structs.length + state.unions.length + state.functions.length;
+  EventBus.emit('cstructDataLoaded', { count });
   EventBus.emit('cstructStateChanged', { key: 'all' });
 }
 
@@ -167,6 +190,7 @@ export function setTargetArch(arch) {
 export function resetState() {
   state.structs = [];
   state.unions = [];
+  state.functions = [];
   state.typedefs = {};
   state.enums = [];
   state.connections = [];

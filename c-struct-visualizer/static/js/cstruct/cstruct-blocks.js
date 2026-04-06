@@ -74,7 +74,9 @@ function drawHeader(ctx, entity, x, y, width, r, colors) {
   ctx.arcTo(x, y, x + r, y, r);
   ctx.closePath();
 
-  if (entity.isUnion) {
+  if (entity.isFunction) {
+    ctx.fillStyle = colors.functionHeader;
+  } else if (entity.isUnion) {
     ctx.fillStyle = colors.unionHeader;
   } else {
     ctx.fillStyle = colors.headerBg;
@@ -91,7 +93,8 @@ function drawHeader(ctx, entity, x, y, width, r, colors) {
   ctx.stroke();
 
   // Entity name
-  const textColor = entity.isUnion ? colors.unionHeaderText : colors.headerText;
+  const textColor = entity.isFunction ? colors.functionHeaderText
+    : entity.isUnion ? colors.unionHeaderText : colors.headerText;
   ctx.fillStyle = textColor;
   ctx.font = 'bold 12px system-ui, sans-serif';
   ctx.textBaseline = 'middle';
@@ -105,20 +108,28 @@ function drawHeader(ctx, entity, x, y, width, r, colors) {
   label = truncateText(ctx, label, maxNameWidth);
   ctx.fillText(label, x + 10, y + hh / 2);
 
-  // Meta info: size, alignment, endianness
+  // Meta info
   ctx.font = '10px system-ui, sans-serif';
-  ctx.fillStyle = entity.isUnion ? colors.unionHeaderText : colors.headerMeta;
+  ctx.fillStyle = entity.isFunction ? colors.functionHeaderText
+    : entity.isUnion ? colors.unionHeaderText : colors.headerMeta;
   ctx.textAlign = 'right';
 
-  const sizeStr = entity.totalSize >= 0 ? `${entity.totalSize}B` : '?B';
-  const alignStr = entity.alignment > 0 ? `${entity.alignment}-al` : '';
-  const typeLabel = entity.isUnion ? 'union' : '';
-  const parts = [typeLabel, sizeStr, alignStr].filter(Boolean);
-  ctx.fillText(parts.join('  '), x + width - 10, y + hh / 2);
+  if (entity.isFunction) {
+    const retStr = entity.returnType || 'void';
+    const paramCount = entity.params ? entity.params.length : 0;
+    const parts = [`\u2192 ${retStr}`, `${paramCount}p`];
+    ctx.fillText(parts.join('  '), x + width - 10, y + hh / 2);
+  } else {
+    const sizeStr = entity.totalSize >= 0 ? `${entity.totalSize}B` : '?B';
+    const alignStr = entity.alignment > 0 ? `${entity.alignment}-al` : '';
+    const typeLabel = entity.isUnion ? 'union' : '';
+    const parts = [typeLabel, sizeStr, alignStr].filter(Boolean);
+    ctx.fillText(parts.join('  '), x + width - 10, y + hh / 2);
+  }
   ctx.textAlign = 'start';
 
-  // Packed badge
-  if (entity.packed) {
+  // Packed badge (structs only)
+  if (entity.packed && !entity.isFunction) {
     drawPackedBadge(ctx, x + width - 10, y + 4, colors);
   }
 }
