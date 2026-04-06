@@ -16,6 +16,10 @@ export function initUpload() {
 
   if (!dropZone || !fileInput) return;
 
+  // Prevent browser default file-open on drag anywhere on the page
+  document.addEventListener('dragover', (e) => e.preventDefault());
+  document.addEventListener('drop', (e) => e.preventDefault());
+
   // Click to browse
   dropZone.addEventListener('click', () => fileInput.click());
 
@@ -29,6 +33,7 @@ export function initUpload() {
   // Drag and drop on the upload zone
   dropZone.addEventListener('dragover', (e) => {
     e.preventDefault();
+    e.stopPropagation();
     dropZone.classList.add('upload-zone--active');
   });
 
@@ -38,6 +43,7 @@ export function initUpload() {
 
   dropZone.addEventListener('drop', (e) => {
     e.preventDefault();
+    e.stopPropagation();
     dropZone.classList.remove('upload-zone--active');
     const files = e.dataTransfer.files;
     if (files.length > 0) {
@@ -50,6 +56,7 @@ export function initUpload() {
   if (canvasContainer) {
     canvasContainer.addEventListener('dragover', (e) => {
       e.preventDefault();
+      e.stopPropagation();
       canvasContainer.classList.add('canvas--dragover');
     });
     canvasContainer.addEventListener('dragleave', () => {
@@ -57,6 +64,7 @@ export function initUpload() {
     });
     canvasContainer.addEventListener('drop', (e) => {
       e.preventDefault();
+      e.stopPropagation();
       canvasContainer.classList.remove('canvas--dragover');
       const files = e.dataTransfer.files;
       if (files.length > 0) {
