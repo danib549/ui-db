@@ -1,0 +1,4627 @@
+===== FILE: .gitignore =====
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+bundle.txt
+*.egg-info/
+dist/
+build/
+===== END: .gitignore =====
+===== FILE: app.py =====
+"""
+app.py — Flask application for C Struct Visualizer.
+Thin route layer: registers blueprints, serves pages.
+"""
+
+from flask import Flask, render_template
+from cstruct_routes import cstruct_bp
+
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16 MB upload limit
+
+# Register blueprints
+app.register_blueprint(cstruct_bp)
+
+
+@app.route("/")
+def index():
+    """Serve the main C struct visualizer page."""
+    return render_template("index.html")
+
+
+if __name__ == "__main__":
+    app.run(debug=True, port=5001)
+===== END: app.py =====
+===== FILE: bundle_code.py =====
+#!/usr/bin/env python3
+"""
+bundle_code.py — Collect all project files into a single text file for easy recreation.
+
+Output format (per file):
+    ===== FILE: <relative_path> =====
+    <file contents>
+    ===== END: <relative_path> =====
+
+Usage:
+    python3 bundle_code.py                   # writes bundle.txt
+    python3 bundle_code.py -o my_output.txt  # custom output name
+    python3 bundle_code.py --unbundle bundle.txt  # recreate files from bundle
+"""
+
+import argparse
+import os
+import sys
+
+# Directories and files to skip when bundling
+SKIP_DIRS = {".git", "__pycache__", ".venv", "venv", "node_modules", ".tox", ".mypy_cache", ".pytest_cache", "tests", "test_data", "test_data_deep", "test_data_large"}
+SKIP_FILES = set()
+
+HEADER_FMT = "===== FILE: {} ====="
+FOOTER_FMT = "===== END: {} ====="
+
+DEFAULT_OUTPUT = "bundle.txt"
+
+
+def is_binary(filepath, block_size=8192):
+    """Heuristic: read a chunk and look for null bytes."""
+    try:
+        with open(filepath, "rb") as f:
+            chunk = f.read(block_size)
+        return b"\x00" in chunk
+    except OSError:
+        return True
+
+
+def bundle(root, output_path):
+    root = os.path.abspath(root)
+    output_abs = os.path.abspath(output_path)
+    collected = []
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        # Prune skipped directories in-place
+        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
+        filenames = sorted(filenames)
+
+        for fname in filenames:
+            full = os.path.join(dirpath, fname)
+            # Don't include the output file itself
+            if os.path.abspath(full) == output_abs:
+                continue
+            rel = os.path.relpath(full, root)
+            if fname in SKIP_FILES:
+                continue
+            if is_binary(full):
+                print(f"  [skip binary] {rel}")
+                continue
+
+            try:
+                with open(full, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+            except OSError as e:
+                print(f"  [skip error]  {rel}: {e}")
+                continue
+
+            collected.append((rel, content))
+            print(f"  [added]       {rel}")
+
+    with open(output_path, "w", encoding="utf-8") as out:
+        for rel, content in collected:
+            out.write(HEADER_FMT.format(rel) + "\n")
+            out.write(content)
+            if content and not content.endswith("\n"):
+                out.write("\n")
+            out.write(FOOTER_FMT.format(rel) + "\n")
+
+    print(f"\nBundled {len(collected)} file(s) into {output_path}")
+
+
+def unbundle(bundle_path, dest_dir="."):
+    """Recreate files from a bundle.txt."""
+    dest_dir = os.path.abspath(dest_dir)
+    current_file = None
+    lines = []
+    count = 0
+
+    with open(bundle_path, "r", encoding="utf-8") as f:
+        for line in f:
+            stripped = line.rstrip("\n")
+            if stripped.startswith("===== FILE: ") and stripped.endswith(" ====="):
+                current_file = stripped[len("===== FILE: "):-len(" =====")]
+                lines = []
+            elif stripped.startswith("===== END: ") and stripped.endswith(" ====="):
+                if current_file:
+                    out_path = os.path.join(dest_dir, current_file)
+                    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+                    with open(out_path, "w", encoding="utf-8") as wf:
+                        wf.write("\n".join(lines))
+                        if lines:
+                            wf.write("\n")
+                    print(f"  [restored] {current_file}")
+                    count += 1
+                current_file = None
+                lines = []
+            elif current_file is not None:
+                lines.append(line.rstrip("\n"))
+
+    print(f"\nRestored {count} file(s) into {dest_dir}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Bundle or unbundle project files.")
+    parser.add_argument("-o", "--output", default=DEFAULT_OUTPUT,
+                        help=f"Output bundle file (default: {DEFAULT_OUTPUT})")
+    parser.add_argument("-d", "--directory", default=".",
+                        help="Root directory to bundle (default: current dir)")
+    parser.add_argument("--unbundle", metavar="BUNDLE_FILE",
+                        help="Recreate files from an existing bundle")
+    parser.add_argument("--dest", default=".",
+                        help="Destination directory for unbundle (default: current dir)")
+    args = parser.parse_args()
+
+    if args.unbundle:
+        unbundle(args.unbundle, args.dest)
+    else:
+        bundle(args.directory, args.output)
+
+
+if __name__ == "__main__":
+    main()
+===== END: bundle_code.py =====
+===== FILE: c_parser.py =====
+"""
+c_parser.py — Parse C/H files using libclang to extract struct/union/enum layouts
+with precise field offsets, sizes, padding, and nesting connections.
+
+Pure functions only — no Flask, no HTTP, no side effects.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Optional
+
+from clang.cindex import (
+    Index,
+    TranslationUnit,
+    CursorKind,
+    TypeKind,
+    Cursor,
+)
+
+# Path to bundled fake system headers
+HEADERS_DIR = str(Path(__file__).parent / "cstruct_headers")
+
+# Target architecture → libclang triple + metadata
+TARGET_MAP: dict[str, dict] = {
+    "arm": {
+        "triple": "arm-none-eabi",
+        "pointer_size": 4,
+        "endianness": "little",
+        "label": "ARM (32-bit)",
+    },
+    "sparc": {
+        "triple": "sparc-unknown-elf",
+        "pointer_size": 4,
+        "endianness": "big",
+        "label": "SPARC/LEON3",
+    },
+    "linux_x64": {
+        "triple": "x86_64-unknown-linux-gnu",
+        "pointer_size": 8,
+        "endianness": "little",
+        "label": "Linux x86_64",
+    },
+    "win_x64": {
+        "triple": "x86_64-pc-windows-msvc",
+        "pointer_size": 8,
+        "endianness": "little",
+        "label": "Windows x64 (MSVC)",
+    },
+}
+
+
+def get_target_info(target_key: str) -> dict:
+    """Return target metadata or default to ARM."""
+    return TARGET_MAP.get(target_key, TARGET_MAP["arm"])
+
+
+def parse_c_files(
+    file_contents: dict[str, str],
+    target: str = "arm",
+) -> dict:
+    """Parse C source files and extract struct/union/enum layouts.
+
+    Args:
+        file_contents: {filename: source_code_string}
+        target: Target architecture key (arm, sparc, linux_x64, win_x64)
+
+    Returns:
+        {structs, unions, typedefs, enums, connections, warnings, target_info}
+    """
+    target_info = get_target_info(target)
+    triple = target_info["triple"]
+
+    # Build unsaved_files list for libclang
+    unsaved = [(name, content) for name, content in file_contents.items()]
+
+    # Pick the first file as the "main" translation unit
+    if not unsaved:
+        return _empty_result(target_info)
+
+    main_file = unsaved[0][0]
+
+    # Create a virtual main file that includes all uploaded files
+    if len(unsaved) > 1:
+        includes = "\n".join(f'#include "{name}"' for name, _ in unsaved)
+        main_file = "__main__.c"
+        unsaved.append((main_file, includes))
+
+    args = [
+        "-target", triple,
+        "-std=c11",
+        "-I", HEADERS_DIR,
+        "-fsyntax-only",
+        "-Wno-everything",
+    ]
+
+    index = Index.create()
+    try:
+        tu = index.parse(
+            main_file,
+            args=args,
+            unsaved_files=unsaved,
+            options=TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD,
+        )
+    except Exception as e:
+        return {**_empty_result(target_info), "warnings": [f"Parse error: {e}"]}
+
+    # Collect diagnostics as warnings
+    warnings = _collect_warnings(tu, file_contents)
+
+    # Walk AST
+    structs = []
+    unions = []
+    typedefs = {}
+    enums = []
+    connections = []
+    seen_names: set[str] = set()
+    anon_counter = {"struct": 0, "union": 0}
+
+    _walk_cursor(
+        tu.cursor,
+        file_contents,
+        structs,
+        unions,
+        typedefs,
+        enums,
+        connections,
+        seen_names,
+        anon_counter,
+        target_info,
+    )
+
+    return {
+        "structs": structs,
+        "unions": unions,
+        "typedefs": typedefs,
+        "enums": enums,
+        "connections": connections,
+        "warnings": warnings,
+        "target_info": {
+            "key": target,
+            "label": target_info["label"],
+            "endianness": target_info["endianness"],
+            "pointer_size": target_info["pointer_size"],
+        },
+    }
+
+
+def _empty_result(target_info: dict) -> dict:
+    return {
+        "structs": [],
+        "unions": [],
+        "typedefs": {},
+        "enums": [],
+        "connections": [],
+        "warnings": [],
+        "target_info": {
+            "key": "arm",
+            "label": target_info["label"],
+            "endianness": target_info["endianness"],
+            "pointer_size": target_info["pointer_size"],
+        },
+    }
+
+
+def _collect_warnings(tu: TranslationUnit, file_contents: dict[str, str]) -> list[str]:
+    """Extract useful diagnostics from the translation unit."""
+    warnings = []
+    for diag in tu.diagnostics:
+        msg = diag.spelling
+        # Flag missing includes specifically
+        if "file not found" in msg.lower():
+            fname = msg.split("'")[1] if "'" in msg else msg
+            warnings.append(
+                f"Missing include: {fname} \u2014 upload this file for complete parsing"
+            )
+        elif diag.severity >= 3:  # Error or Fatal
+            warnings.append(f"Parse warning: {msg}")
+    return warnings
+
+
+def _is_from_user_file(cursor: Cursor, file_contents: dict[str, str]) -> bool:
+    """Check if a cursor is from one of the user-uploaded files."""
+    loc = cursor.location
+    if loc.file is None:
+        return False
+    fname = loc.file.name
+    # Accept user files and our virtual main file
+    return fname in file_contents or fname == "__main__.c"
+
+
+def _walk_cursor(
+    cursor: Cursor,
+    file_contents: dict[str, str],
+    structs: list,
+    unions: list,
+    typedefs: dict,
+    enums: list,
+    connections: list,
+    seen_names: set,
+    anon_counter: dict,
+    target_info: dict,
+) -> None:
+    """Recursively walk the AST and collect type definitions."""
+    for child in cursor.get_children():
+        # Only process items from user files
+        if not _is_from_user_file(child, file_contents):
+            # Still recurse into __main__.c includes
+            if child.location.file and child.location.file.name == "__main__.c":
+                _walk_cursor(
+                    child, file_contents, structs, unions,
+                    typedefs, enums, connections, seen_names,
+                    anon_counter, target_info,
+                )
+            continue
+
+        if child.kind == CursorKind.STRUCT_DECL:
+            _process_record(
+                child, False, file_contents, structs, unions,
+                connections, seen_names, anon_counter, target_info,
+            )
+        elif child.kind == CursorKind.UNION_DECL:
+            _process_record(
+                child, True, file_contents, structs, unions,
+                connections, seen_names, anon_counter, target_info,
+            )
+        elif child.kind == CursorKind.TYPEDEF_DECL:
+            _process_typedef(child, typedefs)
+        elif child.kind == CursorKind.ENUM_DECL:
+            _process_enum(child, enums, seen_names, anon_counter)
+        else:
+            # Recurse
+            _walk_cursor(
+                child, file_contents, structs, unions,
+                typedefs, enums, connections, seen_names,
+                anon_counter, target_info,
+            )
+
+
+def _process_record(
+    cursor: Cursor,
+    is_union: bool,
+    file_contents: dict[str, str],
+    structs: list,
+    unions: list,
+    connections: list,
+    seen_names: set,
+    anon_counter: dict,
+    target_info: dict,
+) -> None:
+    """Process a struct or union declaration."""
+    # Skip forward declarations (no definition)
+    if not cursor.is_definition():
+        return
+
+    name = cursor.spelling
+    if not name:
+        key = "union" if is_union else "struct"
+        anon_counter[key] += 1
+        name = f"__anon_{key}_{anon_counter[key]}"
+
+    if name in seen_names:
+        return
+    seen_names.add(name)
+
+    # Get total size
+    record_type = cursor.type
+    total_size = record_type.get_size()
+    if total_size < 0:
+        total_size = 0
+
+    # Get alignment
+    alignment = record_type.get_align()
+    if alignment < 0:
+        alignment = 0
+
+    # Check for packed attribute
+    packed = _is_packed(cursor)
+
+    # Extract fields
+    fields = []
+    prev_end_bit = 0
+
+    for field_cursor in cursor.get_children():
+        if field_cursor.kind != CursorKind.FIELD_DECL:
+            continue
+
+        field = _extract_field(field_cursor, is_union, connections, name, target_info)
+        if field is None:
+            continue
+
+        # Insert padding before this field (only for non-packed structs)
+        if not is_union:
+            field_start_bit = field.get("_start_bit", 0)
+            if not packed and field_start_bit > prev_end_bit:
+                pad_bytes = (field_start_bit - prev_end_bit) // 8
+                if pad_bytes > 0:
+                    fields.append({
+                        "name": f"__pad_{len(fields)}",
+                        "type": "(padding)",
+                        "offset": prev_end_bit // 8,
+                        "size": pad_bytes,
+                        "bitOffset": None,
+                        "bitSize": None,
+                        "category": "padding",
+                    })
+
+            # Always track end of this field for tail padding computation
+            if field.get("bitSize"):
+                prev_end_bit = field_start_bit + field["bitSize"]
+            else:
+                prev_end_bit = field_start_bit + field["size"] * 8
+
+        # Remove internal tracking key
+        field.pop("_start_bit", None)
+        fields.append(field)
+
+    # Add tail padding for structs
+    if not is_union and total_size > 0 and fields:
+        last_end_byte = prev_end_bit // 8
+        if (prev_end_bit % 8) != 0:
+            last_end_byte += 1
+        if last_end_byte < total_size:
+            fields.append({
+                "name": "(tail padding)",
+                "type": "(padding)",
+                "offset": last_end_byte,
+                "size": total_size - last_end_byte,
+                "bitOffset": None,
+                "bitSize": None,
+                "category": "padding",
+            })
+
+    record = {
+        "name": name,
+        "totalSize": total_size,
+        "alignment": alignment,
+        "packed": packed,
+        "isUnion": is_union,
+        "fields": fields,
+    }
+
+    if is_union:
+        unions.append(record)
+    else:
+        structs.append(record)
+
+
+def _extract_field(
+    cursor: Cursor,
+    is_union: bool,
+    connections: list,
+    parent_name: str,
+    target_info: dict,
+) -> Optional[dict]:
+    """Extract a single field from a struct/union."""
+    field_name = cursor.spelling
+    field_type = cursor.type
+
+    # Type name
+    type_name = field_type.spelling
+
+    # Size in bytes
+    size = field_type.get_size()
+    if size < 0:
+        size = 0
+
+    # Bit offset from struct start
+    bit_offset_raw = cursor.get_field_offsetof()
+    byte_offset = bit_offset_raw // 8 if bit_offset_raw >= 0 else 0
+
+    # Check if this is a bitfield
+    is_bitfield = cursor.is_bitfield()
+    bit_size = None
+    if is_bitfield:
+        bit_size = cursor.get_bitfield_width()
+
+    # Categorize the field
+    category = _categorize_type(field_type, is_bitfield)
+
+    # Detect nested struct/union references
+    ref_struct = None
+    canonical = field_type.get_canonical()
+    if canonical.kind == TypeKind.RECORD:
+        ref_name = canonical.spelling
+        # Clean up "struct X" -> "X"
+        for prefix in ("struct ", "union "):
+            if ref_name.startswith(prefix):
+                ref_name = ref_name[len(prefix):]
+        if ref_name and ref_name != parent_name:
+            ref_struct = ref_name
+            connections.append({
+                "source": parent_name,
+                "target": ref_name,
+                "type": "nested",
+                "field": field_name,
+            })
+
+    # For arrays: check if element type is a struct
+    if field_type.kind == TypeKind.CONSTANTARRAY:
+        elem = field_type.element_type
+        elem_canonical = elem.get_canonical()
+        if elem_canonical.kind == TypeKind.RECORD:
+            ref_name = elem_canonical.spelling
+            for prefix in ("struct ", "union "):
+                if ref_name.startswith(prefix):
+                    ref_name = ref_name[len(prefix):]
+            if ref_name and ref_name != parent_name:
+                ref_struct = ref_name
+                connections.append({
+                    "source": parent_name,
+                    "target": ref_name,
+                    "type": "nested",
+                    "field": field_name,
+                })
+
+    result = {
+        "name": field_name,
+        "type": type_name,
+        "offset": byte_offset,
+        "size": size,
+        "bitOffset": bit_offset_raw if bit_offset_raw >= 0 else None,
+        "bitSize": bit_size,
+        "category": category,
+        "_start_bit": bit_offset_raw if bit_offset_raw >= 0 else 0,
+    }
+
+    if ref_struct:
+        result["refStruct"] = ref_struct
+
+    return result
+
+
+def _categorize_type(field_type, is_bitfield: bool) -> str:
+    """Categorize a field type for visual rendering."""
+    if is_bitfield:
+        return "bitfield"
+
+    canonical = field_type.get_canonical()
+    kind = canonical.kind
+
+    if kind == TypeKind.RECORD:
+        return "struct"
+
+    if kind == TypeKind.ENUM:
+        return "enum"
+
+    if kind == TypeKind.POINTER:
+        return "pointer"
+
+    if kind == TypeKind.CONSTANTARRAY or kind == TypeKind.INCOMPLETEARRAY:
+        return "array"
+
+    if kind in (TypeKind.FLOAT, TypeKind.DOUBLE, TypeKind.LONGDOUBLE):
+        return "float"
+
+    if kind == TypeKind.BOOL:
+        return "integer"
+
+    # Default: integer (covers char, short, int, long, etc.)
+    return "integer"
+
+
+def _is_packed(cursor: Cursor) -> bool:
+    """Check if a struct/union has __attribute__((packed)) or #pragma pack."""
+    # Check for packed attribute
+    for child in cursor.get_children():
+        if child.kind == CursorKind.PACKED_ATTR:
+            return True
+
+    # Heuristic: check if alignment equals 1 (packed structs have alignment 1)
+    alignment = cursor.type.get_align()
+    if alignment == 1:
+        # Verify it has fields with types that normally require > 1 alignment
+        for child in cursor.get_children():
+            if child.kind == CursorKind.FIELD_DECL:
+                field_align = child.type.get_align()
+                if field_align > 1:
+                    return True
+
+    return False
+
+
+def _process_typedef(cursor: Cursor, typedefs: dict) -> None:
+    """Process a typedef declaration."""
+    typedef_name = cursor.spelling
+    underlying = cursor.underlying_typedef_type
+
+    # Resolve to the canonical type name
+    canonical = underlying.get_canonical()
+    target_name = canonical.spelling
+
+    # Clean up struct/union prefix
+    for prefix in ("struct ", "union "):
+        if target_name.startswith(prefix):
+            target_name = target_name[len(prefix):]
+
+    if typedef_name and target_name and typedef_name != target_name:
+        typedefs[typedef_name] = target_name
+
+
+def _process_enum(
+    cursor: Cursor,
+    enums: list,
+    seen_names: set,
+    anon_counter: dict,
+) -> None:
+    """Process an enum declaration."""
+    if not cursor.is_definition():
+        return
+
+    name = cursor.spelling
+    if not name:
+        anon_counter.setdefault("enum", 0)
+        anon_counter["enum"] += 1
+        name = f"__anon_enum_{anon_counter['enum']}"
+
+    if name in seen_names:
+        return
+    seen_names.add(name)
+
+    values = []
+    for child in cursor.get_children():
+        if child.kind == CursorKind.ENUM_CONSTANT_DECL:
+            values.append({
+                "name": child.spelling,
+                "value": child.enum_value,
+            })
+
+    enums.append({
+        "name": name,
+        "values": values,
+    })
+===== END: c_parser.py =====
+===== FILE: cstruct_routes.py =====
+"""
+cstruct_routes.py — Flask Blueprint for /api/cstruct/* endpoints.
+Handles file upload and dispatches to c_parser.py.
+"""
+
+from flask import Blueprint, request, jsonify
+from c_parser import parse_c_files, TARGET_MAP
+
+cstruct_bp = Blueprint("cstruct", __name__, url_prefix="/api/cstruct")
+
+
+@cstruct_bp.route("/upload", methods=["POST"])
+def upload():
+    """Parse uploaded .c/.h files and return struct layouts.
+
+    Accepts multipart form with:
+      - files[]: one or more .c/.h files
+      - target: architecture key (arm, sparc, linux_x64, win_x64)
+    """
+    target = request.form.get("target", "arm")
+
+    # Collect uploaded files
+    file_contents: dict[str, str] = {}
+    uploaded = request.files.getlist("files[]")
+
+    if not uploaded:
+        return jsonify({"error": "No files uploaded"}), 400
+
+    for f in uploaded:
+        if f.filename:
+            content = f.read().decode("utf-8", errors="replace")
+            file_contents[f.filename] = content
+
+    if not file_contents:
+        return jsonify({"error": "No valid files found"}), 400
+
+    result = parse_c_files(file_contents, target)
+    return jsonify(result)
+
+
+@cstruct_bp.route("/targets", methods=["GET"])
+def list_targets():
+    """Return available target architectures."""
+    targets = []
+    for key, info in TARGET_MAP.items():
+        targets.append({
+            "key": key,
+            "label": info["label"],
+            "endianness": info["endianness"],
+            "pointer_size": info["pointer_size"],
+        })
+    return jsonify({"targets": targets})
+===== END: cstruct_routes.py =====
+===== FILE: requirements.txt =====
+flask
+libclang
+===== END: requirements.txt =====
+===== FILE: cstruct_headers/stdbool.h =====
+/* Minimal stdbool.h */
+#ifndef _STDBOOL_H
+#define _STDBOOL_H
+
+#define bool  _Bool
+#define true  1
+#define false 0
+
+#endif /* _STDBOOL_H */
+===== END: cstruct_headers/stdbool.h =====
+===== FILE: cstruct_headers/stddef.h =====
+/* Minimal stddef.h */
+#ifndef _STDDEF_H
+#define _STDDEF_H
+
+typedef unsigned long size_t;
+typedef long          ptrdiff_t;
+
+#ifndef NULL
+#define NULL ((void *)0)
+#endif
+
+#define offsetof(type, member) __builtin_offsetof(type, member)
+
+#endif /* _STDDEF_H */
+===== END: cstruct_headers/stddef.h =====
+===== FILE: cstruct_headers/stdint.h =====
+/* Minimal stdint.h — typedefs only, for libclang parsing */
+#ifndef _STDINT_H
+#define _STDINT_H
+
+typedef signed char        int8_t;
+typedef short              int16_t;
+typedef int                int32_t;
+typedef long long          int64_t;
+
+typedef unsigned char      uint8_t;
+typedef unsigned short     uint16_t;
+typedef unsigned int       uint32_t;
+typedef unsigned long long uint64_t;
+
+typedef signed char        int_least8_t;
+typedef short              int_least16_t;
+typedef int                int_least32_t;
+typedef long long          int_least64_t;
+
+typedef unsigned char      uint_least8_t;
+typedef unsigned short     uint_least16_t;
+typedef unsigned int       uint_least32_t;
+typedef unsigned long long uint_least64_t;
+
+typedef signed char        int_fast8_t;
+typedef int                int_fast16_t;
+typedef int                int_fast32_t;
+typedef long long          int_fast64_t;
+
+typedef unsigned char      uint_fast8_t;
+typedef unsigned int       uint_fast16_t;
+typedef unsigned int       uint_fast32_t;
+typedef unsigned long long uint_fast64_t;
+
+typedef long               intptr_t;
+typedef unsigned long      uintptr_t;
+
+typedef long long          intmax_t;
+typedef unsigned long long uintmax_t;
+
+#define INT8_MIN   (-128)
+#define INT16_MIN  (-32768)
+#define INT32_MIN  (-2147483647-1)
+#define INT64_MIN  (-9223372036854775807LL-1)
+
+#define INT8_MAX   127
+#define INT16_MAX  32767
+#define INT32_MAX  2147483647
+#define INT64_MAX  9223372036854775807LL
+
+#define UINT8_MAX  255
+#define UINT16_MAX 65535
+#define UINT32_MAX 4294967295U
+#define UINT64_MAX 18446744073709551615ULL
+
+#define SIZE_MAX   UINT64_MAX
+
+#endif /* _STDINT_H */
+===== END: cstruct_headers/stdint.h =====
+===== FILE: cstruct_headers/stdlib.h =====
+/* Minimal stdlib.h — declarations only */
+#ifndef _STDLIB_H
+#define _STDLIB_H
+
+#include <stddef.h>
+
+void *malloc(size_t size);
+void *calloc(size_t nmemb, size_t size);
+void *realloc(void *ptr, size_t size);
+void  free(void *ptr);
+
+int    atoi(const char *nptr);
+long   atol(const char *nptr);
+double atof(const char *nptr);
+
+void   exit(int status);
+void   abort(void);
+
+#endif /* _STDLIB_H */
+===== END: cstruct_headers/stdlib.h =====
+===== FILE: cstruct_headers/string.h =====
+/* Minimal string.h — declarations only */
+#ifndef _STRING_H
+#define _STRING_H
+
+#include <stddef.h>
+
+void *memcpy(void *dest, const void *src, size_t n);
+void *memmove(void *dest, const void *src, size_t n);
+void *memset(void *s, int c, size_t n);
+int   memcmp(const void *s1, const void *s2, size_t n);
+
+size_t strlen(const char *s);
+char  *strcpy(char *dest, const char *src);
+char  *strncpy(char *dest, const char *src, size_t n);
+char  *strcat(char *dest, const char *src);
+int    strcmp(const char *s1, const char *s2);
+int    strncmp(const char *s1, const char *s2, size_t n);
+char  *strchr(const char *s, int c);
+char  *strstr(const char *haystack, const char *needle);
+
+#endif /* _STRING_H */
+===== END: cstruct_headers/string.h =====
+===== FILE: static/css/cstruct.css =====
+/* ============================================
+   C Struct Visualizer — Page-Specific Styles
+   ============================================ */
+
+/* ---- Canvas area ---- */
+.canvas-area {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+  background: var(--canvas-bg);
+}
+
+.canvas-area canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  cursor: grab;
+}
+
+.canvas--dragover {
+  outline: 3px dashed var(--accent);
+  outline-offset: -3px;
+}
+
+/* ---- Upload zone ---- */
+.upload-zone {
+  border: 2px dashed var(--chrome-border);
+  border-radius: var(--radius-lg);
+  padding: 20px 16px;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color 0.15s, background-color 0.15s;
+}
+
+.upload-zone:hover,
+.upload-zone--active {
+  border-color: var(--accent);
+  background: var(--chrome-selected);
+}
+
+.upload-zone__icon {
+  font-size: 28px;
+  font-weight: 300;
+  color: var(--chrome-text-secondary);
+  line-height: 1;
+  margin-bottom: 4px;
+}
+
+.upload-zone__text {
+  font-size: 12px;
+  color: var(--chrome-text-secondary);
+  line-height: 1.5;
+}
+
+/* ---- Upload status ---- */
+.upload-status {
+  margin-top: 8px;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+}
+
+.upload-status--parsing {
+  background: var(--chrome-hover);
+  color: var(--chrome-text-secondary);
+}
+
+.upload-status--success {
+  background: rgba(34, 197, 94, 0.1);
+  color: #22C55E;
+}
+
+.upload-status--error {
+  background: rgba(239, 68, 68, 0.1);
+  color: #EF4444;
+}
+
+/* ---- Sidebar select ---- */
+.sidebar__select {
+  width: 100%;
+  padding: 6px 10px;
+  background: var(--chrome-input-bg);
+  color: var(--chrome-text);
+  border: 1px solid var(--chrome-border);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  font-family: inherit;
+  cursor: pointer;
+  appearance: auto;
+}
+
+.sidebar__select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* ---- Sidebar section grow ---- */
+.sidebar__section--grow {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+/* ---- Struct list ---- */
+.sidebar__struct-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sidebar__struct-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background-color 0.1s;
+  font-size: 13px;
+}
+
+.sidebar__struct-item:hover {
+  background: var(--chrome-hover);
+}
+
+.sidebar__struct-item--selected {
+  background: var(--chrome-selected);
+}
+
+.sidebar__badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.sidebar__badge--struct {
+  background: rgba(59, 130, 246, 0.15);
+  color: #3B82F6;
+}
+
+.sidebar__badge--union {
+  background: rgba(124, 58, 237, 0.15);
+  color: #8B5CF6;
+}
+
+.sidebar__badge--enum {
+  background: rgba(236, 72, 153, 0.15);
+  color: #EC4899;
+}
+
+.sidebar__struct-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--chrome-text);
+}
+
+.sidebar__struct-size {
+  font-size: 11px;
+  color: var(--chrome-text-secondary);
+  flex-shrink: 0;
+}
+
+/* ---- Sidebar empty state ---- */
+.sidebar__empty {
+  font-size: 12px;
+  color: var(--chrome-text-secondary);
+  padding: 8px 0;
+}
+
+/* ---- Theme toggle in header ---- */
+.sidebar__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.sidebar__theme-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-sm);
+  color: var(--chrome-text-secondary);
+  transition: background-color 0.1s, color 0.1s;
+}
+
+.sidebar__theme-btn:hover {
+  background: var(--chrome-hover);
+  color: var(--chrome-text);
+}
+
+body.dark .sidebar__theme-btn {
+  color: var(--accent);
+}
+
+/* ---- Warnings ---- */
+.warning-item {
+  padding: 6px 8px;
+  margin-bottom: 4px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  background: rgba(234, 179, 8, 0.1);
+  color: #EAB308;
+  border-left: 3px solid #EAB308;
+}
+
+/* ---- Field detail panel ---- */
+.field-detail {
+  font-size: 12px;
+}
+
+.field-detail__header {
+  font-weight: 600;
+  color: var(--chrome-text);
+  margin-bottom: 6px;
+  font-size: 13px;
+}
+
+.field-detail__meta {
+  color: var(--chrome-text-secondary);
+  margin-bottom: 4px;
+}
+
+.field-detail__row {
+  display: flex;
+  gap: 6px;
+  padding: 2px 0;
+  color: var(--chrome-text-secondary);
+}
+
+.field-detail__row span {
+  color: var(--chrome-text);
+  font-weight: 500;
+  flex-shrink: 0;
+}
+
+.field-detail__row code {
+  font-size: 12px;
+  color: var(--accent);
+}
+===== END: static/css/cstruct.css =====
+===== FILE: static/css/dark-mode.css =====
+/* ============================================
+   Dark Mode Theme Overrides
+   Applied when body has the "dark" class.
+   In dark mode, chrome and canvas are both dark
+   (light mode already has dark chrome with light canvas).
+   ============================================ */
+
+body.dark {
+  /* Canvas */
+  --canvas-bg: #1a1b23;
+  --grid-color: #2d2e3a;
+
+  /* Key colors (slightly brighter for dark bg) */
+  --pk-color: #FBBF24;
+  --fk-color: #60A5FA;
+  --uq-color: #A78BFA;
+  --idx-color: #2DD4BF;
+
+  /* Relationship colors */
+  --rel-one-one: #60A5FA;
+  --rel-one-many: #34D399;
+  --rel-many-many: #FB923C;
+  --rel-self: #C4B5FD;
+
+  /* UI (canvas-area elements like table-viewer modal) */
+  --text-primary: #E5E7EB;
+  --text-secondary: #9CA3AF;
+  --border-color: #374151;
+  --bg-white: #1F2028;
+  --bg-sidebar: #1a1b23;
+  --bg-header: #252630;
+  --bg-selected: rgba(59, 130, 246, 0.15);
+  --bg-hover: #2d2e3a;
+  --accent: #60A5FA;
+  --accent-dark: #93C5FD;
+
+  /* Chrome (sidebar/toolbar) — deeper dark in full dark mode */
+  --chrome-bg: #141520;
+  --chrome-text: #E5E7EB;
+  --chrome-text-secondary: #9CA3AF;
+  --chrome-border: #252630;
+  --chrome-hover: #1e1f2b;
+  --chrome-selected: rgba(59, 130, 246, 0.2);
+  --chrome-input-bg: #1a1b23;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 4px 6px rgba(0, 0, 0, 0.4);
+
+  color-scheme: dark;
+}
+
+/* Table viewer td border */
+body.dark .table-viewer__td {
+  border-bottom-color: #2d2e3a;
+}
+
+body.dark .table-viewer__th {
+  border-bottom-color: #374151;
+}
+
+/* Toast in dark mode */
+body.dark .toast {
+  background: #E5E7EB;
+  color: #1F2028;
+}
+
+/* Zoom indicator */
+body.dark .zoom-indicator {
+  background: rgba(229, 231, 235, 0.85);
+  color: #1F2028;
+}
+
+/* Table viewer backdrop darker */
+body.dark .table-viewer__backdrop {
+  background: rgba(0, 0, 0, 0.55);
+}
+
+/* Dark mode toggle button active state */
+body.dark #btn-theme {
+  background: var(--chrome-hover);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+===== END: static/css/dark-mode.css =====
+===== FILE: static/css/styles.css =====
+/* ============================================
+   CSS Custom Properties
+   ============================================ */
+:root {
+  /* Canvas */
+  --canvas-bg: #F9FAFB;
+  --grid-color: #E5E7EB;
+
+  /* Key colors */
+  --pk-color: #F59E0B;
+  --fk-color: #3B82F6;
+  --uq-color: #8B5CF6;
+  --idx-color: #14B8A6;
+
+  /* Relationship colors */
+  --rel-one-one: #3B82F6;
+  --rel-one-many: #22C55E;
+  --rel-many-many: #F97316;
+  --rel-self: #A78BFA;
+
+  /* UI */
+  --text-primary: #111827;
+  --text-secondary: #6B7280;
+  --border-color: #E5E7EB;
+  --bg-white: #FFFFFF;
+  --bg-sidebar: #1e1f2b;
+  --bg-header: #F9FAFB;
+  --bg-selected: #EFF6FF;
+  --bg-hover: #F3F4F6;
+  --accent: #3B82F6;
+  --accent-dark: #2563EB;
+
+  /* Sidebar / Toolbar chrome (dark panels on light canvas) */
+  --chrome-bg: #1e1f2b;
+  --chrome-text: #E5E7EB;
+  --chrome-text-secondary: #9CA3AF;
+  --chrome-border: #2d2e3a;
+  --chrome-hover: #2d2e3a;
+  --chrome-selected: rgba(59, 130, 246, 0.2);
+  --chrome-input-bg: #272836;
+
+  /* Sizing */
+  --sidebar-width: 280px;
+  --toolbar-height: 48px;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
+  --shadow-md: 0 4px 6px rgba(0, 0, 0, 0.07);
+
+  /* Radius */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+}
+
+/* ============================================
+   Reset & Base
+   ============================================ */
+*,
+*::before,
+*::after {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body {
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--text-primary);
+  background: var(--bg-white);
+}
+
+code, pre, .monospace {
+  font-family: 'JetBrains Mono', monospace;
+}
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+  border: none;
+  background: none;
+}
+
+input {
+  font-family: inherit;
+}
+
+ul {
+  list-style: none;
+}
+
+/* ============================================
+   App Layout
+   ============================================ */
+.app {
+  display: flex;
+  height: 100vh;
+  width: 100vw;
+}
+
+/* ============================================
+   Sidebar
+   ============================================ */
+.sidebar {
+  width: var(--sidebar-width);
+  min-width: var(--sidebar-width);
+  height: 100vh;
+  background: var(--chrome-bg);
+  border-right: 1px solid var(--chrome-border);
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  color: var(--chrome-text);
+}
+
+.sidebar__header {
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--chrome-border);
+}
+
+.sidebar__title {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--chrome-text);
+}
+
+.sidebar__section {
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--chrome-border);
+}
+
+.sidebar__section-title {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--chrome-text-secondary);
+  margin-bottom: 12px;
+}
+
+.sidebar__section-title--toggle {
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  user-select: none;
+}
+
+.sidebar__section-title--toggle:hover {
+  color: var(--chrome-text);
+}
+
+.sidebar__section-arrow {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  margin-right: 4px;
+  flex-shrink: 0;
+  transition: transform 0.2s ease;
+  transform: rotate(90deg);
+}
+
+.sidebar__section-arrow::before {
+  content: '';
+  display: block;
+  width: 0;
+  height: 0;
+  border-left: 5px solid currentColor;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+}
+
+.sidebar__section--collapsed .sidebar__section-arrow {
+  transform: rotate(0deg);
+}
+
+.sidebar__section--collapsed .sidebar__section-title {
+  margin-bottom: 0;
+}
+
+.sidebar__section--collapsed > *:not(.sidebar__section-title) {
+  display: none;
+}
+
+/* Upload Zone */
+.sidebar__upload {
+  border: 2px dashed var(--chrome-border);
+  border-radius: var(--radius-lg);
+  padding: 24px 16px;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color 0.15s, background-color 0.15s;
+}
+
+.sidebar__upload:hover,
+.sidebar__upload--active {
+  border-color: var(--accent);
+  background: var(--chrome-selected);
+}
+
+.sidebar__upload-icon {
+  font-size: 24px;
+  font-weight: 300;
+  color: var(--chrome-text-secondary);
+  margin-bottom: 4px;
+}
+
+.sidebar__upload-text {
+  font-size: 12px;
+  color: var(--chrome-text-secondary);
+}
+
+.sidebar__upload-input {
+  display: none;
+}
+
+/* Table List */
+.sidebar__table-list {
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.sidebar__table-item {
+  display: flex;
+  align-items: center;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  cursor: pointer;
+  transition: background-color 0.1s;
+}
+
+.sidebar__table-item:hover {
+  background: var(--chrome-hover);
+}
+
+.sidebar__table-item--selected {
+  background: var(--chrome-selected);
+  color: var(--accent);
+  font-weight: 500;
+}
+
+.sidebar__table-color {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  margin-right: 8px;
+  flex-shrink: 0;
+}
+
+/* Filter Panel */
+.filter-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.filter-panel__chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border-radius: 12px;
+  font-size: 12px;
+  background: var(--chrome-hover);
+  color: var(--chrome-text);
+  cursor: pointer;
+  transition: background-color 0.1s;
+}
+
+.filter-panel__chip:hover {
+  background: var(--chrome-border);
+}
+
+.filter-panel__chip--active {
+  background: var(--accent);
+  color: #fff;
+}
+
+/* Settings Panel */
+.settings-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.settings-panel__toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--chrome-text);
+}
+
+.settings-panel__hint {
+  margin: 0;
+  font-size: 11px;
+  color: var(--chrome-text-secondary, #888);
+  line-height: 1.3;
+}
+
+.settings-panel__toggle--hidden,
+.settings-panel__hint--hidden {
+  display: none;
+}
+
+.settings-panel__clear-btn {
+  margin-top: 6px;
+  padding: 4px 10px;
+  font-size: 12px;
+  color: var(--chrome-text);
+  background: var(--chrome-hover);
+  border: 1px solid var(--chrome-border);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.settings-panel__clear-btn:hover {
+  background: var(--chrome-input-bg);
+}
+
+/* Search Bar */
+.search-bar {
+  position: relative;
+}
+
+.search-bar__input {
+  width: 100%;
+  padding: 8px 12px;
+  border: 1px solid var(--chrome-border);
+  border-radius: var(--radius-md);
+  font-size: 13px;
+  color: var(--chrome-text);
+  background: var(--chrome-input-bg);
+  outline: none;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.search-bar__input::placeholder {
+  color: var(--chrome-text-secondary);
+}
+
+.search-bar__input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
+}
+
+/* ============================================
+   Main Area
+   ============================================ */
+.main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+/* ============================================
+   Toolbar
+   ============================================ */
+.toolbar {
+  height: var(--toolbar-height);
+  min-height: var(--toolbar-height);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--chrome-border);
+  background: var(--chrome-bg);
+  gap: 12px;
+}
+
+.toolbar__group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.toolbar__btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 6px 12px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--chrome-text);
+  background: var(--chrome-input-bg);
+  border: 1px solid var(--chrome-border);
+  border-radius: var(--radius-md);
+  transition: background-color 0.1s, border-color 0.1s;
+}
+
+.toolbar__btn:hover {
+  background: var(--chrome-hover);
+  border-color: var(--chrome-text-secondary);
+}
+
+.toolbar__btn--active {
+  background: var(--chrome-selected);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.toolbar__btn--icon {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  font-size: 16px;
+}
+
+.toolbar__zoom-label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--chrome-text-secondary);
+  min-width: 40px;
+  text-align: center;
+  user-select: none;
+}
+
+.toolbar__dropdown {
+  position: relative;
+}
+
+/* ============================================
+   Canvas Container
+   ============================================ */
+.canvas-container {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+  background: var(--canvas-bg);
+}
+
+.canvas-container canvas {
+  display: block;
+  /* Do NOT set CSS width/height — canvas.width/height are set by JS to match container.
+     CSS sizing causes a mismatch between internal resolution and display size,
+     breaking mouse coordinate calculations. */
+}
+
+.canvas-container__drop-overlay {
+  position: absolute;
+  inset: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: rgba(59, 130, 246, 0.08);
+  border: 3px dashed var(--accent);
+  border-radius: var(--radius-lg);
+  margin: 8px;
+  pointer-events: none;
+  z-index: 10;
+}
+
+.canvas-container__drop-overlay p {
+  font-size: 16px;
+  font-weight: 500;
+  color: var(--accent);
+}
+
+.canvas-container--drag-over .canvas-container__drop-overlay {
+  display: flex;
+}
+
+/* ============================================
+   Toast Notification
+   ============================================ */
+.toast {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%) translateY(20px);
+  padding: 10px 20px;
+  background: var(--text-primary);
+  color: var(--bg-white);
+  border-radius: var(--radius-md);
+  font-size: 13px;
+  font-weight: 500;
+  box-shadow: var(--shadow-md);
+  z-index: 1000;
+  opacity: 0;
+  transition: opacity 0.2s, transform 0.2s;
+  pointer-events: none;
+}
+
+.toast--visible {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+  pointer-events: auto;
+}
+
+/* ============================================
+   Zoom Indicator
+   ============================================ */
+.zoom-indicator {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  padding: 8px 20px;
+  background: rgba(17, 24, 39, 0.75);
+  color: var(--bg-white);
+  border-radius: var(--radius-md);
+  font-size: 18px;
+  font-weight: 600;
+  z-index: 999;
+  opacity: 0;
+  transition: opacity 0.15s;
+  pointer-events: none;
+}
+
+.zoom-indicator--visible {
+  opacity: 1;
+}
+
+/* ============================================
+   Legend
+   ============================================ */
+.legend {
+  position: absolute;
+  bottom: 16px;
+  right: 16px;
+  background: var(--chrome-bg);
+  border: 1px solid var(--chrome-border);
+  border-radius: var(--radius-md, 8px);
+  padding: 10px 14px;
+  min-width: 170px;
+  z-index: 20;
+  box-shadow: var(--shadow-md);
+  font-size: 12px;
+  color: var(--chrome-text);
+}
+
+.legend--hidden {
+  display: none;
+}
+
+.legend__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.legend__title {
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.legend__close {
+  background: none;
+  border: none;
+  color: var(--chrome-text-secondary);
+  cursor: pointer;
+  font-size: 16px;
+  padding: 0 2px;
+  line-height: 1;
+}
+
+.legend__close:hover {
+  color: var(--chrome-text);
+}
+
+.legend__section {
+  margin-bottom: 8px;
+}
+
+.legend__section:last-child {
+  margin-bottom: 0;
+}
+
+.legend__section-label {
+  display: block;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--chrome-text-secondary);
+  margin-bottom: 4px;
+}
+
+.legend__item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0;
+}
+
+.legend__line {
+  display: inline-block;
+  width: 24px;
+  height: 3px;
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+
+.legend__line--one-to-one   { background: var(--rel-one-one); }
+.legend__line--one-to-many  { background: var(--rel-one-many); }
+.legend__line--many-to-many { background: var(--rel-many-many); }
+.legend__line--self          { background: var(--rel-self); }
+
+.legend__badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 16px;
+  border-radius: 3px;
+  font-size: 9px;
+  font-weight: 700;
+  color: #fff;
+  flex-shrink: 0;
+}
+
+.legend__badge--pk { background: var(--pk-color); }
+.legend__badge--fk { background: var(--fk-color); }
+.legend__badge--uq { background: var(--uq-color); }
+
+.legend__label {
+  color: var(--chrome-text);
+}
+
+/* ============================================
+   Scrollbar Styling
+   ============================================ */
+.sidebar::-webkit-scrollbar,
+.sidebar__table-list::-webkit-scrollbar {
+  width: 6px;
+}
+
+.sidebar::-webkit-scrollbar-track,
+.sidebar__table-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.sidebar::-webkit-scrollbar-thumb,
+.sidebar__table-list::-webkit-scrollbar-thumb {
+  background: var(--chrome-border);
+  border-radius: 3px;
+}
+
+.sidebar::-webkit-scrollbar-thumb:hover,
+.sidebar__table-list::-webkit-scrollbar-thumb:hover {
+  background: var(--chrome-text-secondary);
+}
+
+/* ============================================
+   Search Results
+   ============================================ */
+.search-results {
+  margin-top: 8px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.search-results__group {
+  margin-bottom: 8px;
+}
+
+.search-results__table-name {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  color: var(--chrome-text-secondary);
+  padding: 4px 0;
+}
+
+.search-results__item {
+  display: flex;
+  justify-content: space-between;
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.search-results__item:hover {
+  background: var(--chrome-hover);
+}
+
+.search-results__column {
+  color: var(--chrome-text);
+  font-weight: 500;
+}
+
+.search-results__value {
+  color: var(--chrome-text-secondary);
+  max-width: 100px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.search-results__trace-btn {
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid var(--chrome-border);
+  border-radius: var(--radius-sm);
+  background: var(--chrome-input-bg);
+  color: var(--chrome-text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition: opacity 0.1s, background 0.1s;
+}
+
+.search-results__item:hover .search-results__trace-btn {
+  opacity: 1;
+}
+
+.search-results__trace-btn:hover {
+  background: var(--chrome-selected);
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* ============================================
+   Trace Panel
+   ============================================ */
+.trace-panel {
+  margin-top: 8px;
+}
+
+.trace-path {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+}
+
+.trace-node {
+  padding: 4px 8px;
+  background: var(--chrome-hover);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.trace-node:hover {
+  background: var(--chrome-selected);
+}
+
+.trace-node__depth {
+  font-size: 10px;
+  color: var(--chrome-text-secondary);
+  margin-right: 4px;
+}
+
+.trace-node__table {
+  font-weight: 500;
+}
+
+.trace-arrow {
+  color: var(--chrome-text-secondary);
+  font-size: 14px;
+}
+
+.trace-btn,
+.trace-btn--clear {
+  margin-top: 8px;
+  font-size: 12px;
+}
+
+/* ============================================
+   Filter Panel Groups
+   ============================================ */
+.filter-panel__group {
+  margin-bottom: 12px;
+}
+
+.filter-panel__group-title {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  color: var(--chrome-text-secondary);
+  margin-bottom: 6px;
+}
+
+.filter-panel__checkbox {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 0;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.filter-panel__checkbox input {
+  accent-color: var(--accent);
+}
+
+.filter-panel__controls {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--chrome-border);
+}
+
+.filter-panel__clear {
+  margin-top: 6px;
+  width: 100%;
+  font-size: 12px;
+}
+
+.sidebar__section--collapsed .filter-panel {
+  display: none;
+}
+
+/* ============================================
+   Export Dropdown Menu
+   ============================================ */
+.toolbar__dropdown-menu {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  margin-top: 4px;
+  background: var(--chrome-bg);
+  border: 1px solid var(--chrome-border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+  z-index: 100;
+  min-width: 140px;
+}
+
+.toolbar__dropdown-item {
+  display: block;
+  width: 100%;
+  padding: 8px 12px;
+  font-size: 13px;
+  text-align: left;
+  color: var(--chrome-text);
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+.toolbar__dropdown-item:hover {
+  background: var(--chrome-hover);
+}
+
+.toolbar__dropdown-item:first-child {
+  border-radius: var(--radius-md) var(--radius-md) 0 0;
+}
+
+.toolbar__dropdown-item:last-child {
+  border-radius: 0 0 var(--radius-md) var(--radius-md);
+}
+
+/* ============================================
+   Sidebar Table View Button
+   ============================================ */
+.sidebar__table-item {
+  position: relative;
+}
+
+.sidebar__table-view-btn {
+  margin-left: auto;
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid var(--chrome-border);
+  border-radius: var(--radius-sm);
+  background: var(--chrome-input-bg);
+  color: var(--chrome-text-secondary);
+  font-size: 14px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition: opacity 0.1s, background 0.1s;
+}
+
+.sidebar__table-item:hover .sidebar__table-view-btn {
+  opacity: 1;
+}
+
+.sidebar__table-view-btn:hover {
+  background: var(--chrome-selected);
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* ============================================
+   Table Viewer Modal
+   ============================================ */
+.table-viewer {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.table-viewer__backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.35);
+}
+
+.table-viewer__dialog {
+  position: relative;
+  width: 90vw;
+  max-width: 960px;
+  max-height: 80vh;
+  background: var(--bg-white);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.2);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.table-viewer__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 20px;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-header);
+}
+
+.table-viewer__title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.table-viewer__close {
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: none;
+  font-size: 20px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.table-viewer__close:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.table-viewer__grid {
+  flex: 1;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.table-viewer__count {
+  padding: 8px 20px 4px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.table-viewer__scroll {
+  flex: 1;
+  overflow: auto;
+  padding: 0 0 8px;
+}
+
+.table-viewer__loading,
+.table-viewer__empty {
+  padding: 40px 20px;
+  text-align: center;
+  color: var(--text-secondary);
+  font-size: 14px;
+}
+
+.table-viewer__table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.table-viewer__th {
+  position: sticky;
+  top: 0;
+  background: var(--bg-header);
+  padding: 8px 12px;
+  text-align: left;
+  font-weight: 600;
+  font-size: 12px;
+  color: var(--text-primary);
+  border-bottom: 2px solid var(--border-color);
+  white-space: nowrap;
+  z-index: 1;
+}
+
+.table-viewer__td {
+  padding: 6px 12px;
+  color: var(--text-primary);
+  border-bottom: 1px solid #F3F4F6;
+  cursor: pointer;
+  white-space: nowrap;
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: background 0.1s;
+}
+
+.table-viewer__td:hover {
+  background: var(--bg-selected);
+  color: var(--accent-dark);
+}
+
+.table-viewer__badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 600;
+  color: #fff;
+  vertical-align: middle;
+}
+
+.table-viewer__badge--pk { background: var(--pk-color); }
+.table-viewer__badge--fk { background: var(--fk-color); }
+.table-viewer__badge--uq { background: var(--uq-color); }
+
+/* ============================================================
+   Schema Advisor Panel
+   ============================================================ */
+
+.advisor-panel {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 480px;
+  max-width: 90vw;
+  background: var(--bg-white);
+  border-left: 1px solid var(--border-color);
+  box-shadow: -4px 0 16px rgba(0, 0, 0, 0.08);
+  z-index: 1000;
+  transform: translateX(100%);
+  transition: transform 0.22s ease-out;
+  display: flex;
+  flex-direction: column;
+  font-size: 13px;
+}
+
+.advisor-panel--open {
+  transform: translateX(0);
+}
+
+.advisor-panel__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-header);
+  flex-shrink: 0;
+}
+
+.advisor-panel__title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.advisor-panel__actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.advisor-panel__close {
+  background: transparent;
+  border: none;
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+  color: #6b7280;
+  padding: 0 6px;
+}
+
+.advisor-panel__close:hover { color: #111; }
+
+.advisor-panel__summary {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-header);
+  flex-shrink: 0;
+}
+
+.advisor-panel__body {
+  overflow-y: auto;
+  padding: 12px 16px;
+  flex: 1;
+}
+
+.advisor-counts {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 6px;
+  font-weight: 600;
+  font-size: 12px;
+}
+
+.advisor-count--error { color: #dc2626; }
+.advisor-count--warning { color: #d97706; }
+.advisor-count--info { color: #2563eb; }
+
+.advisor-stats {
+  font-size: 11px;
+  color: #6b7280;
+  margin-bottom: 10px;
+}
+
+.advisor-scores {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.advisor-score {
+  display: grid;
+  grid-template-columns: 110px 1fr 40px;
+  gap: 8px;
+  align-items: center;
+  font-size: 11px;
+}
+
+.advisor-score__label { color: #374151; }
+
+.advisor-score__bar {
+  height: 6px;
+  background: #e5e7eb;
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.advisor-score__fill {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.2s;
+}
+
+.advisor-score__fill--good { background: #10b981; }
+.advisor-score__fill--ok { background: #f59e0b; }
+.advisor-score__fill--bad { background: #ef4444; }
+
+.advisor-score__value {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  color: #6b7280;
+}
+
+.advisor-empty {
+  text-align: center;
+  color: #6b7280;
+  padding: 32px 16px;
+  font-size: 13px;
+}
+
+.advisor-empty--ok { color: #065f46; }
+.advisor-empty--error { color: #b91c1c; }
+
+.advisor-card {
+  border: 1px solid var(--border-color);
+  border-left-width: 4px;
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+  background: var(--bg-white);
+}
+
+.advisor-card--error { border-left-color: #dc2626; }
+.advisor-card--warning { border-left-color: #d97706; }
+.advisor-card--info { border-left-color: #2563eb; }
+
+.advisor-card__header {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  margin-bottom: 6px;
+}
+
+.advisor-card__icon {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: bold;
+  color: #fff;
+  background: #9ca3af;
+}
+
+.advisor-card--error .advisor-card__icon { background: #dc2626; }
+.advisor-card--warning .advisor-card__icon { background: #d97706; }
+.advisor-card--info .advisor-card__icon { background: #2563eb; }
+
+.advisor-card__title { flex: 1; min-width: 0; }
+
+.advisor-card__name {
+  font-weight: 600;
+  font-size: 13px;
+  color: #111827;
+}
+
+.advisor-card__location {
+  font-size: 11px;
+  color: #6b7280;
+  margin-top: 2px;
+}
+
+.advisor-card__location code {
+  background: transparent;
+  padding: 0;
+}
+
+.advisor-card__reason {
+  margin: 4px 0 8px;
+  color: #374151;
+  line-height: 1.4;
+  font-size: 12px;
+}
+
+.advisor-card__evidence {
+  margin: 6px 0;
+  font-size: 11px;
+  color: #4b5563;
+}
+
+.advisor-card__evidence summary {
+  cursor: pointer;
+  color: #6b7280;
+  user-select: none;
+}
+
+.advisor-card__evidence ul {
+  margin: 4px 0 0 0;
+  padding-left: 16px;
+}
+
+.advisor-card__sql {
+  background: #f9fafb;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  padding: 8px 10px;
+  font-size: 11px;
+  overflow-x: auto;
+  margin: 8px 0;
+  line-height: 1.4;
+  font-family: 'SF Mono', Monaco, Consolas, monospace;
+}
+
+.advisor-card__actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.advisor-btn {
+  padding: 5px 10px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-white);
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  color: #111827;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.advisor-btn:hover {
+  background: var(--bg-selected);
+  border-color: var(--accent);
+  color: var(--accent-dark);
+}
+
+.advisor-btn--secondary {
+  background: var(--bg-header);
+}
+
+/* Dark mode support */
+body.dark .advisor-panel {
+  background: #1f2937;
+  border-left-color: #374151;
+  color: #e5e7eb;
+}
+
+body.dark .advisor-panel__header,
+body.dark .advisor-panel__summary {
+  background: #111827;
+  border-bottom-color: #374151;
+}
+
+body.dark .advisor-panel__title { color: #f3f4f6; }
+body.dark .advisor-card { background: #111827; border-color: #374151; }
+body.dark .advisor-card__name { color: #f3f4f6; }
+body.dark .advisor-card__reason { color: #d1d5db; }
+body.dark .advisor-card__sql { background: #0f172a; border-color: #374151; color: #e5e7eb; }
+body.dark .advisor-btn { background: #1f2937; border-color: #374151; color: #e5e7eb; }
+body.dark .advisor-btn:hover { background: #374151; border-color: #60a5fa; color: #dbeafe; }
+body.dark .advisor-score__bar { background: #374151; }
+body.dark .advisor-score__label { color: #d1d5db; }
+body.dark .advisor-empty { color: #9ca3af; }
+
+/* ==========================================================================
+   Rebuilder Modal
+   ========================================================================== */
+
+.rebuilder-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 1100;
+  display: none;
+  align-items: center;
+  justify-content: center;
+}
+.rebuilder-modal--open { display: flex; }
+
+.rebuilder-modal__backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.55);
+}
+
+.rebuilder-modal__dialog {
+  position: relative;
+  width: min(1100px, 92vw);
+  height: min(800px, 88vh);
+  background: #fff;
+  border-radius: 10px;
+  box-shadow: 0 25px 60px rgba(0, 0, 0, 0.3);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.rebuilder-modal__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  padding: 18px 22px 12px;
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.rebuilder-modal__title {
+  margin: 0 0 6px;
+  font-size: 18px;
+  font-weight: 600;
+  color: #0f172a;
+}
+
+.rebuilder-modal__summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  font-size: 12px;
+  color: #475569;
+}
+
+.rebuilder-stat {
+  background: #f1f5f9;
+  padding: 3px 9px;
+  border-radius: 12px;
+  font-weight: 500;
+}
+
+.rebuilder-modal__close {
+  background: transparent;
+  border: none;
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+  color: #64748b;
+  padding: 4px 8px;
+}
+.rebuilder-modal__close:hover { color: #0f172a; }
+
+.rebuilder-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 10px 22px 0;
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.rebuilder-tab {
+  background: transparent;
+  border: none;
+  padding: 8px 16px;
+  font-size: 13px;
+  font-weight: 500;
+  color: #64748b;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+.rebuilder-tab:hover { color: #0f172a; }
+.rebuilder-tab--active {
+  color: #2563eb;
+  border-bottom-color: #2563eb;
+}
+
+.rebuilder-modal__content {
+  flex: 1;
+  overflow: auto;
+  padding: 16px 22px;
+  background: #f8fafc;
+}
+
+.rebuilder-code {
+  margin: 0;
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #0f172a;
+  background: #fff;
+  padding: 14px 16px;
+  border-radius: 6px;
+  border: 1px solid #e5e7eb;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.rebuilder-code--markdown { color: #334155; }
+
+.rebuilder-table {
+  width: 100%;
+  border-collapse: collapse;
+  background: #fff;
+  font-size: 12px;
+}
+.rebuilder-table th,
+.rebuilder-table td {
+  text-align: left;
+  padding: 8px 10px;
+  border-bottom: 1px solid #e5e7eb;
+  vertical-align: top;
+}
+.rebuilder-table th {
+  background: #f1f5f9;
+  font-weight: 600;
+  color: #334155;
+  position: sticky;
+  top: 0;
+}
+.rebuilder-table code {
+  font-family: 'SFMono-Regular', Consolas, monospace;
+  font-size: 11px;
+  background: #f1f5f9;
+  padding: 1px 5px;
+  border-radius: 3px;
+}
+
+.rebuilder-empty {
+  padding: 40px 20px;
+  text-align: center;
+  color: #64748b;
+  font-size: 13px;
+}
+.rebuilder-empty--error { color: #dc2626; }
+
+.rebuilder-modal__footer {
+  display: flex;
+  gap: 8px;
+  padding: 12px 22px;
+  border-top: 1px solid #e5e7eb;
+  background: #fff;
+  justify-content: flex-end;
+}
+
+.rebuilder-btn {
+  padding: 7px 14px;
+  font-size: 13px;
+  font-weight: 500;
+  border-radius: 5px;
+  border: 1px solid #2563eb;
+  background: #2563eb;
+  color: #fff;
+  cursor: pointer;
+}
+.rebuilder-btn:hover { background: #1d4ed8; border-color: #1d4ed8; }
+
+.rebuilder-btn--secondary {
+  background: #fff;
+  color: #334155;
+  border-color: #cbd5e1;
+}
+.rebuilder-btn--secondary:hover {
+  background: #f1f5f9;
+  color: #0f172a;
+  border-color: #94a3b8;
+}
+
+/* Dark mode */
+body.dark .rebuilder-modal__dialog { background: #0f172a; }
+body.dark .rebuilder-modal__header,
+body.dark .rebuilder-tabs { border-bottom-color: #1e293b; }
+body.dark .rebuilder-modal__footer { border-top-color: #1e293b; background: #0f172a; }
+body.dark .rebuilder-modal__title { color: #e2e8f0; }
+body.dark .rebuilder-modal__summary { color: #94a3b8; }
+body.dark .rebuilder-stat { background: #1e293b; color: #cbd5e1; }
+body.dark .rebuilder-tab { color: #94a3b8; }
+body.dark .rebuilder-tab:hover { color: #e2e8f0; }
+body.dark .rebuilder-tab--active { color: #60a5fa; border-bottom-color: #60a5fa; }
+body.dark .rebuilder-modal__content { background: #020617; }
+body.dark .rebuilder-code {
+  background: #0f172a;
+  border-color: #1e293b;
+  color: #e2e8f0;
+}
+body.dark .rebuilder-code--markdown { color: #cbd5e1; }
+body.dark .rebuilder-table { background: #0f172a; color: #cbd5e1; }
+body.dark .rebuilder-table th { background: #1e293b; color: #e2e8f0; }
+body.dark .rebuilder-table th,
+body.dark .rebuilder-table td { border-bottom-color: #1e293b; }
+body.dark .rebuilder-table code { background: #1e293b; color: #e2e8f0; }
+body.dark .rebuilder-empty { color: #94a3b8; }
+body.dark .rebuilder-btn--secondary {
+  background: #1f2937;
+  border-color: #374151;
+  color: #e5e7eb;
+}
+body.dark .rebuilder-btn--secondary:hover {
+  background: #374151;
+  border-color: #60a5fa;
+}
+
+/* Schema rebuilder — optimization options panel */
+.rebuilder-options {
+  padding: 10px 24px;
+  border-bottom: 1px solid #e2e8f0;
+  max-height: 240px;
+  overflow-y: auto;
+  background: #f8fafc;
+}
+.rebuilder-option-group {
+  margin-bottom: 8px;
+}
+.rebuilder-option-group__summary {
+  font-size: 12px;
+  font-weight: 600;
+  color: #334155;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  padding: 4px 0;
+  list-style: none;
+}
+.rebuilder-option-group__summary::before {
+  content: "▸";
+  display: inline-block;
+  width: 14px;
+  transition: transform 0.1s;
+  color: #64748b;
+}
+.rebuilder-option-group[open] > .rebuilder-option-group__summary::before {
+  transform: rotate(90deg);
+}
+.rebuilder-option-group__body {
+  padding: 4px 0 8px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.rebuilder-option-row {
+  display: grid;
+  grid-template-columns: 18px 1fr auto;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  color: #0f172a;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 4px;
+}
+.rebuilder-option-row:hover { background: #e2e8f0; }
+.rebuilder-option-row input[type="checkbox"] { cursor: pointer; }
+.rebuilder-option-label { user-select: none; }
+.rebuilder-option-mode {
+  font-size: 11px;
+  padding: 2px 6px;
+  border: 1px solid #cbd5e1;
+  border-radius: 4px;
+  background: #fff;
+  color: #0f172a;
+  cursor: pointer;
+}
+.rebuilder-option-pill {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: #e0e7ff;
+  color: #3730a3;
+}
+.rebuilder-option-row--flag-only { color: #475569; }
+
+.rebuilder-stat--flags { background: #fef3c7; color: #92400e; }
+
+/* Flags table */
+.rebuilder-flags-table .rebuilder-sev {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  padding: 2px 8px;
+  border-radius: 10px;
+}
+.rebuilder-sev--error   { background: #fee2e2; color: #991b1b; }
+.rebuilder-sev--warning { background: #fef3c7; color: #92400e; }
+.rebuilder-sev--info    { background: #dbeafe; color: #1e40af; }
+.rebuilder-flag-reason { color: #64748b; font-size: 12px; }
+
+/* Dark mode */
+body.dark .rebuilder-options {
+  background: #0f172a;
+  border-bottom-color: #1e293b;
+}
+body.dark .rebuilder-option-group__summary { color: #cbd5e1; }
+body.dark .rebuilder-option-row { color: #e2e8f0; }
+body.dark .rebuilder-option-row:hover { background: #1e293b; }
+body.dark .rebuilder-option-mode {
+  background: #1e293b;
+  border-color: #334155;
+  color: #e2e8f0;
+}
+body.dark .rebuilder-option-pill { background: #312e81; color: #c7d2fe; }
+body.dark .rebuilder-option-row--flag-only { color: #94a3b8; }
+body.dark .rebuilder-stat--flags { background: #451a03; color: #fbbf24; }
+body.dark .rebuilder-sev--error   { background: #450a0a; color: #fca5a5; }
+body.dark .rebuilder-sev--warning { background: #451a03; color: #fbbf24; }
+body.dark .rebuilder-sev--info    { background: #172554; color: #93c5fd; }
+body.dark .rebuilder-flag-reason { color: #94a3b8; }
+
+/* Rebuilder visualization tab */
+.rebuilder-viz {
+  position: relative;
+  background: #f8fafc;
+  border-radius: 6px;
+  overflow: auto;
+}
+.rebuilder-viz__lines {
+  position: absolute;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+  z-index: 1;
+}
+.rebuilder-viz__line {
+  fill: none;
+  stroke: #6366f1;
+  stroke-width: 1.5;
+  opacity: 0.7;
+}
+.rebuilder-viz__card {
+  position: absolute;
+  background: #fff;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08);
+  z-index: 2;
+  font-size: 12px;
+  overflow: hidden;
+}
+.rebuilder-viz__header {
+  background: #1e293b;
+  color: #fff;
+  padding: 8px 10px;
+  font-weight: 600;
+  font-size: 13px;
+  font-family: 'JetBrains Mono', monospace;
+}
+.rebuilder-viz__body { padding: 6px 0; }
+.rebuilder-viz__col {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 10px;
+  height: 22px;
+  font-family: 'JetBrains Mono', monospace;
+}
+.rebuilder-viz__col:hover { background: #f1f5f9; }
+.rebuilder-viz__colname { color: #0f172a; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rebuilder-viz__coltype { color: #64748b; font-size: 10px; text-transform: uppercase; }
+.rebuilder-viz__nn { color: #dc2626; margin-left: 2px; }
+.rebuilder-viz__badge {
+  font-size: 9px;
+  font-weight: 700;
+  padding: 1px 4px;
+  border-radius: 3px;
+  letter-spacing: 0.04em;
+}
+.rebuilder-viz__badge--pk { background: #fef3c7; color: #92400e; }
+.rebuilder-viz__badge--fk { background: #dbeafe; color: #1e40af; }
+.rebuilder-viz__badge--uq { background: #e0e7ff; color: #3730a3; }
+
+/* Dark mode */
+body.dark .rebuilder-viz { background: #0f172a; }
+body.dark .rebuilder-viz__card {
+  background: #1e293b;
+  border-color: #334155;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+}
+body.dark .rebuilder-viz__header { background: #020617; color: #e2e8f0; }
+body.dark .rebuilder-viz__col:hover { background: #0f172a; }
+body.dark .rebuilder-viz__colname { color: #e2e8f0; }
+body.dark .rebuilder-viz__coltype { color: #94a3b8; }
+body.dark .rebuilder-viz__line { stroke: #818cf8; }
+body.dark .rebuilder-viz__badge--pk { background: #451a03; color: #fbbf24; }
+body.dark .rebuilder-viz__badge--fk { background: #172554; color: #93c5fd; }
+body.dark .rebuilder-viz__badge--uq { background: #312e81; color: #c7d2fe; }
+
+/* Rebuilder viz toolbar + draggable viewport */
+.rebuilder-viz-wrap {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 400px;
+}
+.rebuilder-viz-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: #fff;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px 6px 0 0;
+  border-bottom: none;
+  font-size: 12px;
+  color: #334155;
+  flex-shrink: 0;
+}
+.rebuilder-viz-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 500;
+}
+.rebuilder-viz-select {
+  padding: 3px 6px;
+  border: 1px solid #cbd5e1;
+  border-radius: 4px;
+  font-size: 12px;
+  background: #fff;
+  color: #0f172a;
+  cursor: pointer;
+}
+.rebuilder-viz-btn {
+  padding: 3px 10px;
+  border: 1px solid #cbd5e1;
+  border-radius: 4px;
+  background: #fff;
+  color: #0f172a;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  min-width: 28px;
+}
+.rebuilder-viz-btn:hover { background: #f1f5f9; border-color: #6366f1; }
+.rebuilder-viz-zoom {
+  min-width: 44px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  color: #64748b;
+}
+.rebuilder-viz-hint {
+  margin-left: auto;
+  color: #94a3b8;
+  font-size: 11px;
+  font-style: italic;
+}
+.rebuilder-viz-viewport {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+  background: #f8fafc;
+  border: 1px solid #cbd5e1;
+  border-radius: 0 0 6px 6px;
+  cursor: grab;
+  min-height: 500px;
+}
+.rebuilder-viz-viewport--dragging { cursor: grabbing; }
+.rebuilder-viz-viewport .rebuilder-viz {
+  position: absolute;
+  top: 0;
+  left: 0;
+  transform-origin: 0 0;
+  transition: none;
+}
+
+/* Dark mode */
+body.dark .rebuilder-viz-toolbar {
+  background: #1e293b;
+  border-color: #334155;
+  color: #cbd5e1;
+}
+body.dark .rebuilder-viz-select,
+body.dark .rebuilder-viz-btn {
+  background: #0f172a;
+  border-color: #334155;
+  color: #e2e8f0;
+}
+body.dark .rebuilder-viz-btn:hover { background: #1e293b; border-color: #818cf8; }
+body.dark .rebuilder-viz-zoom { color: #94a3b8; }
+body.dark .rebuilder-viz-hint { color: #64748b; }
+body.dark .rebuilder-viz-viewport {
+  background: #0f172a;
+  border-color: #334155;
+}
+===== END: static/css/styles.css =====
+===== FILE: static/js/events.js =====
+/**
+ * EventBus — Simple pub/sub system for inter-module communication.
+ * All module communication flows through this bus.
+ */
+
+const listeners = {};
+
+export const EventBus = {
+  /**
+   * Subscribe to an event.
+   * @param {string} event - Event name
+   * @param {Function} callback - Handler function
+   */
+  on(event, callback) {
+    if (!listeners[event]) {
+      listeners[event] = [];
+    }
+    listeners[event].push(callback);
+  },
+
+  /**
+   * Unsubscribe from an event.
+   * @param {string} event - Event name
+   * @param {Function} callback - Handler to remove
+   */
+  off(event, callback) {
+    if (!listeners[event]) return;
+    listeners[event] = listeners[event].filter((cb) => cb !== callback);
+  },
+
+  /**
+   * Emit an event with optional data.
+   * @param {string} event - Event name
+   * @param {*} data - Payload
+   */
+  emit(event, data) {
+    if (!listeners[event]) return;
+    for (const callback of listeners[event]) {
+      callback(data);
+    }
+  },
+};
+
+/* Supported events:
+ * tableAdded, tableRemoved, tableMoved, tableDragging,
+ * filterChanged, layoutChanged,
+ * connectionAdded, connectionRemoved,
+ * viewportChanged, stateReset,
+ * blockCollapsed, blockExpanded,
+ * searchStarted, searchResultsReady, searchCleared,
+ * traceStarted, traceResultsReady,
+ * panToTable, stateChanged
+ */
+===== END: static/js/events.js =====
+===== FILE: static/js/utils.js =====
+/**
+ * utils.js — Shared utility functions.
+ */
+
+const _escDiv = document.createElement('div');
+
+/** Escape a string for safe HTML insertion. */
+export function escapeHtml(str) {
+  _escDiv.textContent = String(str);
+  return _escDiv.innerHTML;
+}
+===== END: static/js/utils.js =====
+===== FILE: static/js/cstruct/cstruct-app.js =====
+/**
+ * cstruct-app.js — Main orchestrator for the C struct visualizer.
+ * Owns the canvas, viewport, render pipeline, mouse events, and layout.
+ */
+
+import { EventBus } from '../events.js';
+import {
+  getState, getAllEntities, getEntity, getConnections, getPositions,
+  getPosition, getViewport, isCollapsed, getHoveredEntity, getSelectedEntity,
+  setPositions, setPosition, setViewport, toggleCollapsed,
+  setHoveredEntity, setHoveredField, setSelectedEntity,
+} from './cstruct-state.js';
+import {
+  BLOCK, CANVAS_COLORS, CANVAS_COLORS_DARK, LINE,
+} from './cstruct-constants.js';
+import { drawBlock, calculateBlockHeight, hitTestField } from './cstruct-blocks.js';
+import { chooseSides, calculateAnchor, drawBezierConnection, drawArrow } from './cstruct-connections.js';
+import { initUpload } from './cstruct-upload.js';
+
+let canvas = null;
+let ctx = null;
+let rafId = null;
+
+// Drag state
+let isDragging = false;
+let isPanning = false;
+let dragTarget = null;
+let dragOffset = { x: 0, y: 0 };
+let panStart = { x: 0, y: 0 };
+
+// ---- Initialization ----
+
+export function init() {
+  canvas = document.getElementById('cstruct-canvas');
+  if (!canvas) return;
+  ctx = canvas.getContext('2d');
+
+  sizeCanvas();
+  bindEvents();
+  initUpload();
+  initSidebar();
+
+  // Listen to state changes
+  EventBus.on('cstructStateChanged', scheduleRender);
+  EventBus.on('cstructDataLoaded', onDataLoaded);
+
+  scheduleRender();
+}
+
+function bindEvents() {
+  canvas.addEventListener('mousedown', onMouseDown);
+  canvas.addEventListener('mousemove', onMouseMove);
+  canvas.addEventListener('mouseup', onMouseUp);
+  canvas.addEventListener('mouseleave', onMouseLeave);
+  canvas.addEventListener('wheel', onWheel, { passive: false });
+  canvas.addEventListener('dblclick', onDblClick);
+
+  const observer = new ResizeObserver(() => {
+    sizeCanvas();
+    scheduleRender();
+  });
+  if (canvas.parentElement) {
+    observer.observe(canvas.parentElement);
+  }
+}
+
+function initSidebar() {
+  // Target arch selector
+  const archSelect = document.getElementById('arch-select');
+  if (archSelect) {
+    archSelect.addEventListener('change', () => {
+      // Re-upload with new target (handled by upload module)
+      EventBus.emit('cstructArchChanged', { arch: archSelect.value });
+    });
+  }
+
+  // Listen for data to populate struct list
+  EventBus.on('cstructDataLoaded', renderStructList);
+  EventBus.on('cstructEntitySelected', highlightStructListItem);
+}
+
+// ---- Render pipeline ----
+
+function scheduleRender() {
+  if (rafId) return;
+  rafId = requestAnimationFrame(render);
+}
+
+function render() {
+  rafId = null;
+  if (!canvas || !ctx) return;
+
+  const dpr = window.devicePixelRatio || 1;
+  const colors = getColors();
+  const viewport = getViewport();
+
+  // Clear
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = colors.bg;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // Grid
+  drawGrid(colors, viewport, dpr);
+
+  // Apply viewport transform
+  ctx.setTransform(
+    viewport.zoom * dpr, 0, 0, viewport.zoom * dpr,
+    viewport.panX * dpr, viewport.panY * dpr,
+  );
+
+  const entities = getAllEntities();
+  if (entities.length === 0) {
+    drawEmptyMessage(dpr);
+    return;
+  }
+
+  // Draw connections first (under blocks)
+  drawAllConnections(colors);
+
+  // Draw blocks
+  const hovered = getHoveredEntity();
+  const selected = getSelectedEntity();
+
+  for (const entity of entities) {
+    const pos = getPosition(entity.name);
+    if (!pos) continue;
+    drawBlock(
+      ctx, entity, pos,
+      entity.name === hovered,
+      entity.name === selected,
+      isCollapsed(entity.name),
+    );
+  }
+}
+
+// ---- Grid ----
+
+function drawGrid(colors, viewport, dpr) {
+  const spacing = 20;
+  const dotR = 1;
+
+  ctx.setTransform(
+    viewport.zoom * dpr, 0, 0, viewport.zoom * dpr,
+    viewport.panX * dpr, viewport.panY * dpr,
+  );
+
+  const w = canvas.width / dpr;
+  const h = canvas.height / dpr;
+  const left = -viewport.panX / viewport.zoom;
+  const top = -viewport.panY / viewport.zoom;
+  const right = (w - viewport.panX) / viewport.zoom;
+  const bottom = (h - viewport.panY) / viewport.zoom;
+
+  const effectiveSpacing = spacing * Math.ceil(1 / Math.max(viewport.zoom, 0.25));
+  const startX = Math.floor(left / effectiveSpacing) * effectiveSpacing;
+  const startY = Math.floor(top / effectiveSpacing) * effectiveSpacing;
+
+  ctx.fillStyle = colors.dot;
+  for (let x = startX; x <= right; x += effectiveSpacing) {
+    for (let y = startY; y <= bottom; y += effectiveSpacing) {
+      ctx.fillRect(x - dotR, y - dotR, dotR * 2, dotR * 2);
+    }
+  }
+}
+
+// ---- Connections ----
+
+function drawAllConnections(colors) {
+  const connections = getConnections();
+  const hovered = getHoveredEntity();
+
+  for (const conn of connections) {
+    const srcPos = getPosition(conn.source);
+    const tgtPos = getPosition(conn.target);
+    if (!srcPos || !tgtPos) continue;
+
+    const srcEntity = getEntity(conn.source);
+    const tgtEntity = getEntity(conn.target);
+    if (!srcEntity) continue;
+
+    const isHighlighted = hovered === conn.source || hovered === conn.target;
+    const color = isHighlighted ? colors.connectionLine : colors.connectionLineDim;
+    const lineWidth = isHighlighted ? LINE.strokeWidthHover : LINE.strokeWidth;
+
+    // Find the field that references the target to get its Y position
+    const fieldIdx = srcEntity.fields
+      ? srcEntity.fields.findIndex(f => f.name === conn.field)
+      : -1;
+    const srcYOffset = fieldIdx >= 0
+      ? BLOCK.headerHeight + fieldIdx * BLOCK.fieldRowHeight + BLOCK.fieldRowHeight / 2
+      : BLOCK.headerHeight / 2;
+    const tgtYOffset = BLOCK.headerHeight / 2;
+
+    const { srcSide, tgtSide } = chooseSides(srcPos, tgtPos);
+    const srcAnchor = calculateAnchor(srcPos, srcSide, srcYOffset);
+    const tgtAnchor = calculateAnchor(tgtPos, tgtSide, tgtYOffset);
+
+    ctx.globalAlpha = isHighlighted ? 1.0 : (hovered ? 0.2 : 0.6);
+    drawBezierConnection(ctx, srcAnchor, tgtAnchor, color, lineWidth);
+    drawArrow(ctx, tgtAnchor, color);
+    ctx.globalAlpha = 1.0;
+  }
+}
+
+// ---- Layout ----
+
+function onDataLoaded() {
+  computeLayout();
+  autoFit();
+  scheduleRender();
+}
+
+function computeLayout() {
+  const entities = getAllEntities();
+  if (entities.length === 0) return;
+
+  const connections = getConnections();
+  const nameSet = new Set(entities.map(e => e.name));
+
+  // Build dependency graph for topological layout
+  const children = {};
+  const inDegree = {};
+  for (const name of nameSet) {
+    children[name] = [];
+    inDegree[name] = 0;
+  }
+
+  for (const conn of connections) {
+    if (conn.source === conn.target) continue;
+    if (!nameSet.has(conn.source) || !nameSet.has(conn.target)) continue;
+    children[conn.source].push(conn.target);
+    inDegree[conn.target]++;
+  }
+
+  // BFS depth assignment
+  const depth = {};
+  const queue = [];
+  for (const name of nameSet) {
+    if (inDegree[name] === 0) {
+      queue.push(name);
+      depth[name] = 0;
+    }
+  }
+
+  let maxDepth = 0;
+  while (queue.length > 0) {
+    const current = queue.shift();
+    for (const child of children[current]) {
+      const newDepth = depth[current] + 1;
+      if (depth[child] === undefined || newDepth > depth[child]) {
+        depth[child] = newDepth;
+        maxDepth = Math.max(maxDepth, newDepth);
+      }
+      inDegree[child]--;
+      if (inDegree[child] <= 0) queue.push(child);
+    }
+  }
+
+  // Orphans at end
+  for (const name of nameSet) {
+    if (depth[name] === undefined) depth[name] = maxDepth + 1;
+  }
+
+  // Group by depth
+  const rows = {};
+  for (const [name, d] of Object.entries(depth)) {
+    if (!rows[d]) rows[d] = [];
+    rows[d].push(name);
+  }
+
+  const entityMap = Object.fromEntries(entities.map(e => [e.name, e]));
+  const positions = {};
+  let y = 0;
+
+  const rowKeys = Object.keys(rows).map(Number).sort((a, b) => a - b);
+  for (const key of rowKeys) {
+    const row = rows[key];
+    let x = 0;
+    let maxH = 0;
+
+    for (const name of row) {
+      const entity = entityMap[name];
+      const height = calculateBlockHeight(entity, false);
+      const width = BLOCK.minWidth;
+      positions[name] = { x, y, width, height };
+      maxH = Math.max(maxH, height);
+      x += width + BLOCK.gapX;
+    }
+
+    y += maxH + BLOCK.gapY;
+  }
+
+  setPositions(positions);
+}
+
+function autoFit() {
+  const positions = getPositions();
+  const keys = Object.keys(positions);
+  if (keys.length === 0) return;
+
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const k of keys) {
+    const p = positions[k];
+    minX = Math.min(minX, p.x);
+    minY = Math.min(minY, p.y);
+    maxX = Math.max(maxX, p.x + p.width);
+    maxY = Math.max(maxY, p.y + p.height);
+  }
+
+  const pad = 60;
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.width / dpr;
+  const h = canvas.height / dpr;
+  const contentW = maxX - minX;
+  const contentH = maxY - minY;
+
+  if (contentW === 0 || contentH === 0) {
+    setViewport({ zoom: 1, panX: pad, panY: pad });
+    return;
+  }
+
+  const zoom = Math.min(1.5, Math.min((w - pad * 2) / contentW, (h - pad * 2) / contentH));
+  setViewport({
+    zoom,
+    panX: pad + ((w - pad * 2) - contentW * zoom) / 2 - minX * zoom,
+    panY: pad + ((h - pad * 2) - contentH * zoom) / 2 - minY * zoom,
+  });
+}
+
+// ---- Mouse interaction ----
+
+function screenToCanvas(sx, sy) {
+  const vp = getViewport();
+  return {
+    x: (sx - vp.panX) / vp.zoom,
+    y: (sy - vp.panY) / vp.zoom,
+  };
+}
+
+function getMousePos(e) {
+  const rect = canvas.getBoundingClientRect();
+  return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+}
+
+function hitTestBlock(cx, cy) {
+  const entities = getAllEntities();
+  for (const entity of entities) {
+    const pos = getPosition(entity.name);
+    if (!pos) continue;
+    const h = calculateBlockHeight(entity, isCollapsed(entity.name));
+    if (cx >= pos.x && cx <= pos.x + pos.width && cy >= pos.y && cy <= pos.y + h) {
+      return entity.name;
+    }
+  }
+  return null;
+}
+
+function onMouseDown(e) {
+  if (e.button !== 0) return;
+  const pos = getMousePos(e);
+  const { x, y } = screenToCanvas(pos.x, pos.y);
+  const hit = hitTestBlock(x, y);
+
+  if (hit) {
+    isDragging = true;
+    dragTarget = hit;
+    const blockPos = getPosition(hit);
+    dragOffset = { x: x - blockPos.x, y: y - blockPos.y };
+    canvas.style.cursor = 'grabbing';
+  } else {
+    isPanning = true;
+    panStart = pos;
+    canvas.style.cursor = 'grabbing';
+  }
+}
+
+function onMouseMove(e) {
+  const pos = getMousePos(e);
+  const { x, y } = screenToCanvas(pos.x, pos.y);
+
+  if (isDragging && dragTarget) {
+    setPosition(dragTarget, {
+      ...getPosition(dragTarget),
+      x: x - dragOffset.x,
+      y: y - dragOffset.y,
+    });
+    return;
+  }
+
+  if (isPanning) {
+    const vp = getViewport();
+    setViewport({
+      panX: vp.panX + (pos.x - panStart.x),
+      panY: vp.panY + (pos.y - panStart.y),
+    });
+    panStart = pos;
+    return;
+  }
+
+  // Hover detection
+  const hit = hitTestBlock(x, y);
+  setHoveredEntity(hit);
+
+  if (hit) {
+    const entity = getEntity(hit);
+    const blockPos = getPosition(hit);
+    if (entity && blockPos) {
+      const fIdx = hitTestField(entity, blockPos, x, y, isCollapsed(hit));
+      setHoveredField(fIdx >= 0 ? hit : null, fIdx);
+    }
+    canvas.style.cursor = 'pointer';
+  } else {
+    setHoveredField(null, -1);
+    canvas.style.cursor = 'grab';
+  }
+
+  // Update field detail in sidebar
+  updateFieldDetail(hit, x, y);
+}
+
+function onMouseUp() {
+  isDragging = false;
+  isPanning = false;
+  dragTarget = null;
+  canvas.style.cursor = getHoveredEntity() ? 'pointer' : 'grab';
+}
+
+function onMouseLeave() {
+  onMouseUp();
+  setHoveredEntity(null);
+  setHoveredField(null, -1);
+}
+
+function onWheel(e) {
+  e.preventDefault();
+  const pos = getMousePos(e);
+  const { x: cx, y: cy } = screenToCanvas(pos.x, pos.y);
+  const vp = getViewport();
+
+  const factor = e.deltaY < 0 ? 1.1 : 0.9;
+  const newZoom = Math.max(0.15, Math.min(5, vp.zoom * factor));
+
+  setViewport({
+    zoom: newZoom,
+    panX: pos.x - cx * newZoom,
+    panY: pos.y - cy * newZoom,
+  });
+}
+
+function onDblClick(e) {
+  const pos = getMousePos(e);
+  const { x, y } = screenToCanvas(pos.x, pos.y);
+  const hit = hitTestBlock(x, y);
+
+  if (hit) {
+    // Double-click header area to collapse/expand
+    const blockPos = getPosition(hit);
+    if (blockPos && y < blockPos.y + BLOCK.headerHeight) {
+      toggleCollapsed(hit);
+    } else {
+      setSelectedEntity(hit);
+    }
+  }
+}
+
+// ---- Sidebar helpers ----
+
+function renderStructList() {
+  const list = document.getElementById('struct-list');
+  if (!list) return;
+
+  const entities = getAllEntities();
+  const enums = getState().enums || [];
+
+  if (entities.length === 0 && enums.length === 0) {
+    list.innerHTML = '<div class="sidebar__empty">Upload C files to see structs</div>';
+    return;
+  }
+
+  let html = '';
+  for (const entity of entities) {
+    const icon = entity.isUnion ? 'U' : 'S';
+    const iconClass = entity.isUnion ? 'sidebar__badge--union' : 'sidebar__badge--struct';
+    html += `<div class="sidebar__struct-item" data-entity="${entity.name}">
+      <span class="sidebar__badge ${iconClass}">${icon}</span>
+      <span class="sidebar__struct-name">${entity.name.startsWith('__anon_') ? '(anonymous)' : entity.name}</span>
+      <span class="sidebar__struct-size">${entity.totalSize}B</span>
+    </div>`;
+  }
+
+  for (const en of enums) {
+    html += `<div class="sidebar__struct-item" data-entity="${en.name}">
+      <span class="sidebar__badge sidebar__badge--enum">E</span>
+      <span class="sidebar__struct-name">${en.name}</span>
+      <span class="sidebar__struct-size">${en.values.length}v</span>
+    </div>`;
+  }
+
+  list.innerHTML = html;
+
+  // Click to pan to block
+  list.querySelectorAll('.sidebar__struct-item').forEach(el => {
+    el.addEventListener('click', () => {
+      const name = el.dataset.entity;
+      setSelectedEntity(name);
+      panToEntity(name);
+    });
+  });
+
+  // Update warnings
+  renderWarnings();
+}
+
+function highlightStructListItem({ name }) {
+  const items = document.querySelectorAll('.sidebar__struct-item');
+  items.forEach(el => {
+    el.classList.toggle('sidebar__struct-item--selected', el.dataset.entity === name);
+  });
+}
+
+function panToEntity(name) {
+  const pos = getPosition(name);
+  if (!pos) return;
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.width / dpr;
+  const h = canvas.height / dpr;
+  const vp = getViewport();
+
+  setViewport({
+    panX: w / 2 - (pos.x + pos.width / 2) * vp.zoom,
+    panY: h / 2 - (pos.y + pos.height / 2) * vp.zoom,
+  });
+}
+
+function updateFieldDetail(entityName, cx, cy) {
+  const detail = document.getElementById('field-detail');
+  if (!detail) return;
+
+  if (!entityName) {
+    detail.innerHTML = '<div class="sidebar__empty">Hover over a field to see details</div>';
+    return;
+  }
+
+  const entity = getEntity(entityName);
+  const pos = getPosition(entityName);
+  if (!entity || !pos) return;
+
+  const fIdx = hitTestField(entity, pos, cx, cy, isCollapsed(entityName));
+  if (fIdx < 0 || !entity.fields || fIdx >= entity.fields.length) {
+    detail.innerHTML = `<div class="field-detail__header">${entity.name}</div>
+      <div class="field-detail__meta">${entity.totalSize}B | ${entity.alignment}-byte aligned${entity.packed ? ' | PACKED' : ''}</div>`;
+    return;
+  }
+
+  const field = entity.fields[fIdx];
+  detail.innerHTML = `
+    <div class="field-detail__header">${entity.name}.${field.name}</div>
+    <div class="field-detail__row"><span>Type:</span> <code>${field.type}</code></div>
+    <div class="field-detail__row"><span>Offset:</span> +${field.offset} bytes${field.bitOffset != null ? ` (bit ${field.bitOffset})` : ''}</div>
+    <div class="field-detail__row"><span>Size:</span> ${field.bitSize ? field.bitSize + ' bits' : field.size + ' bytes'}</div>
+    <div class="field-detail__row"><span>Category:</span> ${field.category}</div>
+    ${field.refStruct ? `<div class="field-detail__row"><span>References:</span> ${field.refStruct}</div>` : ''}
+  `;
+}
+
+function renderWarnings() {
+  const container = document.getElementById('warnings');
+  if (!container) return;
+
+  const warnings = getState().warnings || [];
+  if (warnings.length === 0) {
+    container.hidden = true;
+    return;
+  }
+
+  container.hidden = false;
+  container.innerHTML = warnings.map(w =>
+    `<div class="warning-item">${w}</div>`
+  ).join('');
+}
+
+// ---- Utility ----
+
+function getColors() {
+  return document.body.classList.contains('dark') ? CANVAS_COLORS_DARK : CANVAS_COLORS;
+}
+
+function sizeCanvas() {
+  if (!canvas) return;
+  const parent = canvas.parentElement;
+  if (!parent) return;
+  const dpr = window.devicePixelRatio || 1;
+  const w = parent.clientWidth;
+  const h = parent.clientHeight;
+  canvas.width = Math.round(w * dpr);
+  canvas.height = Math.round(h * dpr);
+  canvas.style.width = w + 'px';
+  canvas.style.height = h + 'px';
+}
+
+function drawEmptyMessage(dpr) {
+  const colors = getColors();
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const w = canvas.width / dpr;
+  const h = canvas.height / dpr;
+
+  ctx.fillStyle = colors.headerMeta;
+  ctx.font = '14px system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('Upload .c or .h files to visualize struct memory layouts', w / 2, h / 2);
+  ctx.textAlign = 'start';
+}
+
+// init() is called from the HTML module script after all imports resolve.
+===== END: static/js/cstruct/cstruct-app.js =====
+===== FILE: static/js/cstruct/cstruct-blocks.js =====
+/**
+ * cstruct-blocks.js — Renders struct and union blocks on the canvas.
+ * Stateless drawing functions called by cstruct-app.js render pipeline.
+ */
+
+import {
+  BLOCK, CATEGORY_COLORS, CATEGORY_COLORS_DARK,
+  CANVAS_COLORS, CANVAS_COLORS_DARK, BADGE_SHAPES,
+} from './cstruct-constants.js';
+
+function getColors() {
+  return document.body.classList.contains('dark') ? CANVAS_COLORS_DARK : CANVAS_COLORS;
+}
+
+function getCategoryColors() {
+  return document.body.classList.contains('dark') ? CATEGORY_COLORS_DARK : CATEGORY_COLORS;
+}
+
+/** Calculate block height based on fields (or collapsed state). */
+export function calculateBlockHeight(entity, collapsed) {
+  if (collapsed) {
+    return BLOCK.headerHeight;
+  }
+  const fieldCount = entity.fields ? entity.fields.length : 0;
+  return BLOCK.headerHeight + fieldCount * BLOCK.fieldRowHeight + BLOCK.padding;
+}
+
+/** Draw a struct or union block at the given position. */
+export function drawBlock(ctx, entity, pos, isHovered, isSelected, collapsed) {
+  const colors = getColors();
+  const catColors = getCategoryColors();
+  const { x, y, width } = pos;
+  const height = calculateBlockHeight(entity, collapsed);
+  const r = BLOCK.cornerRadius;
+
+  // Shadow
+  ctx.save();
+  ctx.shadowColor = isHovered || isSelected ? colors.shadowHover : colors.shadow;
+  ctx.shadowBlur = isHovered || isSelected ? 10 : 4;
+  ctx.shadowOffsetY = 2;
+  roundRect(ctx, x, y, width, height, r);
+  ctx.fillStyle = colors.boxBg;
+  ctx.fill();
+  ctx.restore();
+
+  // Border
+  roundRect(ctx, x, y, width, height, r);
+  ctx.strokeStyle = isSelected ? colors.boxBorderSelected
+    : isHovered ? colors.boxBorderHover : colors.boxBorder;
+  ctx.lineWidth = isSelected ? 2 : isHovered ? 1.5 : 1;
+  ctx.stroke();
+
+  // Header background
+  drawHeader(ctx, entity, x, y, width, r, colors);
+
+  // Fields (only if not collapsed)
+  if (!collapsed && entity.fields) {
+    drawFields(ctx, entity.fields, x, y, width, colors, catColors);
+  }
+}
+
+function drawHeader(ctx, entity, x, y, width, r, colors) {
+  const hh = BLOCK.headerHeight;
+
+  // Header fill
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + width - r, y);
+  ctx.arcTo(x + width, y, x + width, y + r, r);
+  ctx.lineTo(x + width, y + hh);
+  ctx.lineTo(x, y + hh);
+  ctx.lineTo(x, y + r);
+  ctx.arcTo(x, y, x + r, y, r);
+  ctx.closePath();
+
+  if (entity.isUnion) {
+    ctx.fillStyle = colors.unionHeader;
+  } else {
+    ctx.fillStyle = colors.headerBg;
+  }
+  ctx.fill();
+  ctx.restore();
+
+  // Header divider
+  ctx.beginPath();
+  ctx.moveTo(x, y + hh);
+  ctx.lineTo(x + width, y + hh);
+  ctx.strokeStyle = colors.boxBorder;
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  // Entity name
+  const textColor = entity.isUnion ? colors.unionHeaderText : colors.headerText;
+  ctx.fillStyle = textColor;
+  ctx.font = 'bold 12px system-ui, sans-serif';
+  ctx.textBaseline = 'middle';
+
+  let label = entity.name;
+  if (label.startsWith('__anon_')) {
+    label = '(anonymous)';
+    ctx.font = 'italic bold 12px system-ui, sans-serif';
+  }
+  const maxNameWidth = width * 0.45;
+  label = truncateText(ctx, label, maxNameWidth);
+  ctx.fillText(label, x + 10, y + hh / 2);
+
+  // Meta info: size, alignment, endianness
+  ctx.font = '10px system-ui, sans-serif';
+  ctx.fillStyle = entity.isUnion ? colors.unionHeaderText : colors.headerMeta;
+  ctx.textAlign = 'right';
+
+  const sizeStr = entity.totalSize >= 0 ? `${entity.totalSize}B` : '?B';
+  const alignStr = entity.alignment > 0 ? `${entity.alignment}-al` : '';
+  const typeLabel = entity.isUnion ? 'union' : '';
+  const parts = [typeLabel, sizeStr, alignStr].filter(Boolean);
+  ctx.fillText(parts.join('  '), x + width - 10, y + hh / 2);
+  ctx.textAlign = 'start';
+
+  // Packed badge
+  if (entity.packed) {
+    drawPackedBadge(ctx, x + width - 10, y + 4, colors);
+  }
+}
+
+function drawPackedBadge(ctx, rightX, topY, colors) {
+  ctx.font = 'bold 8px system-ui, sans-serif';
+  const text = 'PACKED';
+  const tw = ctx.measureText(text).width;
+  const px = 4;
+  const bw = tw + px * 2;
+  const bh = 14;
+  const bx = rightX - bw;
+
+  ctx.fillStyle = colors.packedBadgeBg;
+  roundRect(ctx, bx, topY, bw, bh, 3);
+  ctx.fill();
+
+  ctx.fillStyle = colors.packedBadgeText;
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, bx + px, topY + bh / 2);
+}
+
+function drawFields(ctx, fields, blockX, blockY, blockWidth, colors, catColors) {
+  const startY = blockY + BLOCK.headerHeight;
+
+  for (let i = 0; i < fields.length; i++) {
+    const field = fields[i];
+    const fy = startY + i * BLOCK.fieldRowHeight;
+    const rowH = BLOCK.fieldRowHeight;
+
+    // Padding row background
+    if (field.category === 'padding') {
+      drawPaddingBackground(ctx, blockX, fy, blockWidth, rowH, colors);
+    }
+
+    // Category badge
+    const badgeColor = catColors[field.category] || catColors.integer;
+    const badgeShape = BADGE_SHAPES[field.category] || 'circle';
+    drawBadge(ctx, blockX + BLOCK.badgeMarginLeft, fy + rowH / 2, BLOCK.badgeSize, badgeColor, badgeShape);
+
+    // Field name
+    ctx.font = field.category === 'padding'
+      ? 'italic 11px system-ui, sans-serif'
+      : '11px system-ui, sans-serif';
+    ctx.fillStyle = field.category === 'padding' ? colors.fieldTextSecondary : colors.fieldText;
+    ctx.textBaseline = 'middle';
+
+    let nameLabel = field.name;
+    if (field.bitSize) {
+      nameLabel += `:${field.bitSize}`;
+    }
+    ctx.fillText(truncateText(ctx, nameLabel, BLOCK.typeColX - BLOCK.nameColX - 8),
+      blockX + BLOCK.nameColX, fy + rowH / 2);
+
+    // Type
+    ctx.font = '11px monospace';
+    ctx.fillStyle = colors.fieldTextSecondary;
+    ctx.fillText(truncateText(ctx, field.type, BLOCK.offsetColX - BLOCK.typeColX - 8),
+      blockX + BLOCK.typeColX, fy + rowH / 2);
+
+    // Offset
+    ctx.font = '10px monospace';
+    const offsetStr = field.offset !== undefined ? `+${field.offset}` : '';
+    ctx.fillText(offsetStr, blockX + BLOCK.offsetColX, fy + rowH / 2);
+
+    // Size
+    const sizeStr = field.bitSize
+      ? `${field.bitSize}b`
+      : field.size > 0 ? `${field.size}B` : '';
+    ctx.textAlign = 'right';
+    ctx.fillText(sizeStr, blockX + blockWidth - 10, fy + rowH / 2);
+    ctx.textAlign = 'start';
+  }
+}
+
+function drawPaddingBackground(ctx, x, y, w, h, colors) {
+  // Subtle striped background for padding rows
+  ctx.fillStyle = colors.paddingBg;
+  ctx.fillRect(x + 1, y, w - 2, h);
+
+  // Diagonal stripes
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(x + 1, y, w - 2, h);
+  ctx.clip();
+  ctx.strokeStyle = colors.paddingStripe;
+  ctx.lineWidth = 1;
+  const step = 6;
+  for (let sx = x - h; sx < x + w; sx += step) {
+    ctx.beginPath();
+    ctx.moveTo(sx, y + h);
+    ctx.lineTo(sx + h, y);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawBadge(ctx, cx, cy, size, color, shape) {
+  const half = size / 2;
+  ctx.fillStyle = color;
+
+  if (shape === 'circle') {
+    ctx.beginPath();
+    ctx.arc(cx, cy, half, 0, Math.PI * 2);
+    ctx.fill();
+  } else if (shape === 'square') {
+    ctx.fillRect(cx - half, cy - half, size, size);
+  } else if (shape === 'diamond') {
+    ctx.beginPath();
+    ctx.moveTo(cx, cy - half);
+    ctx.lineTo(cx + half, cy);
+    ctx.lineTo(cx, cy + half);
+    ctx.lineTo(cx - half, cy);
+    ctx.closePath();
+    ctx.fill();
+  } else if (shape === 'stripe') {
+    ctx.fillRect(cx - half, cy - 1.5, size, 3);
+  }
+}
+
+function truncateText(ctx, text, maxWidth) {
+  if (ctx.measureText(text).width <= maxWidth) return text;
+  let t = text;
+  while (t.length > 1 && ctx.measureText(t + '\u2026').width > maxWidth) {
+    t = t.slice(0, -1);
+  }
+  return t + '\u2026';
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.arcTo(x + w, y, x + w, y + r, r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.arcTo(x + w, y + h, x + w - r, y + h, r);
+  ctx.lineTo(x + r, y + h);
+  ctx.arcTo(x, y + h, x, y + h - r, r);
+  ctx.lineTo(x, y + r);
+  ctx.arcTo(x, y, x + r, y, r);
+  ctx.closePath();
+}
+
+/** Hit-test: return field index at canvas coordinates within a block, or -1. */
+export function hitTestField(entity, pos, cx, cy, collapsed) {
+  if (collapsed) return -1;
+  const startY = pos.y + BLOCK.headerHeight;
+  if (cy < startY) return -1;
+  const idx = Math.floor((cy - startY) / BLOCK.fieldRowHeight);
+  if (idx >= 0 && idx < (entity.fields ? entity.fields.length : 0)) {
+    return idx;
+  }
+  return -1;
+}
+===== END: static/js/cstruct/cstruct-blocks.js =====
+===== FILE: static/js/cstruct/cstruct-connections.js =====
+/**
+ * cstruct-connections.js — Pure stateless drawing helpers for nesting connections.
+ * No DOM, no state imports. Used by cstruct-app.js.
+ */
+
+import { LINE } from './cstruct-constants.js';
+
+/** Choose which sides to connect from based on box positions. */
+export function chooseSides(srcBox, tgtBox) {
+  const srcCx = srcBox.x + srcBox.width / 2;
+  const tgtCx = tgtBox.x + tgtBox.width / 2;
+  return srcCx <= tgtCx
+    ? { srcSide: 'right', tgtSide: 'left' }
+    : { srcSide: 'left', tgtSide: 'right' };
+}
+
+/** Calculate anchor point on a box edge at a given y-offset from box top. */
+export function calculateAnchor(box, side, yOffset) {
+  const x = side === 'left' ? box.x : box.x + box.width;
+  const y = box.y + yOffset;
+  return { x, y, side };
+}
+
+/** Draw a cubic bezier connection between two anchor points. */
+export function drawBezierConnection(ctx, src, tgt, color, lineWidth) {
+  const offset = LINE.controlPointOffset;
+  const dirSrc = src.side === 'right' ? 1 : -1;
+  const dirTgt = tgt.side === 'right' ? 1 : -1;
+
+  ctx.beginPath();
+  ctx.moveTo(src.x, src.y);
+  ctx.bezierCurveTo(
+    src.x + offset * dirSrc, src.y,
+    tgt.x + offset * dirTgt, tgt.y,
+    tgt.x, tgt.y,
+  );
+  ctx.strokeStyle = color;
+  ctx.lineWidth = lineWidth || LINE.strokeWidth;
+  ctx.stroke();
+}
+
+/** Draw a small filled arrow at an anchor point. */
+export function drawArrow(ctx, anchor, color) {
+  const size = LINE.arrowSize;
+  const dir = anchor.side === 'left' ? -1 : 1;
+
+  ctx.beginPath();
+  ctx.moveTo(anchor.x, anchor.y);
+  ctx.lineTo(anchor.x + size * dir, anchor.y - size / 2);
+  ctx.lineTo(anchor.x + size * dir, anchor.y + size / 2);
+  ctx.closePath();
+  ctx.fillStyle = color;
+  ctx.fill();
+}
+===== END: static/js/cstruct/cstruct-connections.js =====
+===== FILE: static/js/cstruct/cstruct-constants.js =====
+/**
+ * cstruct-constants.js — Colors, dimensions, and type category definitions
+ * for the C struct visualizer canvas.
+ */
+
+// ---- Block dimensions ----
+export const BLOCK = {
+  minWidth: 340,
+  headerHeight: 36,
+  fieldRowHeight: 24,
+  padding: 8,
+  cornerRadius: 6,
+  gapX: 100,
+  gapY: 60,
+  badgeSize: 8,
+  badgeMarginLeft: 10,
+  nameColX: 28,
+  typeColX: 150,
+  offsetColX: 260,
+  sizeColX: 310,
+};
+
+// ---- Field category colors (light mode) ----
+export const CATEGORY_COLORS = {
+  integer:  '#22C55E',
+  float:    '#F97316',
+  pointer:  '#A78BFA',
+  array:    '#14B8A6',
+  struct:   '#3B82F6',
+  bitfield: '#EAB308',
+  padding:  '#9CA3AF',
+  enum:     '#EC4899',
+};
+
+// ---- Field category colors (dark mode) ----
+export const CATEGORY_COLORS_DARK = {
+  integer:  '#4ADE80',
+  float:    '#FB923C',
+  pointer:  '#C4B5FD',
+  array:    '#2DD4BF',
+  struct:   '#60A5FA',
+  bitfield: '#FACC15',
+  padding:  '#6B7280',
+  enum:     '#F472B6',
+};
+
+// ---- Canvas colors (light mode) ----
+export const CANVAS_COLORS = {
+  bg: '#F9FAFB',
+  dot: '#E5E7EB',
+  boxBg: '#FFFFFF',
+  boxBorder: '#D1D5DB',
+  boxBorderHover: '#3B82F6',
+  boxBorderSelected: '#2563EB',
+  headerBg: '#F3F4F6',
+  headerText: '#111827',
+  headerMeta: '#6B7280',
+  fieldText: '#374151',
+  fieldTextSecondary: '#6B7280',
+  paddingBg: 'rgba(156, 163, 175, 0.08)',
+  paddingStripe: 'rgba(156, 163, 175, 0.15)',
+  shadow: 'rgba(0,0,0,0.08)',
+  shadowHover: 'rgba(59,130,246,0.2)',
+  connectionLine: '#3B82F6',
+  connectionLineDim: 'rgba(59,130,246,0.3)',
+  unionHeader: '#7C3AED',
+  unionHeaderText: '#FFFFFF',
+  packedBadgeBg: '#FEF3C7',
+  packedBadgeText: '#92400E',
+};
+
+// ---- Canvas colors (dark mode) ----
+export const CANVAS_COLORS_DARK = {
+  bg: '#1a1b23',
+  dot: '#2d2e3a',
+  boxBg: '#1F2028',
+  boxBorder: '#374151',
+  boxBorderHover: '#60A5FA',
+  boxBorderSelected: '#93C5FD',
+  headerBg: '#252630',
+  headerText: '#E5E7EB',
+  headerMeta: '#9CA3AF',
+  fieldText: '#D1D5DB',
+  fieldTextSecondary: '#9CA3AF',
+  paddingBg: 'rgba(107, 114, 128, 0.1)',
+  paddingStripe: 'rgba(107, 114, 128, 0.2)',
+  shadow: 'rgba(0,0,0,0.3)',
+  shadowHover: 'rgba(96,165,250,0.3)',
+  connectionLine: '#60A5FA',
+  connectionLineDim: 'rgba(96,165,250,0.3)',
+  unionHeader: '#8B5CF6',
+  unionHeaderText: '#F5F3FF',
+  packedBadgeBg: '#422006',
+  packedBadgeText: '#FDE68A',
+};
+
+// ---- Connection line constants ----
+export const LINE = {
+  strokeWidth: 1.5,
+  strokeWidthHover: 2.5,
+  controlPointOffset: 80,
+  arrowSize: 6,
+};
+
+// ---- Badge shapes per category ----
+export const BADGE_SHAPES = {
+  integer:  'circle',
+  float:    'circle',
+  pointer:  'circle',
+  array:    'circle',
+  struct:   'square',
+  bitfield: 'diamond',
+  padding:  'stripe',
+  enum:     'circle',
+};
+===== END: static/js/cstruct/cstruct-constants.js =====
+===== FILE: static/js/cstruct/cstruct-state.js =====
+/**
+ * cstruct-state.js — Single source of truth for the C struct visualizer.
+ * All mutations go through exported functions. Every mutation emits events.
+ */
+
+import { EventBus } from '../events.js';
+
+// ---- Internal state ----
+const state = {
+  structs: [],        // [{name, totalSize, alignment, packed, isUnion:false, fields:[...]}]
+  unions: [],         // [{name, totalSize, alignment, packed, isUnion:true, fields:[...]}]
+  typedefs: {},       // {typedef_name: canonical_name}
+  enums: [],          // [{name, values:[{name, value}]}]
+  connections: [],    // [{source, target, type:'nested', field}]
+  positions: {},      // {entityName: {x, y, width, height}}
+  viewport: { panX: 0, panY: 0, zoom: 1.0 },
+  collapsed: {},      // {entityName: true}
+  hoveredEntity: null,
+  hoveredField: null, // {entity, fieldIndex}
+  selectedEntity: null,
+  targetArch: 'arm',
+  endianness: 'little',
+  warnings: [],
+};
+
+// ---- Getters (read-only access) ----
+
+export function getState() {
+  return state;
+}
+
+export function getStructs() {
+  return state.structs;
+}
+
+export function getUnions() {
+  return state.unions;
+}
+
+export function getAllEntities() {
+  return [...state.structs, ...state.unions];
+}
+
+export function getEntity(name) {
+  return state.structs.find(s => s.name === name)
+    || state.unions.find(u => u.name === name);
+}
+
+export function getTypedefs() {
+  return state.typedefs;
+}
+
+export function getEnums() {
+  return state.enums;
+}
+
+export function getConnections() {
+  return state.connections;
+}
+
+export function getPositions() {
+  return state.positions;
+}
+
+export function getPosition(name) {
+  return state.positions[name] || null;
+}
+
+export function getViewport() {
+  return state.viewport;
+}
+
+export function isCollapsed(name) {
+  return !!state.collapsed[name];
+}
+
+export function getHoveredEntity() {
+  return state.hoveredEntity;
+}
+
+export function getHoveredField() {
+  return state.hoveredField;
+}
+
+export function getSelectedEntity() {
+  return state.selectedEntity;
+}
+
+export function getTargetArch() {
+  return state.targetArch;
+}
+
+export function getEndianness() {
+  return state.endianness;
+}
+
+export function getWarnings() {
+  return state.warnings;
+}
+
+// ---- Mutators ----
+
+export function loadParseResult(result) {
+  state.structs = result.structs || [];
+  state.unions = result.unions || [];
+  state.typedefs = result.typedefs || {};
+  state.enums = result.enums || [];
+  state.connections = result.connections || [];
+  state.warnings = result.warnings || [];
+  state.collapsed = {};
+  state.hoveredEntity = null;
+  state.hoveredField = null;
+  state.selectedEntity = null;
+
+  if (result.target_info) {
+    state.targetArch = result.target_info.key || 'arm';
+    state.endianness = result.target_info.endianness || 'little';
+  }
+
+  EventBus.emit('cstructDataLoaded', { count: state.structs.length + state.unions.length });
+  EventBus.emit('cstructStateChanged', { key: 'all' });
+}
+
+export function setPositions(positions) {
+  state.positions = positions;
+  EventBus.emit('cstructStateChanged', { key: 'positions' });
+}
+
+export function setPosition(name, pos) {
+  state.positions[name] = pos;
+  EventBus.emit('cstructStateChanged', { key: 'positions' });
+}
+
+export function setViewport(viewport) {
+  state.viewport = { ...state.viewport, ...viewport };
+  EventBus.emit('cstructStateChanged', { key: 'viewport' });
+}
+
+export function toggleCollapsed(name) {
+  state.collapsed[name] = !state.collapsed[name];
+  EventBus.emit('cstructBlockToggled', { name, collapsed: state.collapsed[name] });
+  EventBus.emit('cstructStateChanged', { key: 'collapsed' });
+}
+
+export function setHoveredEntity(name) {
+  if (state.hoveredEntity === name) return;
+  state.hoveredEntity = name;
+  EventBus.emit('cstructStateChanged', { key: 'hoveredEntity' });
+}
+
+export function setHoveredField(entity, fieldIndex) {
+  state.hoveredField = entity ? { entity, fieldIndex } : null;
+  EventBus.emit('cstructStateChanged', { key: 'hoveredField' });
+}
+
+export function setSelectedEntity(name) {
+  state.selectedEntity = name === state.selectedEntity ? null : name;
+  EventBus.emit('cstructEntitySelected', { name: state.selectedEntity });
+  EventBus.emit('cstructStateChanged', { key: 'selectedEntity' });
+}
+
+export function setTargetArch(arch) {
+  state.targetArch = arch;
+  EventBus.emit('cstructStateChanged', { key: 'targetArch' });
+}
+
+export function resetState() {
+  state.structs = [];
+  state.unions = [];
+  state.typedefs = {};
+  state.enums = [];
+  state.connections = [];
+  state.positions = {};
+  state.viewport = { panX: 0, panY: 0, zoom: 1.0 };
+  state.collapsed = {};
+  state.hoveredEntity = null;
+  state.hoveredField = null;
+  state.selectedEntity = null;
+  state.warnings = [];
+  EventBus.emit('cstructStateChanged', { key: 'all' });
+}
+===== END: static/js/cstruct/cstruct-state.js =====
+===== FILE: static/js/cstruct/cstruct-upload.js =====
+/**
+ * cstruct-upload.js — Handles file upload (drag-and-drop + file picker)
+ * for .c/.h files. Sends to /api/cstruct/upload and loads results into state.
+ */
+
+import { EventBus } from '../events.js';
+import { loadParseResult, setTargetArch } from './cstruct-state.js';
+
+let dropZone = null;
+let fileInput = null;
+let lastFiles = null;  // Keep for re-parse on arch change
+
+export function initUpload() {
+  dropZone = document.getElementById('upload-zone');
+  fileInput = document.getElementById('file-input');
+
+  if (!dropZone || !fileInput) return;
+
+  // Click to browse
+  dropZone.addEventListener('click', () => fileInput.click());
+
+  // File input change
+  fileInput.addEventListener('change', () => {
+    if (fileInput.files.length > 0) {
+      uploadFiles(fileInput.files);
+    }
+  });
+
+  // Drag and drop on the upload zone
+  dropZone.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    dropZone.classList.add('upload-zone--active');
+  });
+
+  dropZone.addEventListener('dragleave', () => {
+    dropZone.classList.remove('upload-zone--active');
+  });
+
+  dropZone.addEventListener('drop', (e) => {
+    e.preventDefault();
+    dropZone.classList.remove('upload-zone--active');
+    const files = e.dataTransfer.files;
+    if (files.length > 0) {
+      uploadFiles(files);
+    }
+  });
+
+  // Also allow drop on the canvas area
+  const canvasContainer = document.getElementById('canvas-container');
+  if (canvasContainer) {
+    canvasContainer.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      canvasContainer.classList.add('canvas--dragover');
+    });
+    canvasContainer.addEventListener('dragleave', () => {
+      canvasContainer.classList.remove('canvas--dragover');
+    });
+    canvasContainer.addEventListener('drop', (e) => {
+      e.preventDefault();
+      canvasContainer.classList.remove('canvas--dragover');
+      const files = e.dataTransfer.files;
+      if (files.length > 0) {
+        uploadFiles(files);
+      }
+    });
+  }
+
+  // Re-parse on architecture change
+  EventBus.on('cstructArchChanged', ({ arch }) => {
+    setTargetArch(arch);
+    if (lastFiles) {
+      uploadFiles(lastFiles);
+    }
+  });
+}
+
+async function uploadFiles(files) {
+  lastFiles = files;
+
+  const archSelect = document.getElementById('arch-select');
+  const target = archSelect ? archSelect.value : 'arm';
+
+  const formData = new FormData();
+  for (const file of files) {
+    formData.append('files[]', file);
+  }
+  formData.append('target', target);
+
+  // Update UI
+  setUploadStatus('parsing');
+
+  try {
+    const resp = await fetch('/api/cstruct/upload', {
+      method: 'POST',
+      body: formData,
+    });
+
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({ error: 'Upload failed' }));
+      setUploadStatus('error', err.error || 'Upload failed');
+      return;
+    }
+
+    const result = await resp.json();
+    loadParseResult(result);
+
+    const count = (result.structs?.length || 0) + (result.unions?.length || 0);
+    const enumCount = result.enums?.length || 0;
+    const fileNames = Array.from(files).map(f => f.name).join(', ');
+    setUploadStatus('success', `${fileNames} \u2014 ${count} struct${count !== 1 ? 's' : ''}${enumCount ? `, ${enumCount} enum${enumCount !== 1 ? 's' : ''}` : ''}`);
+  } catch (err) {
+    setUploadStatus('error', `Network error: ${err.message}`);
+  }
+}
+
+function setUploadStatus(status, message) {
+  const statusEl = document.getElementById('upload-status');
+  const statusText = document.getElementById('upload-status-text');
+  if (!statusEl || !statusText) return;
+
+  statusEl.className = 'upload-status';
+  statusEl.hidden = false;
+
+  if (status === 'parsing') {
+    statusEl.classList.add('upload-status--parsing');
+    statusText.textContent = 'Parsing...';
+  } else if (status === 'success') {
+    statusEl.classList.add('upload-status--success');
+    statusText.textContent = message;
+  } else if (status === 'error') {
+    statusEl.classList.add('upload-status--error');
+    statusText.textContent = message;
+  }
+}
+===== END: static/js/cstruct/cstruct-upload.js =====
+===== FILE: templates/index.html =====
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>C Struct Visualizer</title>
+  <link rel="stylesheet" href="/static/css/styles.css">
+  <link rel="stylesheet" href="/static/css/dark-mode.css">
+  <link rel="stylesheet" href="/static/css/cstruct.css">
+</head>
+<body>
+  <script>
+    if (localStorage.getItem('cstruct-theme') === 'dark') {
+      document.body.classList.add('dark');
+    }
+  </script>
+
+  <div class="app">
+    <!-- Sidebar -->
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar__header">
+        <h1 class="sidebar__title">C Struct Visualizer</h1>
+        <button class="sidebar__theme-btn" id="btn-theme" title="Toggle dark mode">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+            <path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm0 12.5V2.5a5.5 5.5 0 0 1 0 11z"/>
+          </svg>
+        </button>
+      </div>
+
+      <!-- Upload Section -->
+      <div class="sidebar__section">
+        <div class="sidebar__section-title">Upload Files</div>
+        <div class="upload-zone" id="upload-zone">
+          <div class="upload-zone__icon">+</div>
+          <div class="upload-zone__text">Drop .c / .h files here<br>or click to browse</div>
+          <input type="file" id="file-input" accept=".c,.h,.cpp,.hpp" multiple hidden>
+        </div>
+        <div class="upload-status" id="upload-status" hidden>
+          <span id="upload-status-text"></span>
+        </div>
+      </div>
+
+      <!-- Target Architecture -->
+      <div class="sidebar__section">
+        <div class="sidebar__section-title">Target Architecture</div>
+        <select class="sidebar__select" id="arch-select">
+          <option value="arm" selected>ARM (32-bit embedded)</option>
+          <option value="sparc">SPARC / LEON3</option>
+          <option value="linux_x64">Linux x86_64</option>
+          <option value="win_x64">Windows x64 (MSVC)</option>
+        </select>
+      </div>
+
+      <!-- Struct List -->
+      <div class="sidebar__section sidebar__section--grow">
+        <div class="sidebar__section-title">Structs &amp; Unions</div>
+        <div class="sidebar__struct-list" id="struct-list">
+          <div class="sidebar__empty">Upload C files to see structs</div>
+        </div>
+      </div>
+
+      <!-- Warnings -->
+      <div class="sidebar__section" id="warnings" hidden>
+        <div class="sidebar__section-title">Warnings</div>
+      </div>
+
+      <!-- Field Detail -->
+      <div class="sidebar__section">
+        <div class="sidebar__section-title">Field Detail</div>
+        <div class="field-detail" id="field-detail">
+          <div class="sidebar__empty">Hover over a field to see details</div>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Canvas Area -->
+    <main class="canvas-area" id="canvas-container">
+      <canvas id="cstruct-canvas"></canvas>
+    </main>
+  </div>
+
+  <script>
+    // Theme toggle
+    document.getElementById('btn-theme').addEventListener('click', () => {
+      document.body.classList.toggle('dark');
+      localStorage.setItem('cstruct-theme',
+        document.body.classList.contains('dark') ? 'dark' : 'light');
+      // Trigger re-render
+      window.dispatchEvent(new Event('themeChanged'));
+    });
+
+    window.addEventListener('themeChanged', () => {
+      const { EventBus } = window.__eventBus || {};
+      if (EventBus) EventBus.emit('cstructStateChanged', { key: 'theme' });
+    });
+  </script>
+  <script type="module">
+    import { EventBus } from '/static/js/events.js';
+    import { init } from '/static/js/cstruct/cstruct-app.js';
+    window.__eventBus = { EventBus };
+    init();
+  </script>
+</body>
+</html>
+===== END: templates/index.html =====
