@@ -811,7 +811,7 @@ function renderStructList() {
       iconClass = 'sidebar__badge--struct';
       meta = `${entity.totalSize}B`;
     }
-    const displayName = entity.name.startsWith('__anon_') ? '(anonymous)' : entity.name;
+    const displayName = entity.displayName || entity.name;
     html += `<div class="sidebar__struct-item" data-entity="${entity.name}">
       <span class="sidebar__badge ${iconClass}">${icon}</span>
       <span class="sidebar__struct-name">${displayName}</span>
@@ -882,7 +882,7 @@ function updateFieldDetail(entityName, cx, cy) {
   if (entity.isFunction) {
     if (fIdx < 0 || !entity.params || fIdx >= entity.params.length) {
       const retStr = entity.returnType || 'void';
-      detail.innerHTML = `<div class="field-detail__header">${entity.name}()</div>
+      detail.innerHTML = `<div class="field-detail__header">${entity.displayName || entity.name}()</div>
         <div class="field-detail__meta">Returns: <code>${retStr}</code></div>
         <div class="field-detail__meta">${entity.params?.length || 0} parameter(s)</div>
         ${entity.bodyStructRefs?.length ? `<div class="field-detail__meta">Uses: ${entity.bodyStructRefs.join(', ')}</div>` : ''}`;
@@ -890,7 +890,7 @@ function updateFieldDetail(entityName, cx, cy) {
     }
     const param = entity.params[fIdx];
     detail.innerHTML = `
-      <div class="field-detail__header">${entity.name}(${param.name})</div>
+      <div class="field-detail__header">${entity.displayName || entity.name}(${param.name})</div>
       <div class="field-detail__row"><span>Type:</span> <code>${param.type}</code></div>
       <div class="field-detail__row"><span>Direction:</span> parameter${param.isPointer ? ' (pointer)' : ' (by value)'}</div>
       ${param.refStruct ? `<div class="field-detail__row"><span>Struct ref:</span> ${param.refStruct}</div>` : ''}
@@ -900,14 +900,14 @@ function updateFieldDetail(entityName, cx, cy) {
 
   // Struct/union entity
   if (fIdx < 0 || !entity.fields || fIdx >= entity.fields.length) {
-    detail.innerHTML = `<div class="field-detail__header">${entity.name}</div>
+    detail.innerHTML = `<div class="field-detail__header">${entity.displayName || entity.name}</div>
       <div class="field-detail__meta">${entity.totalSize}B | ${entity.alignment}-byte aligned${entity.packed ? ' | PACKED' : ''}</div>`;
     return;
   }
 
   const field = entity.fields[fIdx];
   detail.innerHTML = `
-    <div class="field-detail__header">${entity.name}.${field.name}</div>
+    <div class="field-detail__header">${entity.displayName || entity.name}.${field.name}</div>
     <div class="field-detail__row"><span>Type:</span> <code>${field.type}</code></div>
     <div class="field-detail__row"><span>Offset:</span> +${field.offset} bytes${field.bitOffset != null ? ` (bit ${field.bitOffset})` : ''}</div>
     <div class="field-detail__row"><span>Size:</span> ${field.bitSize ? field.bitSize + ' bits' : field.size + ' bytes'}</div>

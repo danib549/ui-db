@@ -178,6 +178,30 @@ def _parse_in_directory(
             "(not just function implementations)"
         )
 
+    # Build reverse typedef map: struct_tag -> preferred typedef name
+    # e.g. _sensor_data -> sensor_data_t, so blocks show the cleaner name
+    reverse_typedefs: dict[str, str] = {}
+    for alias, tag in typedefs.items():
+        existing = reverse_typedefs.get(tag)
+        # Prefer aliases without leading underscore, then shorter names
+        if existing is None or (alias[0] != '_' and existing[0] == '_') or len(alias) < len(existing):
+            reverse_typedefs[tag] = alias
+
+    # Add displayName to structs and unions
+    for entity in structs + unions:
+        name = entity["name"]
+        typedef_alias = reverse_typedefs.get(name)
+        if typedef_alias and typedef_alias != name:
+            entity["displayName"] = typedef_alias
+        elif name.startswith("__anon_"):
+            entity["displayName"] = "(anonymous)"
+        else:
+            entity["displayName"] = name
+
+    # Functions keep their own name
+    for fn in functions:
+        fn["displayName"] = fn["name"]
+
     return {
         "structs": structs,
         "unions": unions,

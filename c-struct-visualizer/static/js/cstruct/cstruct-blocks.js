@@ -99,10 +99,13 @@ function drawHeader(ctx, entity, x, y, width, r, colors) {
   ctx.font = 'bold 12px system-ui, sans-serif';
   ctx.textBaseline = 'middle';
 
-  let label = entity.name;
-  if (label.startsWith('__anon_')) {
+  let label = entity.displayName || entity.name;
+  if (label.startsWith('__anon_') || label === '(anonymous)') {
     label = '(anonymous)';
     ctx.font = 'italic bold 12px system-ui, sans-serif';
+  }
+  if (entity.isFunction) {
+    label += '()';
   }
   const maxNameWidth = width * 0.45;
   label = truncateText(ctx, label, maxNameWidth);
