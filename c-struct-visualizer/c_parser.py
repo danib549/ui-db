@@ -19,6 +19,7 @@ from clang.cindex import (
     CursorKind,
     TypeKind,
     Cursor,
+    StorageClass,
 )
 
 # Path to bundled fake system headers
@@ -51,6 +52,82 @@ TARGET_MAP: dict[str, dict] = {
         "label": "Windows x64 (MSVC)",
     },
 }
+
+# Known C standard library names — filtered out during parsing so that
+# user-uploaded files that redeclare stdlib items don't pollute the sidebar.
+STDLIB_NAMES: frozenset[str] = frozenset({
+    # ---- Types / structs ----
+    "_FILE", "FILE", "_iobuf", "__sFILE", "_IO_FILE",
+    "div_t", "ldiv_t", "lconv", "tm", "fpos_t", "va_list",
+
+    # ---- stdio.h ----
+    "printf", "fprintf", "sprintf", "snprintf",
+    "vprintf", "vfprintf", "vsprintf", "vsnprintf",
+    "scanf", "fscanf", "sscanf",
+    "fgetc", "fgets", "fputc", "fputs",
+    "getc", "getchar", "putc", "putchar", "puts", "ungetc",
+    "fopen", "freopen", "fclose", "fflush",
+    "fread", "fwrite",
+    "fseek", "ftell", "rewind", "fgetpos", "fsetpos",
+    "feof", "ferror", "clearerr", "perror",
+    "remove", "rename", "tmpfile", "tmpnam",
+    "setbuf", "setvbuf",
+
+    # ---- stdlib.h ----
+    "malloc", "calloc", "realloc", "free",
+    "atoi", "atol", "atoll", "atof",
+    "strtol", "strtoul", "strtoll", "strtoull", "strtod", "strtof", "strtold",
+    "exit", "abort", "atexit", "_Exit", "quick_exit", "at_quick_exit",
+    "qsort", "bsearch",
+    "abs", "labs", "llabs", "div", "ldiv", "lldiv",
+    "rand", "srand",
+    "system", "getenv",
+
+    # ---- string.h ----
+    "memcpy", "memmove", "memset", "memcmp", "memchr",
+    "strlen", "strcpy", "strncpy",
+    "strcat", "strncat",
+    "strcmp", "strncmp",
+    "strchr", "strrchr", "strstr", "strtok", "strerror",
+    "strcoll", "strxfrm", "strspn", "strcspn", "strpbrk",
+
+    # ---- math.h ----
+    "sin", "cos", "tan", "asin", "acos", "atan", "atan2",
+    "sinh", "cosh", "tanh", "asinh", "acosh", "atanh",
+    "exp", "exp2", "expm1", "log", "log2", "log10", "log1p",
+    "pow", "sqrt", "cbrt", "hypot",
+    "ceil", "floor", "round", "trunc", "fabs", "fmod",
+    "remainder", "copysign", "nan", "ldexp", "frexp", "modf",
+    "isinf", "isnan", "isfinite", "fpclassify",
+    "erf", "erfc", "tgamma", "lgamma",
+    "nextafter", "nexttoward", "fdim", "fmax", "fmin", "fma",
+
+    # ---- ctype.h ----
+    "isalpha", "isdigit", "isalnum", "isspace",
+    "isupper", "islower", "isprint", "ispunct",
+    "iscntrl", "isxdigit", "isgraph",
+    "toupper", "tolower",
+
+    # ---- locale.h ----
+    "setlocale", "localeconv",
+
+    # ---- signal.h ----
+    "signal", "raise",
+
+    # ---- setjmp.h ----
+    "setjmp", "longjmp",
+
+    # ---- time.h ----
+    "time", "clock", "difftime", "mktime",
+    "strftime", "gmtime", "localtime", "asctime", "ctime",
+
+    # ---- assert.h ----
+    "assert",
+
+    # ---- wchar.h ----
+    "wprintf", "fwprintf", "swprintf", "wcslen", "wcscpy", "wcscat",
+    "wcscmp", "wmemcpy", "wmemset", "wmemcmp",
+})
 
 
 def get_target_info(target_key: str) -> dict:
@@ -107,9 +184,14 @@ def _parse_in_directory(
             f.write(content)
         written_paths.append(file_path)
 
-        # Add each directory as an include path
+        # Add each directory AND all ancestor directories as include paths.
+        # This ensures that #include "router/file.h" resolves correctly when
+        # "router/" is a sibling folder, not under the including file's dir.
         parent = os.path.dirname(file_path)
-        include_dirs.add(parent)
+        while parent and parent != tmpdir and parent not in include_dirs:
+            include_dirs.add(parent)
+            parent = os.path.dirname(parent)
+        include_dirs.add(parent)  # ensure the last level is added
 
     # Create a main file that includes all uploaded files
     main_path = os.path.join(tmpdir, "__main__.c")
@@ -141,6 +223,13 @@ def _parse_in_directory(
     user_files = set(written_paths)
     user_files.add(main_path)
 
+    # Reverse map: tmpdir absolute path -> original upload filename
+    path_map: dict[str, str] = {}
+    for name in file_contents:
+        safe = name.replace("\\", "/")
+        abs_path = os.path.normpath(os.path.join(tmpdir, safe))
+        path_map[abs_path] = name
+
     # Collect diagnostics as warnings
     warnings = _collect_warnings(tu, user_files)
 
@@ -151,7 +240,9 @@ def _parse_in_directory(
     enums = []
     functions = []
     connections = []
+    globals_list = []
     seen_names: set[str] = set()
+    seen_globals: set[str] = set()
     anon_counter = {"struct": 0, "union": 0}
 
     _walk_cursor(
@@ -166,7 +257,43 @@ def _parse_in_directory(
         seen_names,
         anon_counter,
         target_info,
+        path_map,
+        globals_list,
+        seen_globals,
     )
+
+    # Extract macros (#define constants) from user files
+    macros = []
+    for child in tu.cursor.get_children():
+        if child.kind == CursorKind.MACRO_DEFINITION:
+            if _is_from_user_file(child, user_files):
+                _process_macro(child, macros, path_map)
+
+    # Extract include graph from translation unit
+    includes = []
+    seen_includes: set[tuple[str, str]] = set()
+    for inc in tu.get_includes():
+        source_loc = inc.location
+        target_file = inc.include
+        if not source_loc or not source_loc.file or not target_file:
+            continue
+        src_path = os.path.normpath(str(source_loc.file))
+        tgt_path = os.path.normpath(str(target_file))
+        # Map to user-facing filenames, skip if not in user files
+        src_name = path_map.get(src_path)
+        tgt_name = path_map.get(tgt_path)
+        if not src_name or not tgt_name:
+            continue
+        edge = (src_name, tgt_name)
+        if edge in seen_includes:
+            continue
+        seen_includes.add(edge)
+        includes.append({
+            "source": src_name,
+            "target": tgt_name,
+            "line": source_loc.line,
+            "depth": inc.depth,
+        })
 
     # Add diagnostic info if nothing was found
     total = len(structs) + len(unions) + len(enums) + len(functions)
@@ -202,6 +329,50 @@ def _parse_in_directory(
     for fn in functions:
         fn["displayName"] = fn["name"]
 
+    # Tag known stdlib entities so the frontend can filter them
+    for entity in structs + unions:
+        entity["isStdlib"] = entity["name"] in STDLIB_NAMES
+    for fn in functions:
+        fn["isStdlib"] = fn["name"] in STDLIB_NAMES
+
+    # Prune call connections whose targets aren't in parsed entities
+    all_names = seen_names.copy()
+    connections[:] = [
+        c for c in connections
+        if c["type"] != "call" or c["target"] in all_names
+    ]
+
+    # Resolve indirect calls through function pointers
+    # Build assignment map: field_name → [target_func_names]
+    assign_map: dict[str, list[str]] = {}
+    for c in connections:
+        if c["type"] == "funcptr":
+            # field is "via .callback_name" → extract field name
+            field = c.get("field", "")
+            fname = field.replace("via .", "").replace("via ", "")
+            assign_map.setdefault(fname, []).append(c["target"])
+
+    # Match indirect calls to assignments (deduplicate)
+    seen_indirect: set[str] = set()
+    for fn in functions:
+        for ic in fn.get("_indirectCalls", []):
+            field_name = ic["field"]
+            targets = assign_map.get(field_name, [])
+            for t in targets:
+                key = f"{ic['caller']}->{t}:{field_name}"
+                if t in all_names and key not in seen_indirect:
+                    seen_indirect.add(key)
+                    connections.append({
+                        "source": ic["caller"],
+                        "target": t,
+                        "type": "indirect_call",
+                        "field": f"via .{field_name}",
+                    })
+
+    # Clean up internal tracking keys
+    for fn in functions:
+        fn.pop("_indirectCalls", None)
+
     return {
         "structs": structs,
         "unions": unions,
@@ -209,6 +380,9 @@ def _parse_in_directory(
         "enums": enums,
         "functions": functions,
         "connections": connections,
+        "globals": globals_list,
+        "macros": macros,
+        "includes": includes,
         "warnings": warnings,
         "target_info": {
             "key": target,
@@ -227,6 +401,9 @@ def _empty_result(target_info: dict) -> dict:
         "enums": [],
         "functions": [],
         "connections": [],
+        "globals": [],
+        "macros": [],
+        "includes": [],
         "warnings": [],
         "target_info": {
             "key": "arm",
@@ -273,6 +450,33 @@ def _is_from_user_file(cursor: Cursor, user_files: set[str]) -> bool:
     return False
 
 
+def _get_source_location(
+    cursor: Cursor,
+    path_map: dict[str, str],
+) -> tuple[Optional[str], Optional[int], Optional[int]]:
+    """Map a cursor's file location back to the original upload filename.
+
+    Returns (filename, start_line, end_line).
+    """
+    loc = cursor.location
+    if loc.file is None:
+        return None, None, None
+    normalized = os.path.normpath(loc.file.name)
+    original_name = path_map.get(normalized)
+    if original_name is None:
+        # Fallback: basename matching
+        for abs_path, name in path_map.items():
+            if normalized.endswith(os.path.basename(abs_path)):
+                original_name = name
+                break
+    if original_name is None:
+        return None, None, None
+    ext = cursor.extent
+    start_line = ext.start.line if ext else loc.line
+    end_line = ext.end.line if ext else loc.line
+    return original_name, start_line, end_line
+
+
 def _walk_cursor(
     cursor: Cursor,
     user_files: set[str],
@@ -285,6 +489,9 @@ def _walk_cursor(
     seen_names: set,
     anon_counter: dict,
     target_info: dict,
+    path_map: dict[str, str],
+    globals_list: list | None = None,
+    seen_globals: set | None = None,
 ) -> None:
     """Recursively walk the AST and collect type definitions and functions."""
     for child in cursor.get_children():
@@ -295,25 +502,31 @@ def _walk_cursor(
         if child.kind == CursorKind.STRUCT_DECL:
             _process_record(
                 child, False, user_files, structs, unions,
-                connections, seen_names, anon_counter, target_info,
+                connections, seen_names, anon_counter, target_info, path_map,
             )
         elif child.kind == CursorKind.UNION_DECL:
             _process_record(
                 child, True, user_files, structs, unions,
-                connections, seen_names, anon_counter, target_info,
+                connections, seen_names, anon_counter, target_info, path_map,
             )
         elif child.kind == CursorKind.TYPEDEF_DECL:
             _process_typedef(child, typedefs)
         elif child.kind == CursorKind.ENUM_DECL:
-            _process_enum(child, enums, seen_names, anon_counter)
+            _process_enum(child, enums, seen_names, anon_counter, path_map)
         elif child.kind == CursorKind.FUNCTION_DECL:
-            _process_function(child, functions, connections, seen_names)
+            _process_function(child, functions, connections, seen_names, path_map)
+        elif child.kind == CursorKind.VAR_DECL and globals_list is not None:
+            # File-scope variable (not inside a function body)
+            _process_global_var(
+                child, globals_list, connections, seen_globals, path_map,
+            )
         else:
             # Recurse into children
             _walk_cursor(
                 child, user_files, structs, unions,
                 typedefs, enums, functions, connections, seen_names,
-                anon_counter, target_info,
+                anon_counter, target_info, path_map,
+                globals_list, seen_globals,
             )
 
 
@@ -327,6 +540,7 @@ def _process_record(
     seen_names: set,
     anon_counter: dict,
     target_info: dict,
+    path_map: dict[str, str],
 ) -> None:
     """Process a struct or union declaration."""
     # Skip forward declarations (no definition)
@@ -411,8 +625,13 @@ def _process_record(
                 "category": "padding",
             })
 
+    source_file, source_line, source_end_line = _get_source_location(cursor, path_map)
+
     record = {
         "name": name,
+        "sourceFile": source_file,
+        "sourceLine": source_line,
+        "sourceEndLine": source_end_line,
         "totalSize": total_size,
         "alignment": alignment,
         "packed": packed,
@@ -457,6 +676,15 @@ def _extract_field(
 
     # Categorize the field
     category = _categorize_type(field_type, is_bitfield)
+
+    # Detect function pointer fields
+    funcptr_sig = None
+    fp_canonical = field_type.get_canonical()
+    if fp_canonical.kind == TypeKind.POINTER:
+        pointee = fp_canonical.get_pointee()
+        if pointee.kind == TypeKind.FUNCTIONPROTO:
+            category = "funcptr"
+            funcptr_sig = pointee.spelling
 
     # Detect nested struct/union references
     ref_struct = None
@@ -507,6 +735,8 @@ def _extract_field(
 
     if ref_struct:
         result["refStruct"] = ref_struct
+    if funcptr_sig:
+        result["funcptrSig"] = funcptr_sig
 
     return result
 
@@ -526,6 +756,9 @@ def _categorize_type(field_type, is_bitfield: bool) -> str:
         return "enum"
 
     if kind == TypeKind.POINTER:
+        pointee = canonical.get_pointee()
+        if pointee.kind == TypeKind.FUNCTIONPROTO:
+            return "funcptr"
         return "pointer"
 
     if kind == TypeKind.CONSTANTARRAY or kind == TypeKind.INCOMPLETEARRAY:
@@ -584,6 +817,7 @@ def _process_enum(
     enums: list,
     seen_names: set,
     anon_counter: dict,
+    path_map: dict[str, str],
 ) -> None:
     """Process an enum declaration."""
     if not cursor.is_definition():
@@ -607,8 +841,13 @@ def _process_enum(
                 "value": child.enum_value,
             })
 
+    source_file, source_line, source_end_line = _get_source_location(cursor, path_map)
+
     enums.append({
         "name": name,
+        "sourceFile": source_file,
+        "sourceLine": source_line,
+        "sourceEndLine": source_end_line,
         "values": values,
     })
 
@@ -653,6 +892,9 @@ def _categorize_param_type(type_obj) -> str:
     canonical = type_obj.get_canonical()
 
     if canonical.kind == TypeKind.POINTER:
+        pointee = canonical.get_pointee()
+        if pointee.kind == TypeKind.FUNCTIONPROTO:
+            return "funcptr"
         return "pointer"
     if canonical.kind == TypeKind.RECORD:
         return "struct"
@@ -667,17 +909,46 @@ def _categorize_param_type(type_obj) -> str:
     return "integer"
 
 
-def _collect_body_struct_refs(
+def _find_func_refs_in_expr(cursor: Cursor) -> list[str]:
+    """Recursively find all DECL_REF_EXPR nodes that reference functions."""
+    refs = []
+    if cursor.kind == CursorKind.DECL_REF_EXPR:
+        ref = cursor.referenced
+        if ref and ref.kind == CursorKind.FUNCTION_DECL:
+            refs.append(cursor.spelling)
+    for child in cursor.get_children():
+        refs.extend(_find_func_refs_in_expr(child))
+    return refs
+
+
+def _get_member_field_name(cursor: Cursor) -> Optional[str]:
+    """Extract the field name from a MEMBER_REF_EXPR in the LHS of an assignment."""
+    if cursor.kind == CursorKind.MEMBER_REF_EXPR:
+        return cursor.spelling
+    for child in cursor.get_children():
+        result = _get_member_field_name(child)
+        if result:
+            return result
+    return None
+
+
+def _collect_body_refs(
     cursor: Cursor,
     func_name: str,
     connections: list,
     seen_refs: set[str],
+    seen_calls: set[str],
+    seen_assigns: set[str] | None = None,
+    indirect_calls: list | None = None,
 ) -> None:
-    """Recursively walk a function body to find local VAR_DECL with struct types.
-
-    Recurses into all nested scopes (if/while/for/switch/compound) to catch
-    structs declared in inner blocks.
+    """Recursively walk a function body to find local struct refs, function calls,
+    function pointer assignments, and indirect calls.
     """
+    if seen_assigns is None:
+        seen_assigns = set()
+    if indirect_calls is None:
+        indirect_calls = []
+
     for child in cursor.get_children():
         if child.kind == CursorKind.VAR_DECL:
             ref = _resolve_struct_name(child.type)
@@ -689,8 +960,207 @@ def _collect_body_struct_refs(
                     "type": "uses",
                     "field": child.spelling or "(local)",
                 })
+            # Check for struct initializer with function pointer assignments
+            # e.g. struct driver d = { .init = uart_init, .read = uart_read };
+            for init_child in child.get_children():
+                if init_child.kind == CursorKind.INIT_LIST_EXPR:
+                    _collect_init_list_funcptrs(
+                        init_child, child.type, func_name,
+                        connections, seen_assigns,
+                    )
+
+        elif child.kind == CursorKind.CALL_EXPR:
+            callee_name = child.spelling
+            ref = child.referenced
+            if ref and ref.kind == CursorKind.FUNCTION_DECL:
+                # Direct call
+                if callee_name and callee_name != func_name and callee_name not in seen_calls:
+                    seen_calls.add(callee_name)
+                    connections.append({
+                        "source": func_name,
+                        "target": callee_name,
+                        "type": "call",
+                        "field": None,
+                    })
+            else:
+                # Indirect call — through a function pointer
+                field_name = _get_member_field_name(child)
+                if field_name:
+                    indirect_calls.append({
+                        "caller": func_name,
+                        "field": field_name,
+                    })
+
+        elif child.kind == CursorKind.BINARY_OPERATOR:
+            # Check for funcptr assignment: ctx->callback = some_func
+            _collect_assignment_funcptr(
+                child, func_name, connections, seen_assigns,
+            )
+
         # Recurse into any compound/control-flow children
-        _collect_body_struct_refs(child, func_name, connections, seen_refs)
+        _collect_body_refs(
+            child, func_name, connections, seen_refs, seen_calls,
+            seen_assigns, indirect_calls,
+        )
+
+
+def _collect_assignment_funcptr(
+    cursor: Cursor,
+    func_name: str,
+    connections: list,
+    seen_assigns: set[str],
+) -> None:
+    """Check if a binary operator is a funcptr assignment like ctx->cb = handler."""
+    children = list(cursor.get_children())
+    if len(children) != 2:
+        return
+
+    lhs, rhs = children
+
+    # Get field name from LHS (MEMBER_REF_EXPR)
+    field_name = _get_member_field_name(lhs)
+    if not field_name:
+        return
+
+    # Find function references in RHS (handles ternary, direct ref, etc.)
+    func_refs = _find_func_refs_in_expr(rhs)
+    for target in func_refs:
+        key = f"{field_name}={target}"
+        if key in seen_assigns:
+            continue
+        seen_assigns.add(key)
+        connections.append({
+            "source": func_name,
+            "target": target,
+            "type": "funcptr",
+            "field": f"via .{field_name}",
+        })
+
+
+def _collect_init_list_funcptrs(
+    cursor: Cursor,
+    var_type,
+    func_name: str,
+    connections: list,
+    seen_assigns: set[str],
+) -> None:
+    """Extract function pointer assignments from struct initializer lists."""
+    # Get the struct fields to match init list positions
+    canonical = var_type.get_canonical()
+    if canonical.kind != TypeKind.RECORD:
+        return
+
+    decl = canonical.get_declaration()
+    if not decl:
+        return
+
+    struct_fields = [
+        f for f in decl.get_children()
+        if f.kind == CursorKind.FIELD_DECL
+    ]
+
+    for i, init_expr in enumerate(cursor.get_children()):
+        # Find any function references in this init expression
+        func_refs = _find_func_refs_in_expr(init_expr)
+        if not func_refs:
+            continue
+
+        # Try to get the field name
+        field_name = None
+        if i < len(struct_fields):
+            field_name = struct_fields[i].spelling
+
+        for target in func_refs:
+            label = f"via .{field_name}" if field_name else f"via init[{i}]"
+            key = f"{label}={target}"
+            if key in seen_assigns:
+                continue
+            seen_assigns.add(key)
+            connections.append({
+                "source": func_name,
+                "target": target,
+                "type": "funcptr",
+                "field": label,
+            })
+
+
+def _process_global_var(
+    cursor: Cursor,
+    globals_list: list,
+    connections: list,
+    seen_globals: set[str],
+    path_map: dict[str, str],
+) -> None:
+    """Extract a file-scope global variable declaration."""
+    name = cursor.spelling
+    if not name or name in seen_globals:
+        return
+
+    # Determine storage class
+    sc = cursor.storage_class
+    if sc == StorageClass.STATIC:
+        storage = "static"
+    elif sc == StorageClass.EXTERN:
+        storage = "extern"
+    else:
+        storage = "global"
+
+    type_spelling = cursor.type.spelling
+    source_file, _, _ = _get_source_location(cursor, path_map)
+    struct_ref = _resolve_struct_name(cursor.type)
+
+    # Check for function pointer assignments in global initializer
+    # e.g. static hal_driver_t uart_driver = { .init = uart_init, ... };
+    seen_assigns: set[str] = set()
+    for child in cursor.get_children():
+        if child.kind == CursorKind.INIT_LIST_EXPR:
+            _collect_init_list_funcptrs(
+                child, cursor.type, name,
+                connections, seen_assigns,
+            )
+
+    seen_globals.add(name)
+    globals_list.append({
+        "name": name,
+        "type": type_spelling,
+        "storage": storage,
+        "sourceFile": source_file,
+        "structRef": struct_ref,
+    })
+
+    # Add connection from global to its struct type
+    if struct_ref:
+        connections.append({
+            "source": name,
+            "target": struct_ref,
+            "type": "global",
+            "field": name,
+        })
+
+
+def _process_macro(
+    cursor: Cursor,
+    macros: list,
+    path_map: dict[str, str],
+) -> None:
+    """Extract a #define macro with its value from tokens."""
+    name = cursor.spelling
+    if not name or name.startswith("__") or name.startswith("_"):
+        return
+
+    tokens = list(cursor.get_tokens())
+    # First token is the macro name, rest is the value
+    if len(tokens) <= 1:
+        return  # Skip empty macros (guards, flags)
+
+    value = " ".join(t.spelling for t in tokens[1:])
+    source_file, _, _ = _get_source_location(cursor, path_map)
+
+    macros.append({
+        "name": name,
+        "value": value,
+        "sourceFile": source_file,
+    })
 
 
 def _process_function(
@@ -698,6 +1168,7 @@ def _process_function(
     functions: list,
     connections: list,
     seen_names: set[str],
+    path_map: dict[str, str],
 ) -> None:
     """Extract a function declaration with params, return type, and body struct refs."""
     name = cursor.spelling
@@ -770,24 +1241,36 @@ def _process_function(
             "field": None,
         })
 
-    # Walk function body for local struct variable usage
+    # Walk function body for local struct variable usage and function calls
     body_refs: set[str] = set()
     # Don't duplicate refs already captured as params or return
     body_refs.update(seen_param_refs)
     if return_struct:
         body_refs.add(return_struct)
+    seen_calls: set[str] = set()
+    seen_assigns: set[str] = set()
+    indirect_calls: list[dict] = []
 
     for child in cursor.get_children():
         if child.kind == CursorKind.COMPOUND_STMT:
-            _collect_body_struct_refs(child, name, connections, body_refs)
+            _collect_body_refs(
+                child, name, connections, body_refs, seen_calls,
+                seen_assigns, indirect_calls,
+            )
+
+    source_file, source_line, source_end_line = _get_source_location(cursor, path_map)
 
     func_data = {
         "name": name,
+        "sourceFile": source_file,
+        "sourceLine": source_line,
+        "sourceEndLine": source_end_line,
         "returnType": return_type_str,
         "returnStruct": return_struct,
         "isPointerReturn": is_pointer_return,
         "params": params,
         "bodyStructRefs": sorted(body_refs - seen_param_refs - ({return_struct} if return_struct else set())),
+        "_indirectCalls": indirect_calls,
     }
 
     if existing_idx is not None:

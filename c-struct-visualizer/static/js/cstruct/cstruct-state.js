@@ -12,7 +12,7 @@ const state = {
   functions: [],      // [{name, returnType, returnStruct, isFunction:true, params:[...], fields:[...]}]
   typedefs: {},       // {typedef_name: canonical_name}
   enums: [],          // [{name, values:[{name, value}]}]
-  connections: [],    // [{source, target, type:'nested'|'param'|'return'|'uses', field}]
+  connections: [],    // [{source, target, type:'nested'|'param'|'return'|'uses'|'call', field}]
   positions: {},      // {entityName: {x, y, width, height}}
   viewport: { panX: 0, panY: 0, zoom: 1.0 },
   collapsed: {},      // {entityName: true}
@@ -22,6 +22,23 @@ const state = {
   targetArch: 'arm',
   endianness: 'little',
   warnings: [],
+  showStdlib: false,  // Whether to show standard C library items in sidebar
+  fileContents: {},   // {filename: sourceCodeString} — for source preview modal
+  searchQuery: '',
+  activeTypeFilters: null,  // null = show all, Set(['struct','union',...]) = show only these
+  activeFileFilters: null,  // null = show all, Set(['sensor.h',...]) = show only these
+  focusedEntity: null,      // entity name for connection-based filtering (show it + its graph)
+  hiddenEntities: {},       // {entityName: true} — per-entity visibility toggle from sidebar
+  activeLayout: 'top-down', // current layout mode
+  fileContainers: {},       // {filename: {x, y, width, height}} — for by-file layout
+  showCallConnections: false, // whether to show function-to-function call lines
+  showDepConnections: true,   // whether to show struct dependency lines (nested, param, return, uses)
+  globals: [],          // [{name, type, storage, sourceFile, structRef}]
+  macros: [],           // [{name, value, sourceFile}]
+  includes: [],         // [{source, target, line, depth}]
+  callGraphRoot: null,  // entity name for call graph focus
+  callGraphDepth: 2,    // max BFS depth for call graph
+  memoryMapEntity: null, // entity name for byte-level memory map view
 };
 
 // ---- Getters (read-only access) ----
@@ -43,7 +60,20 @@ export function getFunctions() {
 }
 
 export function getAllEntities() {
-  return [...state.structs, ...state.unions, ...state.functions];
+  const all = [...state.structs, ...state.unions, ...state.functions];
+  if (!state.showStdlib) {
+    return all.filter(e => !e.isStdlib);
+  }
+  return all;
+}
+
+export function getShowStdlib() {
+  return state.showStdlib;
+}
+
+export function setShowStdlib(show) {
+  state.showStdlib = show;
+  EventBus.emit('cstructStateChanged', { key: 'showStdlib' });
 }
 
 export function getEntity(name) {
@@ -104,6 +134,74 @@ export function getWarnings() {
   return state.warnings;
 }
 
+export function getFileContents() {
+  return state.fileContents;
+}
+
+export function getFileContent(filename) {
+  return state.fileContents[filename] || null;
+}
+
+export function getSearchQuery() {
+  return state.searchQuery;
+}
+
+export function getActiveTypeFilters() {
+  return state.activeTypeFilters;
+}
+
+export function getActiveFileFilters() {
+  return state.activeFileFilters;
+}
+
+export function getFocusedEntity() {
+  return state.focusedEntity;
+}
+
+export function getHiddenEntities() {
+  return state.hiddenEntities;
+}
+
+export function getActiveLayout() {
+  return state.activeLayout;
+}
+
+export function getFileContainers() {
+  return state.fileContainers;
+}
+
+export function getShowCallConnections() {
+  return state.showCallConnections;
+}
+
+export function getShowDepConnections() {
+  return state.showDepConnections;
+}
+
+export function getGlobals() {
+  return state.globals;
+}
+
+export function getMacros() {
+  return state.macros;
+}
+
+export function getIncludes() {
+  return state.includes;
+}
+
+export function getCallGraphRoot() {
+  return state.callGraphRoot;
+}
+
+export function getCallGraphDepth() {
+  return state.callGraphDepth;
+}
+
+export function getMemoryMapEntity() {
+  return state.memoryMapEntity;
+}
+
 // ---- Mutators ----
 
 export function loadParseResult(result) {
@@ -113,10 +211,23 @@ export function loadParseResult(result) {
   state.enums = result.enums || [];
   state.connections = result.connections || [];
   state.warnings = result.warnings || [];
+  state.fileContents = result.fileContents || {};
   state.collapsed = {};
   state.hoveredEntity = null;
   state.hoveredField = null;
   state.selectedEntity = null;
+  state.searchQuery = '';
+  state.activeTypeFilters = null;
+  state.activeFileFilters = null;
+  state.focusedEntity = null;
+  state.hiddenEntities = {};
+  state.fileContainers = {};
+  state.globals = result.globals || [];
+  state.macros = result.macros || [];
+  state.includes = result.includes || [];
+  state.callGraphRoot = null;
+  state.callGraphDepth = 2;
+  state.memoryMapEntity = null;
 
   // Map functions: create a fields array from params so block drawing works
   state.functions = (result.functions || []).map(f => ({
@@ -187,6 +298,84 @@ export function setTargetArch(arch) {
   EventBus.emit('cstructStateChanged', { key: 'targetArch' });
 }
 
+export function setSearchQuery(query) {
+  state.searchQuery = query;
+  EventBus.emit('cstructStateChanged', { key: 'searchQuery' });
+}
+
+export function setActiveTypeFilters(filterSet) {
+  state.activeTypeFilters = filterSet;
+  EventBus.emit('cstructStateChanged', { key: 'activeTypeFilters' });
+}
+
+export function setActiveFileFilters(filterSet) {
+  state.activeFileFilters = filterSet;
+  EventBus.emit('cstructStateChanged', { key: 'activeFileFilters' });
+}
+
+export function setFocusedEntity(name) {
+  state.focusedEntity = name;
+  EventBus.emit('cstructStateChanged', { key: 'focusedEntity' });
+}
+
+export function toggleEntityVisibility(name) {
+  if (state.hiddenEntities[name]) {
+    delete state.hiddenEntities[name];
+  } else {
+    state.hiddenEntities[name] = true;
+  }
+  EventBus.emit('cstructStateChanged', { key: 'hiddenEntities' });
+}
+
+export function isEntityHidden(name) {
+  return !!state.hiddenEntities[name];
+}
+
+export function setActiveLayout(layout) {
+  state.activeLayout = layout;
+  EventBus.emit('cstructStateChanged', { key: 'activeLayout' });
+}
+
+export function setFileContainers(containers) {
+  state.fileContainers = containers;
+  EventBus.emit('cstructStateChanged', { key: 'fileContainers' });
+}
+
+export function setShowCallConnections(show) {
+  state.showCallConnections = show;
+  EventBus.emit('cstructStateChanged', { key: 'showCallConnections' });
+}
+
+export function setShowDepConnections(show) {
+  state.showDepConnections = show;
+  EventBus.emit('cstructStateChanged', { key: 'showDepConnections' });
+}
+
+export function setCallGraphRoot(name) {
+  state.callGraphRoot = name;
+  EventBus.emit('cstructStateChanged', { key: 'callGraphRoot' });
+}
+
+export function setCallGraphDepth(depth) {
+  state.callGraphDepth = depth;
+  EventBus.emit('cstructStateChanged', { key: 'callGraphDepth' });
+}
+
+export function setMemoryMapEntity(name) {
+  state.memoryMapEntity = name;
+  EventBus.emit('cstructStateChanged', { key: 'memoryMapEntity' });
+}
+
+export function clearAllFilters() {
+  state.searchQuery = '';
+  state.activeTypeFilters = null;
+  state.activeFileFilters = null;
+  state.focusedEntity = null;
+  state.hiddenEntities = {};
+  state.selectedEntity = null;
+  EventBus.emit('cstructStateChanged', { key: 'filters' });
+}
+
 export function resetState() {
   state.structs = [];
   state.unions = [];
@@ -201,5 +390,20 @@ export function resetState() {
   state.hoveredField = null;
   state.selectedEntity = null;
   state.warnings = [];
+  state.fileContents = {};
+  state.searchQuery = '';
+  state.activeTypeFilters = null;
+  state.activeFileFilters = null;
+  state.focusedEntity = null;
+  state.hiddenEntities = {};
+  state.fileContainers = {};
+  state.showCallConnections = false;
+  state.showDepConnections = true;
+  state.globals = [];
+  state.macros = [];
+  state.includes = [];
+  state.callGraphRoot = null;
+  state.callGraphDepth = 2;
+  state.memoryMapEntity = null;
   EventBus.emit('cstructStateChanged', { key: 'all' });
 }

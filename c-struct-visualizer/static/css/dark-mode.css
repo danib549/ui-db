@@ -82,3 +82,60 @@ body.dark #btn-theme {
   border-color: var(--accent);
   color: var(--accent);
 }
+
+/* ---- Source modal dark mode ---- */
+body.dark .source-modal__backdrop {
+  background: rgba(0, 0, 0, 0.6);
+}
+
+body.dark .source-modal__dialog {
+  background: #1C1A17;
+  border-color: #3A3229;
+  box-shadow: 0 25px 60px rgba(0, 0, 0, 0.6);
+}
+
+body.dark .source-modal__header {
+  background: #231F1A;
+  border-bottom-color: #3A3229;
+}
+
+body.dark .source-modal__title {
+  color: #E8DECE;
+}
+
+body.dark .source-modal__close {
+  color: #8C7A65;
+}
+body.dark .source-modal__close:hover {
+  color: #E8DECE;
+}
+
+body.dark .source-modal__content {
+  background: #18160F;
+}
+
+body.dark .source-modal__line:hover {
+  background: rgba(180, 140, 80, 0.06);
+}
+
+body.dark .source-modal__line--highlight {
+  background: rgba(196, 132, 29, 0.15) !important;
+  border-left-color: #C4841D;
+}
+
+body.dark .source-modal__line-num {
+  color: #5C4F3E;
+}
+
+body.dark .source-modal__line-text {
+  color: #CABBA6;
+}
+
+/* ---- Search results dark mode ---- */
+body.dark .search-results {
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+}
+
+body.dark .file-filter-dropdown {
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+}
