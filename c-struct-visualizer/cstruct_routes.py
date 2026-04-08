@@ -35,6 +35,7 @@ def upload():
         return jsonify({"error": "No valid files found"}), 400
 
     result = parse_c_files(file_contents, target)
+    result["fileContents"] = file_contents
     return jsonify(result)
 
 

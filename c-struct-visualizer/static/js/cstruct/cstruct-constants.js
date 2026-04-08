@@ -30,6 +30,7 @@ export const CATEGORY_COLORS = {
   bitfield: '#B8962B',
   padding:  '#B8A48C',
   enum:     '#B85470',
+  funcptr:  '#7C3AED',
 };
 
 // ---- Field category colors (dark mode) ----
@@ -42,6 +43,7 @@ export const CATEGORY_COLORS_DARK = {
   bitfield: '#FACC15',
   padding:  '#6B7280',
   enum:     '#F472B6',
+  funcptr:  '#A78BFA',
 };
 
 // ---- Canvas colors (light mode — Anthropic warm palette) ----
@@ -73,6 +75,9 @@ export const CANVAS_COLORS = {
   connectionReturn: '#5C7A3E',
   connectionUses: '#B8A48C',
   connectionCall: '#D4782A',
+  connectionGlobal: '#6366F1',
+  connectionFuncptr: '#7C3AED',
+  connectionIndirectCall: '#9333EA',
 };
 
 // ---- Canvas colors (dark mode) ----
@@ -104,6 +109,9 @@ export const CANVAS_COLORS_DARK = {
   connectionReturn: '#34D399',
   connectionUses: '#6B7280',
   connectionCall: '#FB923C',
+  connectionGlobal: '#818CF8',
+  connectionFuncptr: '#A78BFA',
+  connectionIndirectCall: '#C084FC',
 };
 
 // ---- Connection line constants ----
@@ -124,4 +132,5 @@ export const BADGE_SHAPES = {
   bitfield: 'diamond',
   padding:  'stripe',
   enum:     'circle',
+  funcptr:  'triangle',
 };

@@ -15,6 +15,9 @@ import {
   getShowCallConnections, setShowCallConnections,
   getShowDepConnections, setShowDepConnections,
   getFunctions,
+  getGlobals, getMacros, getIncludes,
+  getCallGraphRoot, getCallGraphDepth, setCallGraphRoot, setCallGraphDepth,
+  setMemoryMapEntity,
 } from './cstruct-state.js';
 import {
   BLOCK, CANVAS_COLORS, CANVAS_COLORS_DARK, LINE,
@@ -24,6 +27,7 @@ import { chooseSides, calculateAnchor, drawBezierConnection, drawArrow } from '.
 import { initUpload } from './cstruct-upload.js';
 import { openSourceModal } from './cstruct-modal.js';
 import { getVisibleEntities, getFocusedSubgraph } from './cstruct-search.js';
+import { escapeHtml } from '../utils.js';
 
 let canvas = null;
 let ctx = null;
@@ -142,10 +146,37 @@ function initSidebar() {
 
   // Listen for data to populate struct list
   EventBus.on('cstructDataLoaded', renderStructList);
+  EventBus.on('cstructDataLoaded', renderGlobalsPanel);
+  EventBus.on('cstructDataLoaded', renderDefinesPanel);
+  EventBus.on('cstructDataLoaded', populateSizeofPanel);
   EventBus.on('cstructEntitySelected', highlightStructListItem);
   EventBus.on('cstructEntitySelected', ({ name }) => {
     if (name) panToEntity(name);
+    renderUsagePanel(name);
+    renderCallGraphPanel(name);
   });
+
+  // sizeof field selector
+  const sizeofStruct = document.getElementById('sizeof-struct');
+  if (sizeofStruct) {
+    sizeofStruct.addEventListener('change', () => updateSizeofResult());
+  }
+  const sizeofField = document.getElementById('sizeof-field');
+  if (sizeofField) {
+    sizeofField.addEventListener('change', () => updateSizeofResult());
+  }
+
+  // Call graph depth slider
+  const depthSlider = document.getElementById('call-graph-depth');
+  if (depthSlider) {
+    depthSlider.addEventListener('input', () => {
+      const val = parseInt(depthSlider.value, 10);
+      document.getElementById('call-graph-depth-label').textContent = val;
+      setCallGraphDepth(val);
+      const selected = getSelectedEntity();
+      if (selected) renderCallGraphPanel(selected);
+    });
+  }
 }
 
 // ---- Render pipeline ----
@@ -176,6 +207,12 @@ function render() {
     viewport.zoom * dpr, 0, 0, viewport.zoom * dpr,
     viewport.panX * dpr, viewport.panY * dpr,
   );
+
+  // Includes layout: special render mode
+  if (getActiveLayout() === 'includes') {
+    drawIncludesGraph(colors);
+    return;
+  }
 
   const entities = getAllEntities();
   if (entities.length === 0) {
@@ -255,8 +292,9 @@ function drawLegend(dpr, colors) {
   const showDeps = getShowDepConnections();
   const types = new Set();
   for (const c of connections) {
-    if (c.type === 'call' && !showCalls) continue;
-    if (c.type !== 'call' && !showDeps) continue;
+    const isCallType = c.type === 'call' || c.type === 'indirect_call';
+    if (isCallType && !showCalls) continue;
+    if (!isCallType && !showDeps) continue;
     types.add(c.type);
   }
   if (types.size === 0) return;
@@ -268,6 +306,9 @@ function drawLegend(dpr, colors) {
     { type: 'return', label: 'Return type', color: colors.connectionReturn, dash: [] },
     { type: 'uses', label: 'Local usage', color: colors.connectionUses, dash: [4, 4] },
     { type: 'call', label: 'Function call', color: colors.connectionCall, dash: [8, 3, 2, 3] },
+    { type: 'global', label: 'Global var', color: colors.connectionGlobal, dash: [3, 3] },
+    { type: 'funcptr', label: 'FP assignment', color: colors.connectionFuncptr, dash: [4, 2] },
+    { type: 'indirect_call', label: 'Indirect call', color: colors.connectionIndirectCall, dash: [6, 2, 2, 2] },
   ];
   const entries = allEntries.filter(e => types.has(e.type));
   if (entries.length === 0) return;
@@ -414,8 +455,9 @@ function drawAllConnections(colors, traceGraph, visibleSet, focusSet) {
     const conn = connections[i];
 
     // Skip connections based on toggles
-    if (conn.type === 'call' && !getShowCallConnections()) continue;
-    if (conn.type !== 'call' && !getShowDepConnections()) continue;
+    const isCallType = conn.type === 'call' || conn.type === 'indirect_call';
+    if (isCallType && !getShowCallConnections()) continue;
+    if (!isCallType && !getShowDepConnections()) continue;
 
     // Hard-filter: skip connections where either endpoint is hidden by hard filters
     if (visibleSet && (!visibleSet.has(conn.source) || !visibleSet.has(conn.target))) continue;
@@ -424,11 +466,21 @@ function drawAllConnections(colors, traceGraph, visibleSet, focusSet) {
     const isOutsideFocus = focusSet
       && (!focusSet.has(conn.source) || !focusSet.has(conn.target));
 
-    const srcPos = getPosition(conn.source);
+    let srcPos = getPosition(conn.source);
     const tgtPos = getPosition(conn.target);
-    if (!srcPos || !tgtPos) continue;
 
-    const srcEntity = getEntity(conn.source);
+    // For funcptr connections from globals (no canvas block), use the struct type as source
+    let srcEntity = getEntity(conn.source);
+    if (!srcPos && conn.type === 'funcptr') {
+      const globals = getGlobals();
+      const g = globals.find(gl => gl.name === conn.source);
+      if (g && g.structRef) {
+        srcPos = getPosition(g.structRef);
+        srcEntity = getEntity(g.structRef);
+      }
+    }
+
+    if (!srcPos || !tgtPos) continue;
     if (!srcEntity) continue;
 
     const isHighlighted = hovered === conn.source || hovered === conn.target;
@@ -444,6 +496,12 @@ function drawAllConnections(colors, traceGraph, visibleSet, focusSet) {
       color = colors.connectionCall;
     } else if (conn.type === 'param') {
       color = colors.connectionParam;
+    } else if (conn.type === 'global') {
+      color = colors.connectionGlobal;
+    } else if (conn.type === 'funcptr') {
+      color = colors.connectionFuncptr;
+    } else if (conn.type === 'indirect_call') {
+      color = colors.connectionIndirectCall;
     } else {
       color = colors.connectionLine;  // 'nested'
     }
@@ -478,6 +536,12 @@ function drawAllConnections(colors, traceGraph, visibleSet, focusSet) {
       ctx.setLineDash([4, 4]);
     } else if (conn.type === 'call') {
       ctx.setLineDash([8, 3, 2, 3]);
+    } else if (conn.type === 'global') {
+      ctx.setLineDash([3, 3]);
+    } else if (conn.type === 'funcptr') {
+      ctx.setLineDash([4, 2]);
+    } else if (conn.type === 'indirect_call') {
+      ctx.setLineDash([6, 2, 2, 2]);
     }
 
     drawBezierConnection(ctx, srcAnchor, tgtAnchor, color, lineWidth);
@@ -552,6 +616,9 @@ function applyLayout(mode, animate = true) {
     const result = layoutByFile(entities, entityMap);
     newPositions = result.positions;
     setFileContainers(result.containers);
+  } else if (mode === 'includes') {
+    newPositions = layoutIncludes();
+    setFileContainers({});
   } else {
     newPositions = layoutTopDown(entities, entityMap, connections, nameSet);
     setFileContainers({});
@@ -895,6 +962,144 @@ function layoutByFile(entities, entityMap) {
   }
 
   return { positions, containers };
+}
+
+// ---- Includes graph rendering ----
+
+function drawIncludesGraph(colors) {
+  const includes = getIncludes();
+  const positions = getPositions();
+
+  if (includes.length === 0) {
+    const dpr = window.devicePixelRatio || 1;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = colors.headerMeta || '#999';
+    ctx.font = '14px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('No include relationships found', canvas.width / (2 * dpr), canvas.height / (2 * dpr));
+    return;
+  }
+
+  // Draw connections between file nodes
+  for (const inc of includes) {
+    const srcPos = positions[`__include_${inc.source}`];
+    const tgtPos = positions[`__include_${inc.target}`];
+    if (!srcPos || !tgtPos) continue;
+
+    const sx = srcPos.x + srcPos.width / 2;
+    const sy = srcPos.y + srcPos.height;
+    const tx = tgtPos.x + tgtPos.width / 2;
+    const ty = tgtPos.y;
+    const cp = Math.abs(ty - sy) * 0.4;
+
+    ctx.beginPath();
+    ctx.moveTo(sx, sy);
+    ctx.bezierCurveTo(sx, sy + cp, tx, ty - cp, tx, ty);
+    ctx.strokeStyle = colors.connectionLine || '#C4841D';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    // Arrow (pointing down)
+    const arrowSize = 6;
+    ctx.beginPath();
+    ctx.moveTo(tx, ty);
+    ctx.lineTo(tx - arrowSize / 2, ty - arrowSize);
+    ctx.lineTo(tx + arrowSize / 2, ty - arrowSize);
+    ctx.closePath();
+    ctx.fillStyle = colors.connectionLine || '#C4841D';
+    ctx.fill();
+  }
+
+  // Draw file nodes
+  for (const [key, pos] of Object.entries(positions)) {
+    if (!key.startsWith('__include_')) continue;
+    const filename = key.slice('__include_'.length);
+
+    ctx.fillStyle = colors.headerBg || '#F0E8D8';
+    ctx.strokeStyle = colors.boxBorder || '#D4C4AA';
+    ctx.lineWidth = 1;
+
+    const r = 6;
+    ctx.beginPath();
+    ctx.roundRect(pos.x, pos.y, pos.width, pos.height, r);
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.fillStyle = colors.headerText || '#2C1E0E';
+    ctx.font = 'bold 12px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(filename, pos.x + pos.width / 2, pos.y + pos.height / 2);
+  }
+}
+
+// ---- Includes layout ----
+
+function layoutIncludes() {
+  const includes = getIncludes();
+  const positions = {};
+  if (includes.length === 0) return positions;
+
+  // Collect unique file names
+  const files = new Set();
+  for (const inc of includes) {
+    files.add(inc.source);
+    files.add(inc.target);
+  }
+
+  // Build depth map via BFS (files with no includers are roots at depth 0)
+  const targets = new Set(includes.map(i => i.target));
+  const roots = [...files].filter(f => !targets.has(f));
+  if (roots.length === 0) roots.push([...files][0]);
+
+  const depthMap = {};
+  const queue = roots.map(r => ({ name: r, depth: 0 }));
+  const visited = new Set();
+  for (const r of roots) { depthMap[r] = 0; visited.add(r); }
+
+  while (queue.length > 0) {
+    const { name, depth } = queue.shift();
+    for (const inc of includes) {
+      if (inc.source === name && !visited.has(inc.target)) {
+        visited.add(inc.target);
+        depthMap[inc.target] = depth + 1;
+        queue.push({ name: inc.target, depth: depth + 1 });
+      }
+    }
+  }
+
+  // Any unvisited files get their own depth
+  for (const f of files) {
+    if (depthMap[f] == null) depthMap[f] = 0;
+  }
+
+  // Group by depth
+  const byDepth = {};
+  for (const [f, d] of Object.entries(depthMap)) {
+    if (!byDepth[d]) byDepth[d] = [];
+    byDepth[d].push(f);
+  }
+
+  const nodeW = 180;
+  const nodeH = 36;
+  const gapX = 60;
+  const gapY = 80;
+
+  for (const [depth, filesAtDepth] of Object.entries(byDepth)) {
+    const d = parseInt(depth, 10);
+    const totalW = filesAtDepth.length * (nodeW + gapX) - gapX;
+    const startX = -totalW / 2;
+    filesAtDepth.forEach((f, i) => {
+      positions[`__include_${f}`] = {
+        x: startX + i * (nodeW + gapX),
+        y: d * (nodeH + gapY),
+        width: nodeW,
+        height: nodeH,
+      };
+    });
+  }
+
+  return positions;
 }
 
 // ---- Animated transition ----
@@ -1320,7 +1525,11 @@ function updateFieldDetail(entityName, cx, cy) {
   // Struct/union entity
   if (fIdx < 0 || !entity.fields || fIdx >= entity.fields.length) {
     detail.innerHTML = `<div class="field-detail__header">${entity.displayName || entity.name}</div>
-      <div class="field-detail__meta">${entity.totalSize}B | ${entity.alignment}-byte aligned${entity.packed ? ' | PACKED' : ''}</div>`;
+      <div class="field-detail__meta">${entity.totalSize}B | ${entity.alignment}-byte aligned${entity.packed ? ' | PACKED' : ''}</div>
+      <button class="field-detail__memmap-btn" data-entity="${entityName}">Memory Map</button>`;
+    detail.querySelector('.field-detail__memmap-btn')?.addEventListener('click', () => {
+      setMemoryMapEntity(entityName);
+    });
     return;
   }
 
@@ -1331,6 +1540,7 @@ function updateFieldDetail(entityName, cx, cy) {
     <div class="field-detail__row"><span>Offset:</span> +${field.offset} bytes${field.bitOffset != null ? ` (bit ${field.bitOffset})` : ''}</div>
     <div class="field-detail__row"><span>Size:</span> ${field.bitSize ? field.bitSize + ' bits' : field.size + ' bytes'}</div>
     <div class="field-detail__row"><span>Category:</span> ${field.category}</div>
+    ${field.funcptrSig ? `<div class="field-detail__row"><span>Signature:</span> <code>${field.funcptrSig}</code></div>` : ''}
     ${field.refStruct ? `<div class="field-detail__row"><span>References:</span> ${field.refStruct}</div>` : ''}
   `;
 }
@@ -1349,6 +1559,329 @@ function renderWarnings() {
   container.innerHTML = warnings.map(w =>
     `<div class="warning-item">${w}</div>`
   ).join('');
+}
+
+// ---- Globals Panel ----
+
+function renderGlobalsPanel() {
+  const panel = document.getElementById('globals-panel');
+  const list = document.getElementById('globals-list');
+  if (!panel || !list) return;
+
+  const globals = getGlobals();
+  if (globals.length === 0) { panel.hidden = true; return; }
+
+  panel.hidden = false;
+  list.innerHTML = globals.map(g => {
+    const badge = g.storage === 'static' ? 'S' : g.storage === 'extern' ? 'E' : 'G';
+    const badgeClass = g.storage === 'static' ? 'sidebar__badge--static'
+      : g.storage === 'extern' ? 'sidebar__badge--extern' : 'sidebar__badge--global';
+    const ref = g.structRef ? `data-entity="${escapeHtml(g.structRef)}"` : '';
+    return `<div class="sidebar__global-item" ${ref}>
+      <span class="sidebar__badge ${badgeClass}">${badge}</span>
+      <span class="sidebar__global-name">${escapeHtml(g.name)}</span>
+      <span class="sidebar__global-type">${escapeHtml(g.type)}</span>
+    </div>`;
+  }).join('');
+
+  list.querySelectorAll('.sidebar__global-item[data-entity]').forEach(el => {
+    el.style.cursor = 'pointer';
+    el.addEventListener('click', () => {
+      setSelectedEntity(el.dataset.entity);
+    });
+  });
+}
+
+// ---- Defines Panel ----
+
+function renderDefinesPanel() {
+  const panel = document.getElementById('defines-panel');
+  const list = document.getElementById('defines-list');
+  if (!panel || !list) return;
+
+  const macros = getMacros();
+  if (macros.length === 0) { panel.hidden = true; return; }
+
+  panel.hidden = false;
+  // Group by source file
+  const byFile = {};
+  for (const m of macros) {
+    const file = m.sourceFile || '(unknown)';
+    if (!byFile[file]) byFile[file] = [];
+    byFile[file].push(m);
+  }
+
+  let html = '';
+  for (const [file, items] of Object.entries(byFile)) {
+    html += `<div class="sidebar__defines-file">${escapeHtml(file)}</div>`;
+    for (const m of items) {
+      html += `<div class="sidebar__define-item">
+        <span class="sidebar__define-name">${escapeHtml(m.name)}</span>
+        <span class="sidebar__define-value">${escapeHtml(m.value)}</span>
+      </div>`;
+    }
+  }
+  list.innerHTML = html;
+}
+
+// ---- Usage Panel (Used By / Uses) ----
+
+function renderUsagePanel(entityName) {
+  const panel = document.getElementById('usage-panel');
+  const list = document.getElementById('usage-list');
+  const title = document.getElementById('usage-panel-title');
+  if (!panel || !list) return;
+
+  if (!entityName) { panel.hidden = true; return; }
+
+  const entity = getEntity(entityName);
+  if (!entity) { panel.hidden = true; return; }
+
+  const connections = getConnections();
+  const isFunc = entity.isFunction;
+
+  if (isFunc) {
+    // Function selected: show which structs it uses
+    renderFunctionUsage(entityName, connections, panel, list, title);
+  } else {
+    // Struct/union selected: show which functions use it
+    renderStructUsage(entityName, connections, panel, list, title);
+  }
+}
+
+function renderStructUsage(entityName, connections, panel, list, title) {
+  const usedBy = connections.filter(c =>
+    c.target === entityName && ['param', 'return', 'uses', 'global'].includes(c.type)
+  );
+  if (usedBy.length === 0) { panel.hidden = true; return; }
+
+  panel.hidden = false;
+  title.textContent = 'Used By';
+
+  const byType = { param: [], return: [], uses: [], global: [] };
+  for (const c of usedBy) {
+    if (byType[c.type]) byType[c.type].push(c.source);
+  }
+
+  let html = '';
+  const labels = { param: 'As parameter', return: 'As return', uses: 'Local variable', global: 'Global variable' };
+  for (const [type, funcs] of Object.entries(byType)) {
+    if (funcs.length === 0) continue;
+    html += `<div class="sidebar__usage-group">${labels[type]}</div>`;
+    for (const fn of funcs) {
+      html += `<div class="sidebar__usage-item" data-entity="${escapeHtml(fn)}">${escapeHtml(fn)}()</div>`;
+    }
+  }
+  list.innerHTML = html;
+  bindUsageClicks(list);
+}
+
+function renderFunctionUsage(entityName, connections, panel, list, title) {
+  const uses = connections.filter(c =>
+    c.source === entityName && ['param', 'return', 'uses'].includes(c.type)
+  );
+  if (uses.length === 0) { panel.hidden = true; return; }
+
+  panel.hidden = false;
+  title.textContent = 'Uses Structs';
+
+  const byType = { param: [], return: [], uses: [] };
+  for (const c of uses) {
+    if (byType[c.type]) byType[c.type].push(c.target);
+  }
+
+  let html = '';
+  const labels = { param: 'Parameters', return: 'Return type', uses: 'Local variables' };
+  for (const [type, structs] of Object.entries(byType)) {
+    if (structs.length === 0) continue;
+    html += `<div class="sidebar__usage-group">${labels[type]}</div>`;
+    for (const s of structs) {
+      html += `<div class="sidebar__usage-item" data-entity="${escapeHtml(s)}">${escapeHtml(s)}</div>`;
+    }
+  }
+  list.innerHTML = html;
+  bindUsageClicks(list);
+}
+
+function bindUsageClicks(list) {
+  list.querySelectorAll('.sidebar__usage-item').forEach(el => {
+    el.addEventListener('click', () => {
+      setSelectedEntity(el.dataset.entity);
+    });
+  });
+}
+
+// ---- sizeof / offsetof Calculator ----
+
+function populateSizeofPanel() {
+  const panel = document.getElementById('sizeof-panel');
+  const select = document.getElementById('sizeof-struct');
+  if (!panel || !select) return;
+
+  const state = getState();
+  const structs = [...state.structs, ...state.unions];
+  if (structs.length === 0) { panel.hidden = true; return; }
+
+  panel.hidden = false;
+  let html = '<option value="">Select struct...</option>';
+  for (const s of structs) {
+    const name = s.displayName || s.name;
+    html += `<option value="${escapeHtml(s.name)}">${escapeHtml(name)}</option>`;
+  }
+  select.innerHTML = html;
+  document.getElementById('sizeof-field').hidden = true;
+  document.getElementById('sizeof-result').innerHTML = '';
+}
+
+function updateSizeofResult() {
+  const structSelect = document.getElementById('sizeof-struct');
+  const fieldSelect = document.getElementById('sizeof-field');
+  const resultDiv = document.getElementById('sizeof-result');
+  if (!structSelect || !fieldSelect || !resultDiv) return;
+
+  const entityName = structSelect.value;
+  if (!entityName) {
+    fieldSelect.hidden = true;
+    resultDiv.innerHTML = '';
+    return;
+  }
+
+  const entity = getEntity(entityName);
+  if (!entity) return;
+
+  // Populate field dropdown
+  const fields = (entity.fields || []).filter(f => f.category !== 'padding');
+  let fhtml = '<option value="">-- whole struct --</option>';
+  for (const f of fields) {
+    fhtml += `<option value="${escapeHtml(f.name)}">${escapeHtml(f.name)}</option>`;
+  }
+  fieldSelect.innerHTML = fhtml;
+  fieldSelect.hidden = false;
+
+  // Build result
+  const displayName = entity.displayName || entity.name;
+  const fieldName = fieldSelect.value;
+  let html = `<div class="sizeof-row"><b>sizeof</b>(${escapeHtml(displayName)}) = <b>${entity.totalSize}</b> bytes</div>`;
+  html += `<div class="sizeof-row">Alignment: <b>${entity.alignment}</b></div>`;
+
+  if (fieldName) {
+    const field = fields.find(f => f.name === fieldName);
+    if (field) {
+      html += `<div class="sizeof-row"><b>offsetof</b>(${escapeHtml(displayName)}, ${escapeHtml(fieldName)}) = <b>${field.offset}</b></div>`;
+      html += `<div class="sizeof-row">Field size: <b>${field.size}</b> bytes</div>`;
+      html += `<div class="sizeof-row">Type: ${escapeHtml(field.type)}</div>`;
+    }
+  }
+
+  if (entity.packed) html += `<div class="sizeof-row sizeof-row--packed">Packed (no padding)</div>`;
+  resultDiv.innerHTML = html;
+}
+
+// ---- Call Graph Panel ----
+
+function renderCallGraphPanel(entityName) {
+  const panel = document.getElementById('call-graph-panel');
+  const tree = document.getElementById('call-graph-tree');
+  if (!panel || !tree) return;
+
+  if (!entityName) { panel.hidden = true; return; }
+  const entity = getEntity(entityName);
+  if (!entity || !entity.isFunction) { panel.hidden = true; return; }
+
+  panel.hidden = false;
+  const connections = getConnections();
+  const depth = getCallGraphDepth();
+  setCallGraphRoot(entityName);
+
+  // Build caller/callee adjacency (direct + indirect calls)
+  const callers = {};     // target -> [sources]
+  const callees = {};     // source -> [targets]
+  const indirectEdges = new Set(); // "source->target" for indirect calls
+  const callTypes = new Set(['call', 'indirect_call']);
+  for (const c of connections) {
+    if (!callTypes.has(c.type)) continue;
+    if (!callees[c.source]) callees[c.source] = [];
+    callees[c.source].push(c.target);
+    if (!callers[c.target]) callers[c.target] = [];
+    callers[c.target].push(c.source);
+    if (c.type === 'indirect_call') {
+      indirectEdges.add(`${c.source}->${c.target}`);
+    }
+  }
+
+  let html = '';
+
+  // Callers (who calls this function)
+  const callerTree = buildCallTree(entityName, callers, depth);
+  if (callerTree.length > 0) {
+    html += `<div class="call-tree__label">&#8592; called by:</div>`;
+    html += renderCallTree(callerTree, 0, indirectEdges, 'caller');
+  }
+
+  // Callees (what this function calls)
+  const calleeTree = buildCallTree(entityName, callees, depth);
+  if (calleeTree.length > 0) {
+    html += `<div class="call-tree__label">&#8594; calls:</div>`;
+    html += renderCallTree(calleeTree, 0, indirectEdges, 'callee', entityName);
+  }
+
+  if (!html) {
+    html = '<div class="sidebar__empty">No call connections</div>';
+  }
+
+  // Hint about indirect call tracking
+  if (indirectEdges.size > 0) {
+    html += `<div class="call-tree__hint">Dashed = indirect call via function pointer (proved by assignment in code)</div>`;
+  }
+
+  tree.innerHTML = html;
+
+  // Bind clicks
+  tree.querySelectorAll('.call-tree__node').forEach(el => {
+    el.addEventListener('click', () => {
+      setSelectedEntity(el.dataset.entity);
+    });
+  });
+}
+
+function buildCallTree(root, adjacency, maxDepth) {
+  const result = [];
+  const visited = new Set([root]);
+
+  function walk(name, depth) {
+    if (depth >= maxDepth) return [];
+    const neighbors = adjacency[name] || [];
+    const children = [];
+    for (const n of neighbors) {
+      if (visited.has(n)) continue;
+      visited.add(n);
+      children.push({ name: n, children: walk(n, depth + 1) });
+    }
+    return children;
+  }
+
+  return walk(root, 0);
+}
+
+function renderCallTree(nodes, indent, indirectEdges = new Set(), direction = 'callee', parentName = '') {
+  let html = '';
+  for (const node of nodes) {
+    const pad = indent * 16;
+    // Check if this edge is indirect
+    const edgeKey = direction === 'callee'
+      ? `${parentName}->${node.name}`
+      : `${node.name}->${parentName}`;
+    const isIndirect = indirectEdges.has(edgeKey);
+    const cls = isIndirect ? 'call-tree__node call-tree__node--indirect' : 'call-tree__node';
+    const tag = isIndirect ? ' <span class="call-tree__tag">via fp</span>' : '';
+    html += `<div class="${cls}" data-entity="${escapeHtml(node.name)}" style="padding-left:${pad}px">
+      ${escapeHtml(node.name)}()${tag}
+    </div>`;
+    if (node.children.length > 0) {
+      html += renderCallTree(node.children, indent + 1, indirectEdges, direction, node.name);
+    }
+  }
+  return html;
 }
 
 // ---- Utility ----

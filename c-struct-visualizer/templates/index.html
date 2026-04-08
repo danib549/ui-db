@@ -65,15 +65,68 @@
           <button class="layout-btn" data-layout="left-right" title="Dependency hierarchy left-to-right">Left-Right</button>
           <button class="layout-btn" data-layout="force" title="Force-directed physics layout">Force</button>
           <button class="layout-btn" data-layout="grid" title="Alphabetical grid">Grid</button>
+          <button class="layout-btn" data-layout="by-file" title="Group by source file">By File</button>
+          <button class="layout-btn" data-layout="includes" title="Header include graph">Includes</button>
         </div>
       </div>
 
       <!-- Struct List -->
       <div class="sidebar__section sidebar__section--grow">
-        <div class="sidebar__section-title">Types &amp; Functions</div>
+        <div class="sidebar__section-title">
+          Types &amp; Functions
+          <label class="sidebar__filter-toggle" title="Show standard C library functions (printf, malloc, etc.)">
+            <input type="checkbox" id="show-stdlib-checkbox">
+            <span class="sidebar__filter-label">stdlib</span>
+          </label>
+        </div>
         <div class="sidebar__struct-list" id="struct-list">
           <div class="sidebar__empty">Upload C files to see structs</div>
         </div>
+      </div>
+
+      <!-- Used By / Uses panel (context-sensitive, shown on entity select) -->
+      <div class="sidebar__section" id="usage-panel" hidden>
+        <div class="sidebar__section-title" id="usage-panel-title">Used By</div>
+        <div class="sidebar__usage-list" id="usage-list"></div>
+      </div>
+
+      <!-- Call Graph (shown when a function is selected) -->
+      <div class="sidebar__section" id="call-graph-panel" hidden>
+        <div class="sidebar__section-title">
+          Call Graph
+          <label class="sidebar__depth-control" title="Max traversal depth">
+            <span>Depth:</span>
+            <input type="range" id="call-graph-depth" min="1" max="3" value="2" class="sidebar__depth-slider">
+            <span id="call-graph-depth-label">2</span>
+          </label>
+        </div>
+        <div class="sidebar__call-tree" id="call-graph-tree"></div>
+      </div>
+
+      <!-- sizeof / offsetof Calculator -->
+      <div class="sidebar__section" id="sizeof-panel" hidden>
+        <div class="sidebar__section-title">sizeof / offsetof</div>
+        <div class="sizeof-calculator">
+          <select id="sizeof-struct" class="sizeof-calculator__select">
+            <option value="">Select struct...</option>
+          </select>
+          <select id="sizeof-field" class="sizeof-calculator__select" hidden>
+            <option value="">Select field...</option>
+          </select>
+          <div class="sizeof-calculator__result" id="sizeof-result"></div>
+        </div>
+      </div>
+
+      <!-- Global Variables -->
+      <div class="sidebar__section" id="globals-panel" hidden>
+        <div class="sidebar__section-title">Global Variables</div>
+        <div class="sidebar__globals-list" id="globals-list"></div>
+      </div>
+
+      <!-- Defines (#define macros) -->
+      <div class="sidebar__section" id="defines-panel" hidden>
+        <div class="sidebar__section-title">Defines</div>
+        <div class="sidebar__defines-list" id="defines-list"></div>
       </div>
 
       <!-- Warnings -->
@@ -88,12 +141,64 @@
           <div class="sidebar__empty">Hover over a field to see details</div>
         </div>
       </div>
+
     </aside>
 
-    <!-- Canvas Area -->
-    <main class="canvas-area" id="canvas-container">
-      <canvas id="cstruct-canvas"></canvas>
+    <!-- Main Content (toolbar + canvas) -->
+    <main class="main-content">
+      <!-- Search & Filter Toolbar -->
+      <div class="cstruct-toolbar" id="cstruct-toolbar" hidden>
+        <div class="cstruct-toolbar__search">
+          <input type="text" id="cstruct-search"
+                 class="cstruct-toolbar__input"
+                 placeholder="Search structs, functions, fields, types...">
+          <button class="cstruct-toolbar__clear" id="search-clear" hidden>&times;</button>
+        </div>
+        <label class="cstruct-toolbar__checkbox" title="When clicking a search result, show only its connected subgraph">
+          <input type="checkbox" id="search-trace-checkbox">
+          <span>Trace</span>
+        </label>
+        <div class="cstruct-toolbar__filters" id="filter-chips">
+          <button class="filter-chip filter-chip--active" data-type="struct">S Structs</button>
+          <button class="filter-chip filter-chip--active" data-type="union">U Unions</button>
+          <button class="filter-chip filter-chip--active" data-type="function">F Functions</button>
+          <span class="cstruct-toolbar__sep"></span>
+          <button class="filter-chip" id="stdlib-chip" data-special="stdlib">Stdlib</button>
+          <span class="cstruct-toolbar__sep"></span>
+          <div style="position:relative;display:inline-block;">
+            <button class="filter-chip" id="file-filter-btn">Files &#9662;</button>
+            <div class="file-filter-dropdown" id="file-filter-dropdown" hidden></div>
+          </div>
+        </div>
+        <span class="cstruct-toolbar__sep"></span>
+        <label class="cstruct-toolbar__checkbox" title="Show struct/type dependency lines">
+          <input type="checkbox" id="show-deps-checkbox" checked>
+          <span>Deps</span>
+        </label>
+        <label class="cstruct-toolbar__checkbox" title="Show function-to-function call connections">
+          <input type="checkbox" id="show-calls-checkbox">
+          <span>Calls</span>
+        </label>
+        <button class="cstruct-toolbar__reset" id="filter-reset" hidden>Reset All</button>
+      </div>
+      <!-- Search results dropdown -->
+      <div class="search-results" id="search-results" hidden></div>
+      <!-- Canvas Area -->
+      <div class="canvas-area" id="canvas-container">
+        <canvas id="cstruct-canvas"></canvas>
+      </div>
     </main>
+  </div>
+
+  <!-- Memory Map Modal (outside .app so it overlays everything) -->
+  <div class="memmap-overlay" id="memmap-overlay" hidden>
+    <div class="memmap-modal">
+      <div class="memmap-modal__header">
+        <span class="memmap-modal__title" id="memmap-title">Memory Map</span>
+        <button class="memmap-modal__close" id="memmap-close">&times;</button>
+      </div>
+      <div class="memmap-modal__body" id="memmap-body"></div>
+    </div>
   </div>
 
   <script>
@@ -114,8 +219,12 @@
   <script type="module">
     import { EventBus } from '/static/js/events.js';
     import { init } from '/static/js/cstruct/cstruct-app.js';
+    import { initSearch } from '/static/js/cstruct/cstruct-search.js';
+    import { initMemoryMap } from '/static/js/cstruct/cstruct-memmap.js';
     window.__eventBus = { EventBus };
     init();
+    initSearch();
+    initMemoryMap();
   </script>
 </body>
 </html>

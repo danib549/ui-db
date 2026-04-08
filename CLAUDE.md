@@ -71,6 +71,17 @@ Design PostgreSQL schemas visually → generate production-ready DDL. Three inpu
 - `.claude/skills/pg-sql-import.md` — SQL file parsing, statement tokenizer, CREATE/ALTER/INDEX extraction, pg_dump compatibility
 - `.claude/skills/pg-schema-diff.md` — Schema comparison, ALTER generation, column/constraint/index diffs, enum evolution
 
+### C Struct Visualizer Skills (`c-struct-visualizer/`)
+Separate sub-project: parses C/C++ files with libclang, visualizes struct memory layouts on canvas. Has its own `CLAUDE.md` at `c-struct-visualizer/CLAUDE.md`.
+
+- `c-struct-visualizer/.claude/skills/c-struct-visualizer.md` — Full system lifecycle: file upload → libclang parsing → canvas visualization, architecture decisions
+- `c-struct-visualizer/.claude/skills/c-parser-engine.md` — libclang AST parsing, struct/union/enum/function extraction, field offsets, padding, bitfields, typedefs, multi-file includes, target architectures
+- `c-struct-visualizer/.claude/skills/cstruct-canvas-engine.md` — Render pipeline, viewport transforms, coordinate math, DPR handling, rAF batching, grid drawing
+- `c-struct-visualizer/.claude/skills/cstruct-canvas-ui.md` — Block rendering: struct/union/function blocks, headers, field rows, badges, padding visualization, dark mode
+- `c-struct-visualizer/.claude/skills/cstruct-connections.md` — Bezier connection lines, anchor calculation, side selection, arrows, connection types, subgraph highlighting
+- `c-struct-visualizer/.claude/skills/cstruct-layout-algorithms.md` — Top-down, left-right, force-directed, grid layouts, dependency graph, animated transitions, auto-fit
+- `c-struct-visualizer/.claude/skills/cstruct-upload-system.md` — Drag-drop, folder walking, file/folder picker, re-parse on arch change, status UI
+
 ## Rules
 - `.claude/rules/modular-architecture.md` — Project structure and module boundaries
 - `.claude/rules/canvas-redraw-guarantee.md` — Lines must always redraw (the iron rule)
@@ -142,7 +153,7 @@ Before starting, ask:
 - What breaks if my assumption about X is wrong?
 - Does this change any event contract or public API?
 - Will connection lines still redraw correctly?
-- Edge cases: empty data, zero tables, extreme zoom?
+- Edge cases: empty data, zero tables, extnreme zoom?
 
 ---
 
