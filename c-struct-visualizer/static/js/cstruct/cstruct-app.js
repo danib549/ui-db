@@ -9,13 +9,21 @@ import {
   getPosition, getViewport, isCollapsed, getHoveredEntity, getSelectedEntity,
   setPositions, setPosition, setViewport, toggleCollapsed,
   setHoveredEntity, setHoveredField, setSelectedEntity,
+  getShowStdlib, setShowStdlib,
+  getActiveLayout, setActiveLayout, getFileContainers, setFileContainers,
+  toggleEntityVisibility, isEntityHidden,
+  getShowCallConnections, setShowCallConnections,
+  getShowDepConnections, setShowDepConnections,
+  getFunctions,
 } from './cstruct-state.js';
 import {
   BLOCK, CANVAS_COLORS, CANVAS_COLORS_DARK, LINE,
 } from './cstruct-constants.js';
-import { drawBlock, calculateBlockHeight, hitTestField } from './cstruct-blocks.js';
+import { drawBlock, calculateBlockHeight, hitTestField, hitTestBadge, hitTestCollapseButton, drawFileContainer } from './cstruct-blocks.js';
 import { chooseSides, calculateAnchor, drawBezierConnection, drawArrow } from './cstruct-connections.js';
 import { initUpload } from './cstruct-upload.js';
+import { openSourceModal } from './cstruct-modal.js';
+import { getVisibleEntities, getFocusedSubgraph } from './cstruct-search.js';
 
 let canvas = null;
 let ctx = null;
@@ -25,9 +33,11 @@ let rafId = null;
 let isDragging = false;
 let isPanning = false;
 let dragMoved = false;
-let dragTarget = null;
+let dragTarget = null;       // entity name or null
+let dragContainer = null;    // filename of dragged file container or null
 let dragOffset = { x: 0, y: 0 };
 let panStart = { x: 0, y: 0 };
+let lastRefStats = new Map();  // cached from last render for badge tooltips
 
 // ---- Initialization ----
 
@@ -84,9 +94,58 @@ function initSidebar() {
     });
   });
 
+  // Stdlib filter checkbox (sidebar) — syncs with toolbar chip
+  const stdlibCheckbox = document.getElementById('show-stdlib-checkbox');
+  if (stdlibCheckbox) {
+    stdlibCheckbox.checked = getShowStdlib();
+    stdlibCheckbox.addEventListener('change', () => {
+      setShowStdlib(stdlibCheckbox.checked);
+      renderStructList();
+      scheduleRender();
+    });
+    // Keep sidebar checkbox in sync with state changes from toolbar chip
+    EventBus.on('cstructStateChanged', ({ key }) => {
+      if (key === 'showStdlib' || key === 'all' || key === 'filters') {
+        stdlibCheckbox.checked = getShowStdlib();
+        renderStructList();
+      }
+    });
+  }
+
+  // Dependency connections checkbox
+  const depCheckbox = document.getElementById('show-deps-checkbox');
+  if (depCheckbox) {
+    depCheckbox.checked = getShowDepConnections();
+    depCheckbox.addEventListener('change', () => {
+      setShowDepConnections(depCheckbox.checked);
+    });
+    EventBus.on('cstructStateChanged', ({ key }) => {
+      if (key === 'showDepConnections' || key === 'all') {
+        depCheckbox.checked = getShowDepConnections();
+      }
+    });
+  }
+
+  // Function call connections checkbox
+  const callCheckbox = document.getElementById('show-calls-checkbox');
+  if (callCheckbox) {
+    callCheckbox.checked = getShowCallConnections();
+    callCheckbox.addEventListener('change', () => {
+      setShowCallConnections(callCheckbox.checked);
+    });
+    EventBus.on('cstructStateChanged', ({ key }) => {
+      if (key === 'showCallConnections' || key === 'all') {
+        callCheckbox.checked = getShowCallConnections();
+      }
+    });
+  }
+
   // Listen for data to populate struct list
   EventBus.on('cstructDataLoaded', renderStructList);
   EventBus.on('cstructEntitySelected', highlightStructListItem);
+  EventBus.on('cstructEntitySelected', ({ name }) => {
+    if (name) panToEntity(name);
+  });
 }
 
 // ---- Render pipeline ----
@@ -124,12 +183,34 @@ function render() {
     return;
   }
 
+  // Filter: hard filters (type/file/hidden/stdlib)
+  const visibleSet = getVisibleEntities();
+  // Soft filter: focused entity subgraph (dims non-members)
+  const focusSet = getFocusedSubgraph();
+
   // Compute trace subgraph if something is selected
   const selected = getSelectedEntity();
   const traceGraph = selected ? getConnectedSubgraph(selected) : null;
 
+  // Draw file containers (for by-file layout) — only if they have visible entities
+  if (getActiveLayout() === 'by-file') {
+    const containers = getFileContainers();
+    for (const [filename, box] of Object.entries(containers)) {
+      // Skip container if all its entities are filtered out
+      if (visibleSet) {
+        const hasVisible = entities.some(e => e.sourceFile === filename && visibleSet.has(e.name));
+        if (!hasVisible) continue;
+      }
+      drawFileContainer(ctx, filename, box.x, box.y, box.width, box.height);
+    }
+  }
+
   // Draw connections first (under blocks)
-  drawAllConnections(colors, traceGraph);
+  drawAllConnections(colors, traceGraph, visibleSet, focusSet);
+
+  // Compute reference stats (how many connections target/originate from each entity)
+  const refStats = buildRefStats();
+  lastRefStats = refStats;
 
   // Draw blocks
   const hovered = getHoveredEntity();
@@ -138,9 +219,14 @@ function render() {
     const pos = getPosition(entity.name);
     if (!pos) continue;
 
-    // Dim blocks not in trace subgraph
+    // Hard-filter: type/file/hidden/stdlib filters fully hide
+    if (visibleSet && !visibleSet.has(entity.name)) continue;
+
+    // Soft-dim: trace subgraph or focused entity dims non-members
     if (traceGraph && !traceGraph.entities.has(entity.name)) {
-      ctx.globalAlpha = 0.15;
+      ctx.globalAlpha = 0.08;
+    } else if (focusSet && !focusSet.has(entity.name)) {
+      ctx.globalAlpha = 0.08;
     }
 
     drawBlock(
@@ -148,9 +234,119 @@ function render() {
       entity.name === hovered,
       entity.name === selected,
       isCollapsed(entity.name),
+      refStats.get(entity.name) || null,
     );
 
     ctx.globalAlpha = 1.0;
+  }
+
+  // Draw legend in screen space (fixed position)
+  drawLegend(dpr, colors);
+}
+
+// ---- Legend ----
+
+function drawLegend(dpr, colors) {
+  const connections = getConnections();
+  if (connections.length === 0) return;
+
+  // Determine which connection types are visible
+  const showCalls = getShowCallConnections();
+  const showDeps = getShowDepConnections();
+  const types = new Set();
+  for (const c of connections) {
+    if (c.type === 'call' && !showCalls) continue;
+    if (c.type !== 'call' && !showDeps) continue;
+    types.add(c.type);
+  }
+  if (types.size === 0) return;
+
+  // Legend entries in display order
+  const allEntries = [
+    { type: 'nested', label: 'Nested struct', color: colors.connectionLine, dash: [] },
+    { type: 'param', label: 'Parameter', color: colors.connectionParam, dash: [6, 3] },
+    { type: 'return', label: 'Return type', color: colors.connectionReturn, dash: [] },
+    { type: 'uses', label: 'Local usage', color: colors.connectionUses, dash: [4, 4] },
+    { type: 'call', label: 'Function call', color: colors.connectionCall, dash: [8, 3, 2, 3] },
+  ];
+  const entries = allEntries.filter(e => types.has(e.type));
+  if (entries.length === 0) return;
+
+  // Switch to screen coordinates
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  const lineW = 30;
+  const rowH = 18;
+  const padX = 12;
+  const padY = 8;
+  const fontSize = 11;
+  ctx.font = `${fontSize}px -apple-system, BlinkMacSystemFont, sans-serif`;
+
+  // Measure text widths
+  let maxTextW = 0;
+  for (const e of entries) {
+    const w = ctx.measureText(e.label).width;
+    if (w > maxTextW) maxTextW = w;
+  }
+
+  const boxW = padX + lineW + 8 + maxTextW + padX;
+  const boxH = padY + entries.length * rowH + padY;
+  const canvasW = canvas.width / dpr;
+  const canvasH = canvas.height / dpr;
+  const x = canvasW - boxW - 12;
+  const y = canvasH - boxH - 12;
+
+  // Background
+  const r = 6;
+  ctx.fillStyle = colors.bg;
+  ctx.globalAlpha = 0.85;
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + boxW - r, y);
+  ctx.arcTo(x + boxW, y, x + boxW, y + r, r);
+  ctx.lineTo(x + boxW, y + boxH - r);
+  ctx.arcTo(x + boxW, y + boxH, x + boxW - r, y + boxH, r);
+  ctx.lineTo(x + r, y + boxH);
+  ctx.arcTo(x, y + boxH, x, y + boxH - r, r);
+  ctx.lineTo(x, y + r);
+  ctx.arcTo(x, y, x + r, y, r);
+  ctx.closePath();
+  ctx.fill();
+  ctx.globalAlpha = 1.0;
+  ctx.strokeStyle = colors.boxBorder;
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  // Entries
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i];
+    const rowY = y + padY + i * rowH + rowH / 2;
+
+    // Line sample
+    ctx.beginPath();
+    ctx.setLineDash(e.dash);
+    ctx.strokeStyle = e.color;
+    ctx.lineWidth = 2;
+    ctx.moveTo(x + padX, rowY);
+    ctx.lineTo(x + padX + lineW, rowY);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Arrow head
+    const ax = x + padX + lineW;
+    ctx.beginPath();
+    ctx.moveTo(ax, rowY);
+    ctx.lineTo(ax - 5, rowY - 3);
+    ctx.lineTo(ax - 5, rowY + 3);
+    ctx.closePath();
+    ctx.fillStyle = e.color;
+    ctx.fill();
+
+    // Label
+    ctx.fillStyle = colors.fieldText;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(e.label, x + padX + lineW + 8, rowY);
   }
 }
 
@@ -184,14 +380,50 @@ function drawGrid(colors, viewport, dpr) {
   }
 }
 
+// ---- Reference counts ----
+
+function buildRefStats() {
+  const connections = getConnections();
+  const showCalls = getShowCallConnections();
+  const showDeps = getShowDepConnections();
+  const funcNames = new Set(getFunctions().map(f => f.name));
+  const stats = new Map();
+  const ensure = (name) => {
+    if (!stats.has(name)) stats.set(name, { calledBy: 0, calls: 0, byFunc: 0, byStruct: 0 });
+    return stats.get(name);
+  };
+  for (const c of connections) {
+    if (c.type === 'call' && !showCalls) continue;
+    if (c.type !== 'call' && !showDeps) continue;
+    const tgt = ensure(c.target);
+    tgt.calledBy++;
+    if (funcNames.has(c.source)) tgt.byFunc++;
+    else tgt.byStruct++;
+    ensure(c.source).calls++;
+  }
+  return stats;
+}
+
 // ---- Connections ----
 
-function drawAllConnections(colors, traceGraph) {
+function drawAllConnections(colors, traceGraph, visibleSet, focusSet) {
   const connections = getConnections();
   const hovered = getHoveredEntity();
 
   for (let i = 0; i < connections.length; i++) {
     const conn = connections[i];
+
+    // Skip connections based on toggles
+    if (conn.type === 'call' && !getShowCallConnections()) continue;
+    if (conn.type !== 'call' && !getShowDepConnections()) continue;
+
+    // Hard-filter: skip connections where either endpoint is hidden by hard filters
+    if (visibleSet && (!visibleSet.has(conn.source) || !visibleSet.has(conn.target))) continue;
+
+    // Soft-filter: check if connection is outside focus subgraph
+    const isOutsideFocus = focusSet
+      && (!focusSet.has(conn.source) || !focusSet.has(conn.target));
+
     const srcPos = getPosition(conn.source);
     const tgtPos = getPosition(conn.target);
     if (!srcPos || !tgtPos) continue;
@@ -208,8 +440,12 @@ function drawAllConnections(colors, traceGraph) {
       color = colors.connectionReturn;
     } else if (conn.type === 'uses') {
       color = colors.connectionUses;
+    } else if (conn.type === 'call') {
+      color = colors.connectionCall;
+    } else if (conn.type === 'param') {
+      color = colors.connectionParam;
     } else {
-      color = colors.connectionLine;  // 'nested' and 'param'
+      color = colors.connectionLine;  // 'nested'
     }
     const lineWidth = isHighlighted ? LINE.strokeWidthHover : LINE.strokeWidth;
 
@@ -226,16 +462,22 @@ function drawAllConnections(colors, traceGraph) {
     const srcAnchor = calculateAnchor(srcPos, srcSide, srcYOffset);
     const tgtAnchor = calculateAnchor(tgtPos, tgtSide, tgtYOffset);
 
-    // Dimming: trace mode dims non-trace connections, hover dims non-hovered
-    if (traceGraph && !isInTrace) {
+    // Dimming: focus, trace, or hover
+    if (isOutsideFocus) {
+      ctx.globalAlpha = 0.04;
+    } else if (traceGraph && !isInTrace) {
       ctx.globalAlpha = 0.05;
     } else {
       ctx.globalAlpha = isHighlighted ? 1.0 : (hovered ? 0.2 : 0.6);
     }
 
-    // Dashed lines for 'uses' connections
-    if (conn.type === 'uses') {
+    // Dashed lines for 'param', 'uses', and 'call' connections
+    if (conn.type === 'param') {
+      ctx.setLineDash([6, 3]);
+    } else if (conn.type === 'uses') {
       ctx.setLineDash([4, 4]);
+    } else if (conn.type === 'call') {
+      ctx.setLineDash([8, 3, 2, 3]);
     }
 
     drawBezierConnection(ctx, srcAnchor, tgtAnchor, color, lineWidth);
@@ -288,6 +530,7 @@ function onDataLoaded() {
 /** Apply a named layout with optional animation. */
 function applyLayout(mode, animate = true) {
   currentLayoutMode = mode;
+  setActiveLayout(mode);
   const entities = getAllEntities();
   if (entities.length === 0) return;
 
@@ -298,12 +541,20 @@ function applyLayout(mode, animate = true) {
   let newPositions;
   if (mode === 'left-right') {
     newPositions = layoutLeftRight(entities, entityMap, connections, nameSet);
+    setFileContainers({});
   } else if (mode === 'force') {
     newPositions = layoutForceDirected(entities, entityMap, connections, nameSet);
+    setFileContainers({});
   } else if (mode === 'grid') {
     newPositions = layoutGrid(entities, entityMap);
+    setFileContainers({});
+  } else if (mode === 'by-file') {
+    const result = layoutByFile(entities, entityMap);
+    newPositions = result.positions;
+    setFileContainers(result.containers);
   } else {
     newPositions = layoutTopDown(entities, entityMap, connections, nameSet);
+    setFileContainers({});
   }
 
   if (animate && Object.keys(getPositions()).length > 0) {
@@ -553,6 +804,99 @@ function layoutGrid(entities, entityMap) {
   return positions;
 }
 
+// ---- By-file layout (Phase 6) ----
+
+function layoutByFile(entities, entityMap) {
+  // Group entities by sourceFile
+  const fileGroups = {};
+  for (const entity of entities) {
+    const file = entity.sourceFile || '(unknown)';
+    if (!fileGroups[file]) fileGroups[file] = [];
+    fileGroups[file].push(entity);
+  }
+
+  const containerPad = 20;
+  const containerTitleH = 32;
+  const innerGapX = 20;
+  const innerGapY = 16;
+  const containerGapX = 60;
+  const containerGapY = 50;
+
+  const positions = {};
+  const containers = {};
+
+  // Sort files alphabetically
+  const sortedFiles = Object.keys(fileGroups).sort();
+
+  // Arrange containers in a grid
+  const containerCols = Math.max(1, Math.ceil(Math.sqrt(sortedFiles.length)));
+  let containerX = 0, containerY = 0, col = 0, rowMaxH = 0;
+
+  for (const file of sortedFiles) {
+    const group = fileGroups[file];
+
+    // Layout entities inside this container as a grid
+    const innerCols = Math.max(1, Math.ceil(Math.sqrt(group.length)));
+    let ix = containerPad, iy = containerTitleH + containerPad;
+    let icol = 0, innerRowMaxH = 0;
+    let maxRowWidth = 0;
+
+    for (const entity of group) {
+      const h = calculateBlockHeight(entity, false);
+      positions[entity.name] = {
+        x: containerX + ix,
+        y: containerY + iy,
+        width: BLOCK.minWidth,
+        height: h,
+      };
+      innerRowMaxH = Math.max(innerRowMaxH, h);
+      icol++;
+
+      if (icol >= innerCols) {
+        maxRowWidth = Math.max(maxRowWidth, ix + BLOCK.minWidth + containerPad);
+        icol = 0;
+        ix = containerPad;
+        iy += innerRowMaxH + innerGapY;
+        innerRowMaxH = 0;
+      } else {
+        ix += BLOCK.minWidth + innerGapX;
+      }
+    }
+
+    // Compute container dimensions
+    if (icol > 0) {
+      maxRowWidth = Math.max(maxRowWidth, ix + BLOCK.minWidth + containerPad);
+      iy += innerRowMaxH + containerPad;
+    } else {
+      iy += containerPad;
+    }
+
+    const containerW = Math.max(maxRowWidth, BLOCK.minWidth + containerPad * 2);
+    const containerH = iy;
+
+    containers[file] = {
+      x: containerX,
+      y: containerY,
+      width: containerW,
+      height: containerH,
+    };
+
+    rowMaxH = Math.max(rowMaxH, containerH);
+    col++;
+
+    if (col >= containerCols) {
+      col = 0;
+      containerX = 0;
+      containerY += rowMaxH + containerGapY;
+      rowMaxH = 0;
+    } else {
+      containerX += containerW + containerGapX;
+    }
+  }
+
+  return { positions, containers };
+}
+
 // ---- Animated transition ----
 
 function animateToPositions(targetPositions, duration = 350) {
@@ -660,6 +1004,38 @@ function hitTestBlock(cx, cy) {
   return null;
 }
 
+function hitTestContainer(cx, cy) {
+  const containers = getFileContainers();
+  for (const [filename, box] of Object.entries(containers)) {
+    if (cx >= box.x && cx <= box.x + box.width && cy >= box.y && cy <= box.y + box.height) {
+      return filename;
+    }
+  }
+  return null;
+}
+
+function moveContainer(filename, newX, newY) {
+  const containers = getFileContainers();
+  const box = containers[filename];
+  if (!box) return;
+
+  const dx = newX - box.x;
+  const dy = newY - box.y;
+
+  // Move the container itself
+  const updated = { ...containers, [filename]: { ...box, x: newX, y: newY } };
+  setFileContainers(updated);
+
+  // Move all entities belonging to this file
+  const entities = getAllEntities();
+  for (const entity of entities) {
+    if (entity.sourceFile !== filename) continue;
+    const pos = getPosition(entity.name);
+    if (!pos) continue;
+    setPosition(entity.name, { ...pos, x: pos.x + dx, y: pos.y + dy });
+  }
+}
+
 function onMouseDown(e) {
   if (e.button !== 0) return;
   const pos = getMousePos(e);
@@ -667,6 +1043,7 @@ function onMouseDown(e) {
   const hit = hitTestBlock(x, y);
 
   dragMoved = false;
+  dragContainer = null;
 
   if (hit) {
     isDragging = true;
@@ -674,6 +1051,20 @@ function onMouseDown(e) {
     const blockPos = getPosition(hit);
     dragOffset = { x: x - blockPos.x, y: y - blockPos.y };
     canvas.style.cursor = 'grabbing';
+  } else if (getActiveLayout() === 'by-file') {
+    const containerHit = hitTestContainer(x, y);
+    if (containerHit) {
+      isDragging = true;
+      dragContainer = containerHit;
+      const containers = getFileContainers();
+      const box = containers[containerHit];
+      dragOffset = { x: x - box.x, y: y - box.y };
+      canvas.style.cursor = 'grabbing';
+    } else {
+      isPanning = true;
+      panStart = pos;
+      canvas.style.cursor = 'grabbing';
+    }
   } else {
     isPanning = true;
     panStart = pos;
@@ -692,6 +1083,12 @@ function onMouseMove(e) {
       x: x - dragOffset.x,
       y: y - dragOffset.y,
     });
+    return;
+  }
+
+  if (isDragging && dragContainer) {
+    dragMoved = true;
+    moveContainer(dragContainer, x - dragOffset.x, y - dragOffset.y);
     return;
   }
 
@@ -716,11 +1113,14 @@ function onMouseMove(e) {
     if (entity && blockPos) {
       const fIdx = hitTestField(entity, blockPos, x, y, isCollapsed(hit));
       setHoveredField(fIdx >= 0 ? hit : null, fIdx);
+      const tip = hitTestBadge(ctx, entity, blockPos, lastRefStats.get(hit) || null, x, y);
+      canvas.title = tip || '';
     }
     canvas.style.cursor = 'pointer';
   } else {
     setHoveredField(null, -1);
     canvas.style.cursor = 'grab';
+    canvas.title = '';
   }
 
   // Update field detail in sidebar
@@ -732,6 +1132,7 @@ function onMouseUp(e) {
   isDragging = false;
   isPanning = false;
   dragTarget = null;
+  dragContainer = null;
 
   // Click-to-select: if mouse didn't move, treat as a click
   if (!wasDrag && e) {
@@ -739,7 +1140,13 @@ function onMouseUp(e) {
     const { x, y } = screenToCanvas(pos.x, pos.y);
     const hit = hitTestBlock(x, y);
     if (hit) {
-      setSelectedEntity(hit);
+      // Check if click is on the collapse button (left 20px of header)
+      const blockPos = getPosition(hit);
+      if (blockPos && hitTestCollapseButton(blockPos, x, y)) {
+        toggleCollapsed(hit);
+      } else {
+        setSelectedEntity(hit);
+      }
     } else if (getSelectedEntity()) {
       // Click empty space to deselect
       setSelectedEntity(getSelectedEntity());
@@ -777,7 +1184,7 @@ function onDblClick(e) {
   const hit = hitTestBlock(x, y);
 
   if (hit) {
-    toggleCollapsed(hit);
+    openSourceModal(hit);
   }
 }
 
@@ -812,7 +1219,9 @@ function renderStructList() {
       meta = `${entity.totalSize}B`;
     }
     const displayName = entity.displayName || entity.name;
+    const checked = isEntityHidden(entity.name) ? '' : 'checked';
     html += `<div class="sidebar__struct-item" data-entity="${entity.name}">
+      <input type="checkbox" class="sidebar__checkbox" data-toggle="${entity.name}" ${checked} title="Show/hide on canvas">
       <span class="sidebar__badge ${iconClass}">${icon}</span>
       <span class="sidebar__struct-name">${displayName}</span>
       <span class="sidebar__struct-size">${meta}</span>
@@ -829,12 +1238,22 @@ function renderStructList() {
 
   list.innerHTML = html;
 
-  // Click to pan to block
+  // Checkbox to toggle visibility on canvas
+  list.querySelectorAll('.sidebar__checkbox').forEach(cb => {
+    cb.addEventListener('change', (e) => {
+      e.stopPropagation();
+      toggleEntityVisibility(cb.dataset.toggle);
+      scheduleRender();
+    });
+    // Prevent click from bubbling to the parent item (which does pan)
+    cb.addEventListener('click', (e) => e.stopPropagation());
+  });
+
+  // Click on item (not checkbox) to pan to block
   list.querySelectorAll('.sidebar__struct-item').forEach(el => {
     el.addEventListener('click', () => {
       const name = el.dataset.entity;
       setSelectedEntity(name);
-      panToEntity(name);
     });
   });
 

@@ -20,16 +20,16 @@ export const BLOCK = {
   sizeColX: 310,
 };
 
-// ---- Field category colors (light mode) ----
+// ---- Field category colors (light mode — warm tones) ----
 export const CATEGORY_COLORS = {
-  integer:  '#22C55E',
-  float:    '#F97316',
-  pointer:  '#A78BFA',
-  array:    '#14B8A6',
-  struct:   '#3B82F6',
-  bitfield: '#EAB308',
-  padding:  '#9CA3AF',
-  enum:     '#EC4899',
+  integer:  '#5C7A3E',
+  float:    '#D4782A',
+  pointer:  '#9B6B9E',
+  array:    '#4A8C7A',
+  struct:   '#C4841D',
+  bitfield: '#B8962B',
+  padding:  '#B8A48C',
+  enum:     '#B85470',
 };
 
 // ---- Field category colors (dark mode) ----
@@ -44,33 +44,35 @@ export const CATEGORY_COLORS_DARK = {
   enum:     '#F472B6',
 };
 
-// ---- Canvas colors (light mode) ----
+// ---- Canvas colors (light mode — Anthropic warm palette) ----
 export const CANVAS_COLORS = {
-  bg: '#F9FAFB',
-  dot: '#E5E7EB',
-  boxBg: '#FFFFFF',
-  boxBorder: '#D1D5DB',
-  boxBorderHover: '#3B82F6',
-  boxBorderSelected: '#2563EB',
-  headerBg: '#F3F4F6',
-  headerText: '#111827',
-  headerMeta: '#6B7280',
-  fieldText: '#374151',
-  fieldTextSecondary: '#6B7280',
-  paddingBg: 'rgba(156, 163, 175, 0.08)',
-  paddingStripe: 'rgba(156, 163, 175, 0.15)',
-  shadow: 'rgba(0,0,0,0.08)',
-  shadowHover: 'rgba(59,130,246,0.2)',
-  connectionLine: '#3B82F6',
-  connectionLineDim: 'rgba(59,130,246,0.3)',
-  unionHeader: '#7C3AED',
-  unionHeaderText: '#FFFFFF',
+  bg: '#F5F0E8',
+  dot: '#DDD4C4',
+  boxBg: '#FFFDF8',
+  boxBorder: '#D4C4AA',
+  boxBorderHover: '#C4841D',
+  boxBorderSelected: '#A06B15',
+  headerBg: '#F0E8D8',
+  headerText: '#2C1E0E',
+  headerMeta: '#7A6A54',
+  fieldText: '#3E2A14',
+  fieldTextSecondary: '#7A6A54',
+  paddingBg: 'rgba(180, 160, 130, 0.08)',
+  paddingStripe: 'rgba(180, 160, 130, 0.15)',
+  shadow: 'rgba(62, 42, 20, 0.08)',
+  shadowHover: 'rgba(196, 132, 29, 0.2)',
+  connectionLine: '#C4841D',
+  connectionLineDim: 'rgba(196, 132, 29, 0.3)',
+  unionHeader: '#8B5A2B',
+  unionHeaderText: '#FFF8EE',
   packedBadgeBg: '#FEF3C7',
   packedBadgeText: '#92400E',
-  functionHeader: '#059669',
-  functionHeaderText: '#FFFFFF',
-  connectionReturn: '#059669',
-  connectionUses: '#9CA3AF',
+  functionHeader: '#5C7A3E',
+  functionHeaderText: '#F5F8F0',
+  connectionParam: '#6A8EC4',
+  connectionReturn: '#5C7A3E',
+  connectionUses: '#B8A48C',
+  connectionCall: '#D4782A',
 };
 
 // ---- Canvas colors (dark mode) ----
@@ -98,8 +100,10 @@ export const CANVAS_COLORS_DARK = {
   packedBadgeText: '#FDE68A',
   functionHeader: '#10B981',
   functionHeaderText: '#ECFDF5',
+  connectionParam: '#93C5FD',
   connectionReturn: '#34D399',
   connectionUses: '#6B7280',
+  connectionCall: '#FB923C',
 };
 
 // ---- Connection line constants ----
